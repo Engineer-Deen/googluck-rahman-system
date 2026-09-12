@@ -20,6 +20,7 @@ _check_sync_key() plus a devices table lookup, not a redesign.
 from datetime import datetime, timezone
 
 from flask import Blueprint, current_app, jsonify, request
+from sqlalchemy import func
 
 from app.auth import login_required
 from app.extensions import db
@@ -29,6 +30,8 @@ from app.routes.stock import apply_stock_movement
 from app.sync.device import get_current_device_id
 
 sync_bp = Blueprint("sync", __name__, url_prefix="/api/sync")
+
+_PULL_MODELS = (Shop, Staff, Product, Sale, SalePayment, StockMovement, SystemSetting)
 
 
 def _check_sync_key() -> bool:
@@ -51,6 +54,24 @@ def _ensure_device_registered(device_id: str):
         db.session.add(device)
     device.last_seen_at = datetime.now(timezone.utc)
     db.session.commit()
+
+
+def _parse_cursor(value: str):
+    """Parse the ISO-8601 cursor format returned by this endpoint."""
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
+def _pull_high_watermark():
+    """Return the latest committed update timestamp across pulled entities.
+
+    Capture this from persisted data before reading any result rows. It is a
+    data boundary, rather than a later application-server wall-clock value.
+    """
+    values = [db.session.query(func.max(model.updated_at)).scalar() for model in _PULL_MODELS]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
 
 
 @sync_bp.post("/push")
@@ -109,13 +130,24 @@ def pull():
     since = None
     if since_raw:
         try:
-            since = datetime.fromisoformat(since_raw)
+            since = _parse_cursor(since_raw)
         except ValueError:
             return jsonify(error="`since` must be an ISO timestamp"), 400
 
+    # This endpoint is currently an unpaginated, high-water-mark-bounded pull.
+    # If pagination is added later, every page must retain this same upper bound
+    # until the client has consumed the complete snapshot.
+    high_watermark = _pull_high_watermark()
+
     def changed(query, model):
         if since:
-            return query.filter(model.updated_at > since)
+            # Inclusive lower bound deliberately replays the cursor boundary.
+            # A row committed after the prior read can share its timestamp; the
+            # existing UUID/key upserts make that replay safe and prevent a
+            # strict `>` comparison from permanently missing the row.
+            query = query.filter(model.updated_at >= since)
+        if high_watermark:
+            query = query.filter(model.updated_at <= high_watermark)
         return query
 
     shops = changed(Shop.query, Shop).all()
@@ -129,6 +161,9 @@ def pull():
     settings = changed(SystemSetting.query, SystemSetting).all()
 
     return jsonify(
+        # New clients persist this data-derived high-water mark. Keep
+        # server_time for compatibility and status display only.
+        next_cursor=high_watermark.isoformat() if high_watermark else since_raw,
         server_time=datetime.now(timezone.utc).isoformat(),
         shops=[
             {"id": s.id, "name": s.name, "location": s.location, "logo_data": s.logo_data}

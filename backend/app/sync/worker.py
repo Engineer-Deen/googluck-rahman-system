@@ -20,6 +20,27 @@ REQUEST_TIMEOUT_SECONDS = 8
 LAST_PULL_KEY = "last_pull_at"
 
 
+def _parse_datetime(value):
+    """Deserialize central ISO-8601 timestamps for SQLAlchemy DateTime fields.
+
+    The central API emits ``datetime.isoformat()`` values. The existing models
+    use timezone-naive ``DateTime`` columns but create timestamps in UTC, so
+    normalize aware input to UTC before binding it. This preserves the instant
+    even on SQLite, whose DateTime storage does not retain an offset. Naive
+    legacy values remain naive. ``Z`` is normalized for Python versions where
+    ``fromisoformat`` does not accept it.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Expected an ISO-8601 timestamp string or null")
+
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(value)
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed
+
+
 def _set_state(key, value):
     row = SyncState.query.get(key)
     if not row:
@@ -103,10 +124,10 @@ def _upsert_transactions(data):
         sale.customer_name = raw.get("customer_name")
         sale.payment_method = raw.get("payment_method", "cash")
         sale.total_amount = raw.get("total_amount", 0)
-        sale.created_at = raw.get("created_at")
-        sale.updated_at = raw.get("updated_at") or raw.get("created_at")
-        sale.server_received_at = raw.get("server_received_at")
-        sale.voided_at = raw.get("voided_at")
+        sale.created_at = _parse_datetime(raw.get("created_at"))
+        sale.updated_at = _parse_datetime(raw.get("updated_at") or raw.get("created_at"))
+        sale.server_received_at = _parse_datetime(raw.get("server_received_at"))
+        sale.voided_at = _parse_datetime(raw.get("voided_at"))
         sale.voided_by_staff_id = raw.get("voided_by_staff_id")
         sale.void_reason = raw.get("void_reason")
 
@@ -131,9 +152,9 @@ def _upsert_transactions(data):
         payment.amount = raw["amount"]
         payment.device_id = raw.get("device_id")
         payment.staff_id = raw.get("staff_id")
-        payment.created_at = raw.get("created_at")
-        payment.updated_at = raw.get("updated_at") or raw.get("created_at")
-        payment.server_received_at = raw.get("server_received_at")
+        payment.created_at = _parse_datetime(raw.get("created_at"))
+        payment.updated_at = _parse_datetime(raw.get("updated_at") or raw.get("created_at"))
+        payment.server_received_at = _parse_datetime(raw.get("server_received_at"))
 
     for raw in data.get("stock_movements", []):
         movement = StockMovement.query.get(raw["id"])
@@ -146,9 +167,9 @@ def _upsert_transactions(data):
         movement.quantity_delta = raw["quantity_delta"]
         movement.reason = raw["reason"]
         movement.reference_id = raw.get("reference_id")
-        movement.created_at = raw.get("created_at")
-        movement.updated_at = raw.get("updated_at") or raw.get("created_at")
-        movement.server_received_at = raw.get("server_received_at")
+        movement.created_at = _parse_datetime(raw.get("created_at"))
+        movement.updated_at = _parse_datetime(raw.get("updated_at") or raw.get("created_at"))
+        movement.server_received_at = _parse_datetime(raw.get("server_received_at"))
 
 
 def pull_reference_data_once(app) -> dict:
@@ -212,8 +233,12 @@ def pull_reference_data_once(app) -> dict:
         if not state:
             state = SyncState(key=LAST_PULL_KEY)
             db.session.add(state)
-        state.value = data["server_time"]
-        _set_state("last_pull_success", data["server_time"])
+        # New central servers send a high-water-mark cursor captured before
+        # querying. Fall back to the legacy server_time only while upgrading
+        # an older central server.
+        next_cursor = data.get("next_cursor") or data.get("server_time")
+        state.value = next_cursor
+        _set_state("last_pull_success", next_cursor)
         _set_state("last_pull_error", "")
         db.session.commit()
         return {

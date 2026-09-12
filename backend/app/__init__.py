@@ -24,6 +24,9 @@ def create_app():
     with app.app_context():
         db.create_all()
         _run_compat_migrations()
+        if app.config.get("BOOTSTRAP_INITIAL_LOCAL_DATA"):
+            from app.bootstrap import ensure_initial_local_data
+            ensure_initial_local_data()
 
     @app.get("/api/health")
     def health():

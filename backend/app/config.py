@@ -15,10 +15,28 @@ models are written against SQLAlchemy, which works the same either way.
 """
 
 import os
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-INSTANCE_DIR = BASE_DIR / "instance"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _local_instance_dir() -> Path:
+    """Return the writable directory for local SQLite and device state."""
+    if not IS_FROZEN:
+        # Keep direct source execution convenient for development.
+        return BASE_DIR / "instance"
+
+    # PyInstaller one-file executables extract modules into a temporary
+    # _MEI* directory. Storing mutable data relative to __file__ would make
+    # the SQLite database and device identity disappear on every restart.
+    # LOCALAPPDATA is a stable, per-user writable location on Windows.
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    return local_app_data / "Good Luck Rahman Enterprise"
+
+
+INSTANCE_DIR = _local_instance_dir()
 
 
 class BaseConfig:
@@ -61,6 +79,8 @@ class LocalConfig(BaseConfig):
     for local mode only, and it is optional.
     """
     INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
+    # Used by create_app() to provision only a brand-new frozen local install.
+    BOOTSTRAP_INITIAL_LOCAL_DATA = IS_FROZEN
     SQLALCHEMY_DATABASE_URI = os.environ.get(
         "LOCAL_DATABASE_URL", f"sqlite:///{INSTANCE_DIR / 'glr_local.sqlite'}"
     )
