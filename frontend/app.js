@@ -1,0 +1,1121 @@
+/*
+  This frontend only ever talks to ITS OWN local Flask server at
+  localhost:5000 -- never directly to the central server. That's
+  deliberate: the local server is the thing that's always reachable
+  (even offline), and it's the local server's own background worker
+  that handles reaching central when possible. The UI never needs to
+  know or care whether central is reachable right now.
+*/
+const API_BASE = "http://localhost:5000/api";
+
+let authToken = localStorage.getItem("glr_token") || null;
+let currentStaff = JSON.parse(localStorage.getItem("glr_staff") || "null");
+let productsCache = [];
+let sessionSales = [];
+let productsLoadedAt = 0;
+let productsLoadPromise = null;
+const PRODUCT_CACHE_MS = 2500;
+const VOID_REASONS = [
+  "Customer returned item",
+  "Wrong product or quantity entered",
+  "Wrong price entered",
+  "Duplicate sale",
+  "Payment issue",
+  "Customer cancelled order",
+  "Other approved reason"
+];
+const DEFAULT_SYSTEM_SETTINGS = { timeoutMinutes: 15, fullLoginHours: 8, pinConfigured: false };
+let systemSettingsCache = Object.assign({}, DEFAULT_SYSTEM_SETTINGS);
+let historySearchTimer = null;
+let pendingSaleWatchers = new Map();
+let reasonResolver = null;
+let adminLocked = false;
+let activityTimer = null;
+
+
+// ---------- tiny UUID v4, used for client-generated ids (sales, stock
+// movements) so records stay idempotent across retries and devices,
+// exactly matching the backend's expectations. Prefers the browser's
+// built-in generator when available. ----------
+function uuidv4() {
+  if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+// ---------- login role selector ----------
+// This DOES get sent to the server now, but only as a courtesy check
+// (see backend/app/routes/auth.py) -- the server independently
+// verifies the account's real role against the selected group and
+// rejects a mismatch with a clear message. The actual permissions a
+// logged-in session gets are always determined by the account's real
+// role from the database, never by which button was clicked here.
+let selectedLoginRole = "owner";
+function setLoginRole(role) {
+  selectedLoginRole = role;
+  document.querySelectorAll(".role-btn").forEach((b) => b.classList.remove("active"));
+  document.querySelector(`.role-btn[data-role="${role}"]`).classList.add("active");
+}
+
+// ---------- theme ----------
+function setTheme(name) {
+  document.documentElement.setAttribute("data-theme", name);
+  localStorage.setItem("glr_theme", name);
+  document.getElementById("theme-btn-dark").classList.toggle("active", name === "dark");
+  document.getElementById("theme-btn-light").classList.toggle("active", name === "light");
+}
+(function initTheme() {
+  setTheme(localStorage.getItem("glr_theme") || "dark");
+})();
+
+// ---------- centered notifications ----------
+let toastTimer = null;
+function toast(message, kind) {
+  const el = document.getElementById("toast");
+  const msg = document.getElementById("toast-message");
+  const title = document.getElementById("toast-title");
+  const icon = document.getElementById("toast-icon");
+  if (!el || !msg) return;
+  clearTimeout(toastTimer);
+  msg.textContent = message;
+  title.textContent = kind === "error" ? "Action needs attention" : kind === "success" ? "Completed" : "Notification";
+  icon.textContent = kind === "error" ? "!" : kind === "success" ? "✓" : "i";
+  el.className = "toast show" + (kind ? " " + kind : "");
+}
+function closeToast() {
+  const el = document.getElementById("toast");
+  if (el) el.classList.remove("show");
+}
+
+// ---------- API helper ----------
+async function api(path, options = {}) {
+  const headers = Object.assign(
+    { "Content-Type": "application/json" },
+    options.headers || {}
+  );
+  if (authToken) headers["Authorization"] = "Bearer " + authToken;
+
+  const res = await fetch(API_BASE + path, Object.assign({}, options, { headers }));
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* no body */ }
+
+  if (!res.ok) {
+    const message = (data && data.error) || `Request failed (${res.status})`;
+    throw new Error(message);
+  }
+  return data;
+}
+
+// ---------- auth ----------
+function togglePasswordVisibility() {
+  const input = document.getElementById("login-password");
+  const btn = document.querySelector(".password-toggle");
+  const showing = input.type === "text";
+  input.type = showing ? "password" : "text";
+  btn.textContent = showing ? "Show" : "Hide";
+}
+
+async function doLogin() {
+  const email = document.getElementById("login-email").value.trim();
+  const password = document.getElementById("login-password").value;
+  const errorEl = document.getElementById("login-error");
+  const btn = document.getElementById("login-submit-btn");
+  errorEl.textContent = "";
+
+  if (!email || !password) {
+    errorEl.textContent = "Enter your email and password.";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "LOGGING IN...";
+  try {
+    const data = await api("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password, role_group: selectedLoginRole }),
+    });
+    authToken = data.token;
+    currentStaff = data.staff;
+    localStorage.setItem("glr_token", authToken);
+    localStorage.setItem("glr_staff", JSON.stringify(currentStaff));
+    if (ADMIN_ROLES.includes(currentStaff.role)) {
+      localStorage.setItem("glr_admin_session_started", String(Date.now()));
+      localStorage.setItem("glr_admin_last_active", String(Date.now()));
+    }
+    enterApp();
+  } catch (err) {
+    errorEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "LOG IN";
+  }
+}
+
+function doLogout() {
+  authToken = null;
+  currentStaff = null;
+  localStorage.removeItem("glr_token");
+  localStorage.removeItem("glr_staff");
+  localStorage.removeItem("glr_admin_session_started");
+  localStorage.removeItem("glr_admin_last_active");
+  document.getElementById("app").classList.remove("visible");
+  document.getElementById("login-overlay").style.display = "flex";
+
+  // Move the theme toggle back to its floating position over the login
+  // screen, since the header it was living in is no longer visible.
+  const toggle = document.getElementById("theme-toggle");
+  toggle.classList.remove("inline");
+  document.body.appendChild(toggle);
+}
+
+function enterApp() {
+  document.getElementById("login-overlay").style.display = "none";
+  document.getElementById("app").classList.add("visible");
+  document.getElementById("header-staff-name").textContent =
+    currentStaff ? `${currentStaff.name} (${currentStaff.role})` : "";
+
+  // Move the theme toggle INTO the header's flex row instead of leaving
+  // it fixed-positioned over the top-right corner -- fixed positioning
+  // is what caused it to sit on top of the staff name / logout button.
+  const toggle = document.getElementById("theme-toggle");
+  const headerRight = document.getElementById("header-right");
+  toggle.classList.add("inline");
+  headerRight.insertBefore(toggle, headerRight.firstChild);
+
+  applyRoleVisibility();
+  initializeAdminSecurity();
+  refreshAll();
+  loadShopBranding();
+  if (currentStaff && ADMIN_ROLES.includes(currentStaff.role)) loadSystemSettings();
+  startSyncStatusPolling();
+}
+
+// ---------- role-based UI ----------
+// Purely cosmetic: hides tabs/sections a role shouldn't see. The
+// backend enforces every one of these independently (roles_required
+// decorators, central-mode guards) -- this never IS the security
+// boundary, it just avoids showing someone a button that would 403 if
+// they clicked it. Two tiers, matching the backend exactly:
+//   finance-only:    owner, admin, manager (product/stock management)
+//   admin-only:      owner, admin only (staff management, audit log)
+const FINANCE_ROLES = ["owner", "admin", "manager"];
+const ADMIN_ROLES = ["owner", "admin"];
+
+function applyRoleVisibility() {
+  const role = currentStaff ? currentStaff.role : null;
+  const isFinance = FINANCE_ROLES.includes(role);
+  const isAdmin = ADMIN_ROLES.includes(role);
+  const isOwner = role === "owner";
+  document.querySelectorAll(".owner-only").forEach((el) => { el.style.display = isOwner ? "" : "none"; });
+  document.querySelectorAll(".finance-only").forEach((el) => {
+    el.style.display = isFinance ? "" : "none";
+  });
+  document.querySelectorAll(".admin-only").forEach((el) => {
+    el.style.display = isAdmin ? "" : "none";
+  });
+}
+
+// ---------- panels ----------
+function showPanel(name) {
+  document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
+  document.querySelectorAll(".nav-tab").forEach((t) => t.classList.remove("active"));
+  document.getElementById("panel-" + name).classList.add("active");
+  document.querySelector(`.nav-tab[data-panel="${name}"]`).classList.add("active");
+  if (name === "dashboard") loadDashboard();
+  if (name === "sales") loadSalesPanel();
+  if (name === "payments") loadPaymentDesk();
+  if (name === "inventory") loadInventoryPanel();
+  if (name === "history") loadHistory("today");
+  if (name === "staff") loadStaffPanel();
+  if (name === "audit") loadAuditLog();
+  if (name === "settings") loadSystemSettings();
+}
+
+async function refreshAll() {
+  await loadProducts();
+  loadDashboard();
+}
+
+// ---------- products (shared cache) ----------
+async function loadProducts(force = false) {
+  const now = Date.now();
+  if (!force && productsCache.length && now - productsLoadedAt < PRODUCT_CACHE_MS) return productsCache;
+  if (productsLoadPromise && !force) return productsLoadPromise;
+  productsLoadPromise = api("/products").then((data) => {
+    productsCache = data || [];
+    productsLoadedAt = Date.now();
+    return productsCache;
+  }).catch((err) => {
+    toast(err.message, "error");
+    return productsCache;
+  }).finally(() => { productsLoadPromise = null; });
+  return productsLoadPromise;
+}
+
+function money(n) {
+    return "NLe " + Number(n).toFixed(2);
+}
+function formatSaleProducts(items) {
+  if (!items || !items.length) return "—";
+  return items.map(i => i.product_name || `Product #${i.product_id}`).join(", ");
+}
+
+function getSaleItemCount(items) {
+  if (!items || !items.length) return 0;
+  return items.reduce((total, item) => total + Number(item.quantity || 0), 0);
+}
+
+  // ---------- dashboard ----------
+async function loadDashboard() {
+  try {
+    const [, sales] = await Promise.all([loadProducts(), api("/sales")]);
+    const today = new Date().toDateString();
+    const todaySales = sales.filter((s) => s.status !== "voided" && new Date(s.created_at).toDateString() === today);
+
+    document.getElementById("stat-sales-count").textContent = todaySales.length;
+    const revenue = todaySales.reduce((sum, s) => sum + Number(s.total_amount), 0);
+    document.getElementById("stat-revenue").textContent = money(revenue);
+    document.getElementById("stat-products").textContent = productsCache.length;
+    document.getElementById("stat-low-stock").textContent =
+      productsCache.filter((p) => p.stock <= 0).length;
+
+    const outstanding = sales.filter(s => s.status !== "voided").reduce((sum, s) => sum + Number(s.balance || 0), 0);
+    document.getElementById("stat-outstanding").textContent = money(outstanding);
+
+    // "profit" only appears in the API response for finance roles (owner/
+    // admin/manager) -- its presence, not the local staff object, is what
+    // decides whether to show this card, since that's the same rule the
+    // server already enforces.
+    if (todaySales.some((s) => "profit" in s)) {
+      const profitToday = todaySales.reduce((sum, s) => sum + Number(s.profit || 0), 0);
+      document.getElementById("stat-profit").textContent = money(profitToday);
+      document.getElementById("stat-profit-card").style.display = "block";
+    } else {
+      document.getElementById("stat-profit-card").style.display = "none";
+    }
+
+    const tbody = document.getElementById("dash-recent-sales");
+    tbody.innerHTML = "";
+    sales.slice(0, 10).forEach((s) => {
+      const productSummary = formatSaleProducts(s.items);
+      const itemCount = getSaleItemCount(s.items);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td style="font-family:'DM Mono',monospace;font-size:0.78rem;">${s.invoice_number || "PENDING SYNC"}</td>
+        <td>${new Date(s.created_at).toLocaleTimeString()}</td>
+        <td>${s.customer_name || "Walk-in"}</td>
+        <td>${productSummary}</td>
+        <td>${itemCount}</td>
+        <td>${money(s.total_amount)}</td>
+        ${"profit" in s ? `<td>${money(s.profit)}</td>` : ""}
+        <td>${statusTag(s.status)}</td>
+        <td class="action-cell"><button class="btn btn-secondary btn-sm" onclick="viewSale('${s.id}')">VIEW</button> ${voidActionCell(s)}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+function statusTag(status) {
+  if (status === "voided") return '<span class="tag tag-danger">voided</span>';
+  return status === "completed"
+    ? '<span class="tag tag-ok">completed</span>'
+    : '<span class="tag tag-warn">incomplete</span>';
+}
+
+// Returns the void button's HTML for a sale row, or an empty string if
+// it's already voided. The backend is the real gatekeeper for WHO can
+// void WHAT (same-day + own-sale for a cashier, anytime for finance
+// roles) -- this button is shown to everyone with an active sale and
+// simply lets the server's own answer (a clear error toast) explain it
+// if someone taps it without permission, rather than duplicating that
+// same-day/ownership logic here and risking it drifting out of sync
+// with the real rule.
+function saleCanEdit(sale) {
+  if (!currentStaff) return false;
+  if (ADMIN_ROLES.includes(currentStaff.role) || FINANCE_ROLES.includes(currentStaff.role)) return true;
+  if (sale.staff_id !== currentStaff.id) return false;
+  return new Date(sale.created_at).toDateString() === new Date().toDateString();
+}
+
+function voidActionCell(sale) {
+  if (sale.status === "voided") return '<span class="muted">—</span>';
+  const edit = saleCanEdit(sale) ? `<button class="btn btn-secondary btn-sm" onclick="editSale('${sale.id}')">EDIT</button>` : "";
+  const del = `<button class="btn btn-danger btn-sm" onclick="voidSale('${sale.id}')">DELETE</button>`;
+  return `${edit} ${del}`;
+}
+
+function openReasonModal(title, reasons = VOID_REASONS) {
+  return new Promise((resolve) => {
+    reasonResolver = resolve;
+    document.getElementById("reason-modal-title").textContent = title;
+    const select = document.getElementById("reason-modal-select");
+    select.innerHTML = '<option value="">Select a reason</option>' + reasons.map(r => `<option value="${r}">${r}</option>`).join("");
+    document.getElementById("reason-modal").style.display = "flex";
+    setTimeout(() => select.focus(), 50);
+  });
+}
+function submitReasonModal() {
+  const value = document.getElementById("reason-modal-select").value;
+  if (!value) { toast("Please select a reason.", "error"); return; }
+  closeReasonModal(value);
+}
+function closeReasonModal(value) {
+  document.getElementById("reason-modal").style.display = "none";
+  if (reasonResolver) { const resolve = reasonResolver; reasonResolver = null; resolve(value); }
+}
+async function editSale(saleId) {
+  try {
+    const sale = await api(`/sales/${saleId}`);
+    const customer = prompt("Customer name:", sale.customer_name || "");
+    if (customer === null) return;
+    let items = sale.items.map(i => ({product_id:i.product_id, quantity:i.quantity, unit_price:Number(i.unit_price)}));
+    if (sale.items.length === 1) {
+      const q = prompt("Correct quantity:", String(items[0].quantity));
+      if (q === null) return;
+      const price = prompt("Correct selling price:", String(items[0].unit_price));
+      if (price === null) return;
+      items[0].quantity = Number(q); items[0].unit_price = Number(price);
+    }
+    const reason = await openReasonModal("Why are you correcting this sale?", ["Wrong product or quantity entered", "Wrong price entered", "Customer information correction", "Payment correction", "Other approved reason"]);
+    if (!reason) return;
+    await api(`/sales/${saleId}`, { method: "PUT", body: JSON.stringify({ customer_name: customer.trim(), payment_method: sale.payment_method, items, reason }) });
+    toast("Sale updated and audit recorded.", "success");
+    await loadProducts();
+    await loadDashboard();
+    await loadHistory(currentHistoryPeriod);
+  } catch (err) { toast(err.message, "error"); }
+}
+
+async function voidSale(saleId) {
+  const reason = await openReasonModal("Why are you deleting/voiding this sale?");
+  if (!reason) return;
+  try {
+    const result = await api(`/sales/${saleId}/void`, {
+      method: "POST",
+      body: JSON.stringify({ id: uuidv4(), reason }),
+    });
+    toast("Sale voided. Stock has been restored.", "success");
+
+    // The session table (Sales Entry tab) is a client-only list that
+    // never refetches from the server, so it needs its own copy of
+    // this sale updated directly -- otherwise it would keep showing
+    // the old pre-void status until the page reloads.
+    const idx = sessionSales.findIndex((s) => s.id === saleId);
+    if (idx !== -1) sessionSales[idx] = result;
+
+    loadDashboard();
+    if (document.getElementById("panel-payments").classList.contains("active")) loadPaymentDesk();
+    if (document.getElementById("panel-sales").classList.contains("active")) renderSessionTable();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+// ---------- sales entry ----------
+async function loadSalesPanel() {
+  await loadProducts();
+  const select = document.getElementById("s-product");
+  select.innerHTML = '<option value="">Select product</option>';
+  // Out-of-stock products don't appear here at all -- there's nothing
+  // to sell, so nothing to pick. The backend independently enforces
+  // this too (rejects the sale outright if requested quantity exceeds
+  // current stock); this is just the matching UI-side courtesy so a
+  // seller never gets that far in the first place.
+  productsCache.filter((p) => p.stock > 0).forEach((p) => {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name;
+    opt.dataset.price = p.unit_price;
+    opt.dataset.stock = p.stock;
+    select.appendChild(opt);
+  });
+  renderSessionTable();
+}
+
+function onPaidInFullToggle() {
+  const checked = document.getElementById("s-paid-in-full").checked;
+  const amountField = document.getElementById("s-amount-paid");
+  if (checked) {
+    const total = Number(document.getElementById("s-price").value || 0) * Number(document.getElementById("s-qty").value || 0);
+    amountField.value = total.toFixed(2);
+    amountField.disabled = true;
+  } else {
+    amountField.disabled = false;
+  }
+  calcSaleTotal();
+}
+
+function onSaleProductChange() {
+  const select = document.getElementById("s-product");
+  const opt = select.selectedOptions[0];
+  if (!opt || !opt.value) {
+    document.getElementById("s-stock-card").style.display = "none";
+    return;
+  }
+  document.getElementById("s-price").value = opt.dataset.price;
+  document.getElementById("s-stock-count").textContent = opt.dataset.stock;
+  document.getElementById("s-stock-card").style.display = "flex";
+  calcSaleTotal();
+}
+
+function calcSaleTotal() {
+  const price = Number(document.getElementById("s-price").value) || 0;
+  const qty = Number(document.getElementById("s-qty").value) || 0;
+  const total = price * qty;
+  document.getElementById("s-total-disp").textContent = money(total);
+
+  // If "Paid in full" is checked, keep the amount field tracking the
+  // total as price/quantity change, rather than letting it go stale.
+  if (document.getElementById("s-paid-in-full").checked) {
+    document.getElementById("s-amount-paid").value = total.toFixed(2);
+  }
+
+  const paidField = document.getElementById("s-amount-paid").value;
+  const balancePreview = document.getElementById("s-balance-preview");
+  if (paidField === "") {
+    balancePreview.style.display = "none";
+    return;
+  }
+  const paid = Number(paidField) || 0;
+  const balance = Math.max(total - paid, 0);
+  if (balance > 0) {
+    document.getElementById("s-balance-disp").textContent = money(balance);
+    balancePreview.style.display = "block";
+  } else {
+    balancePreview.style.display = "none";
+  }
+}
+
+function formatPersonName(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").split(" ").filter(Boolean).map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(" ");
+}
+function normalizeInputName(input) {
+  if (!input) return;
+  const formatted = formatPersonName(input.value);
+  if (formatted) input.value = formatted;
+}
+
+function clearSaleForm() {
+  document.getElementById("s-customer").value = "";
+  document.getElementById("s-product").value = "";
+  document.getElementById("s-price").value = "";
+  document.getElementById("s-qty").value = "1";
+  document.getElementById("s-amount-paid").value = "";
+  document.getElementById("s-amount-paid").disabled = false;
+  document.getElementById("s-paid-in-full").checked = false;
+  document.getElementById("s-stock-card").style.display = "none";
+  document.getElementById("s-balance-preview").style.display = "none";
+  calcSaleTotal();
+}
+
+async function saveSale() {
+  const productId = Number(document.getElementById("s-product").value);
+  const price = Number(document.getElementById("s-price").value);
+  const qty = Number(document.getElementById("s-qty").value);
+  const customerInput = document.getElementById("s-customer");
+  normalizeInputName(customerInput);
+  const customer = customerInput.value.trim();
+  const amountPaidField = document.getElementById("s-amount-paid").value;
+  const btn = document.getElementById("s-save-btn");
+
+  if (!customer) { toast("Enter customer name.", "error"); return; }
+  if (!productId) { toast("Select a product first.", "error"); return; }
+  if (!price || price <= 0) { toast("Enter a valid price.", "error"); return; }
+  if (!qty || qty <= 0) { toast("Enter a valid quantity.", "error"); return; }
+
+  // Generated HERE, at the moment of sale, on this device -- not by the
+  // server. This is what makes the sale idempotent and safe to sync
+  // later no matter how many times the request gets retried.
+  const saleId = uuidv4();
+
+  const payload = {
+    id: saleId,
+    customer_name: customer,
+    items: [{ product_id: productId, quantity: qty, unit_price: price }],
+  };
+  // Leaving Amount Paid blank means nothing has been paid yet -- the
+  // server defaults it to 0 (an open balance), not a full payment. We
+  // simply don't send the field at all when it's blank, and the
+  // server's own default takes over from there.
+  if (amountPaidField !== "") {
+    payload.amount_paid = Number(amountPaidField);
+  }
+
+  btn.disabled = true;
+  btn.textContent = "SAVING...";
+  try {
+    const sale = await api("/sales", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    if (sale.stock_warning) {
+      toast("Sale saved, but stock is now negative -- restock needed.", "error");
+    } else if (sale.status === "incomplete") {
+      toast(`Sale saved. Balance of ${money(sale.balance)} still owed.`, "success");
+    } else {
+      toast("Sale saved.", "success");
+    }
+
+    sessionSales.unshift(sale);
+    clearSaleForm();
+    if (!sale.invoice_number) watchSaleSync(saleId);
+    await loadProducts(true);
+    await loadSalesPanel();
+    await loadDashboard();
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "SAVE SALE";
+  }
+}
+
+function watchSaleSync(saleId) {
+  if (!saleId || pendingSaleWatchers.has(saleId)) return;
+  let attempts = 0;
+  const timer = setInterval(async () => {
+    attempts += 1;
+    try {
+      const sale = await api(`/sales/${saleId}`);
+      if (sale.invoice_number) {
+        clearInterval(timer);
+        pendingSaleWatchers.delete(saleId);
+        const idx = sessionSales.findIndex(s => s.id === saleId);
+        if (idx >= 0) sessionSales[idx] = sale;
+        renderSessionTable();
+        await Promise.all([loadDashboard(), loadPaymentDesk()]);
+        toast(`Server assigned ${sale.invoice_number}.`, "success");
+      }
+    } catch (_) {}
+    if (attempts >= 15) { clearInterval(timer); pendingSaleWatchers.delete(saleId); }
+  }, 2000);
+  pendingSaleWatchers.set(saleId, timer);
+}
+
+function renderSessionTable() {
+  const tbody = document.getElementById("session-table");
+  tbody.innerHTML = "";
+  if (sessionSales.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No sales recorded yet this session.</td></tr>';
+    return;
+  }
+  sessionSales.forEach((s) => {
+    const item = s.items[0] || {};
+    const product = s.items.map(i => i.product_name || productsCache.find(p => p.id === i.product_id)?.name || `Product #${i.product_id}`).join(", ");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td style="font-family:'DM Mono',monospace;font-size:.78rem;">${escapeHtml(s.invoice_number || "PENDING SYNC")}</td><td>${new Date(s.created_at).toLocaleTimeString()}</td><td>${escapeHtml(s.customer_name || "Walk-in")}</td><td>${escapeHtml(product)}</td><td>${s.items.reduce((n,i)=>n+Number(i.quantity||0),0)}</td><td>${money(s.total_amount)}</td>${"profit" in s ? `<td>${money(s.profit)}</td>` : ""}<td>${statusTag(s.status)}</td><td class="action-cell"><button class="btn btn-secondary btn-sm" onclick="viewSale('${s.id}')">VIEW</button> ${voidActionCell(s)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+// ---------- payment desk ----------
+let openBalanceSales = [];
+let selectedPaymentSaleId = null;
+
+async function loadPaymentDesk() {
+  try {
+    const sales = await api("/sales?status=incomplete&limit=200");
+    openBalanceSales = sales;
+    renderPaymentDeskList();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+  cancelPayment();
+}
+
+function renderPaymentDeskList() {
+  const search = document.getElementById("pd-search").value.trim().toLowerCase();
+  const filtered = search
+    ? openBalanceSales.filter(
+        (s) =>
+          s.id.toLowerCase().includes(search) ||
+          (s.customer_name || "").toLowerCase().includes(search)
+      )
+    : openBalanceSales;
+
+  const tbody = document.getElementById("pd-table");
+  const emptyEl = document.getElementById("pd-empty");
+  tbody.innerHTML = "";
+
+  if (filtered.length === 0) {
+    emptyEl.style.display = "block";
+    return;
+  }
+  emptyEl.style.display = "none";
+
+  filtered.forEach((s) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="font-family:'DM Mono',monospace;font-size:0.78rem;">${s.invoice_number || "PENDING SYNC"}</td>
+      <td>${s.customer_name || "Walk-in"}</td>
+      <td>${money(s.total_amount)}</td>
+      <td>${money(s.amount_paid)}</td>
+      <td style="color:var(--warning);">${money(s.balance)}</td>
+      ${"profit" in s ? `<td>${money(s.profit)}</td>` : ""}
+      <td class="action-cell"><button class="btn btn-primary btn-sm" onclick="selectSaleForPayment('${s.id}')">PAY</button> <button class="btn btn-secondary btn-sm" onclick="viewSale('${s.id}')">VIEW</button> ${voidActionCell(s)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function selectSaleForPayment(saleId) {
+  const sale = openBalanceSales.find((s) => s.id === saleId);
+  if (!sale) return;
+  selectedPaymentSaleId = saleId;
+  document.getElementById("pd-pay-sale-id").textContent = sale.invoice_number || "PENDING SYNC";
+  document.getElementById("pd-pay-balance").textContent = money(sale.balance);
+  document.getElementById("pd-pay-amount").value = sale.balance;
+  document.getElementById("pd-pay-error").textContent = "";
+  document.getElementById("pd-pay-card").style.display = "block";
+  if (!sale.invoice_number) watchSaleSync(sale.id);
+}
+
+function cancelPayment() {
+  selectedPaymentSaleId = null;
+  document.getElementById("pd-pay-card").style.display = "none";
+  document.getElementById("pd-pay-error").textContent = "";
+}
+
+async function submitPayment() {
+  if (!selectedPaymentSaleId) return;
+
+  const amount = Number(document.getElementById("pd-pay-amount").value);
+  const errorEl = document.getElementById("pd-pay-error");
+  const btn = document.getElementById("pd-pay-submit-btn");
+  errorEl.textContent = "";
+
+  if (!amount || amount <= 0) {
+    errorEl.textContent = "Enter a valid payment amount.";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "RECORDING...";
+  try {
+    await api(`/sales/${selectedPaymentSaleId}/payments`, {
+      method: "POST",
+      body: JSON.stringify({ id: uuidv4(), amount }),
+    });
+    toast("Payment recorded.", "success");
+    cancelPayment();
+    await Promise.all([loadPaymentDesk(), loadDashboard(), loadSalesPanel()]);
+
+  } catch (err) {
+    // A 503 here means "this device needs to be online to pay down a
+    // balance" -- see backend/app/routes/sales.py for why that's a
+    // deliberate safety rule, not a bug. err.message already carries
+    // that exact explanation from the server.
+    errorEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "RECORD PAYMENT";
+  }
+}
+
+// ---------- staff management ----------
+let staffCache = [];
+let resetPasswordStaffId = null;
+
+async function loadStaffPanel() {
+  try {
+    staffCache = await api("/staff");
+  } catch (err) {
+    toast(err.message, "error");
+    return;
+  }
+
+  const tbody = document.getElementById("staff-table");
+  tbody.innerHTML = "";
+  staffCache.forEach((s) => {
+    const tr = document.createElement("tr");
+    const statusBadge = s.is_active
+      ? '<span class="tag tag-ok">active</span>'
+      : '<span class="tag tag-danger">deactivated</span>';
+    const toggleLabel = s.is_active ? "DEACTIVATE" : "REACTIVATE";
+    tr.innerHTML = `
+      <td>${s.name}</td>
+      <td>${s.email}</td>
+      <td style="text-transform:capitalize;">${s.role}</td>
+      <td>${statusBadge}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="startPasswordReset(${s.id})">RESET PW</button>
+        <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="toggleStaffActive(${s.id}, ${!s.is_active})">${toggleLabel}</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+async function createStaff() {
+  const name = document.getElementById("st-name").value.trim();
+  const email = document.getElementById("st-email").value.trim();
+  const password = document.getElementById("st-password").value;
+  const role = document.getElementById("st-role").value;
+
+  if (!name || !email) { toast("Enter a name and email.", "error"); return; }
+  if (password.length < 6) { toast("Password must be at least 6 characters.", "error"); return; }
+
+  try {
+    await api("/staff", {
+      method: "POST",
+      body: JSON.stringify({ name, email, password, role }),
+    });
+    toast(`${name}'s account created.`, "success");
+    document.getElementById("st-name").value = "";
+    document.getElementById("st-email").value = "";
+    document.getElementById("st-password").value = "";
+    await loadStaffPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function createAdminAccount() {
+  const name = document.getElementById("ad-name").value.trim();
+  const email = document.getElementById("ad-email").value.trim();
+  const password = document.getElementById("ad-password").value;
+  if (!name || !email || password.length < 6) { toast("Enter a name, valid email and password of at least 6 characters.", "error"); return; }
+  try {
+    await api("/staff/admins", { method: "POST", body: JSON.stringify({ name, email, password }) });
+    toast("Administrator account created.", "success");
+    document.getElementById("ad-name").value = ""; document.getElementById("ad-email").value = ""; document.getElementById("ad-password").value = "";
+    await loadStaffPanel();
+  } catch (err) { toast(err.message, "error"); }
+}
+
+function startPasswordReset(staffId) {
+  const s = staffCache.find((x) => x.id === staffId);
+  if (!s) return;
+  resetPasswordStaffId = staffId;
+  document.getElementById("st-reset-name").textContent = s.name;
+  document.getElementById("st-reset-password").value = "";
+  document.getElementById("st-reset-card").style.display = "block";
+  document.getElementById("st-reset-card").scrollIntoView({ behavior: "smooth" });
+}
+
+function cancelPasswordReset() {
+  resetPasswordStaffId = null;
+  document.getElementById("st-reset-card").style.display = "none";
+}
+
+async function submitPasswordReset() {
+  if (!resetPasswordStaffId) return;
+  const newPassword = document.getElementById("st-reset-password").value;
+  if (newPassword.length < 6) { toast("Password must be at least 6 characters.", "error"); return; }
+
+  try {
+    await api(`/staff/${resetPasswordStaffId}/reset-password`, {
+      method: "POST",
+      body: JSON.stringify({ new_password: newPassword }),
+    });
+    toast("Password reset.", "success");
+    cancelPasswordReset();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function toggleStaffActive(staffId, makeActive) {
+  try {
+    await api(`/staff/${staffId}`, {
+      method: "PUT",
+      body: JSON.stringify({ is_active: makeActive }),
+    });
+    toast(makeActive ? "Account reactivated." : "Account deactivated.", "success");
+    await loadStaffPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+// ---------- audit log ----------
+async function loadAuditLog() {
+  try {
+    const entries = await api("/audit-log");
+    const tbody = document.getElementById("audit-table");
+    const emptyEl = document.getElementById("audit-empty");
+    tbody.innerHTML = "";
+
+    if (entries.length === 0) {
+      emptyEl.style.display = "block";
+      return;
+    }
+    emptyEl.style.display = "none";
+
+    entries.forEach((e) => {
+      const tr = document.createElement("tr");
+      const details = e.description || "Activity recorded.";
+      tr.innerHTML = `
+        <td style="white-space:nowrap;font-size:0.78rem;">${new Date(e.created_at).toLocaleString()}</td>
+        <td>${e.actor_name || "Unknown"} <span style="color:var(--text-dim);text-transform:capitalize;">(${e.actor_role || "-"})</span></td>
+        <td>${e.action.replace(/_/g, " ")}</td>
+        <td style="font-size:0.78rem;color:var(--text-secondary);max-width:360px;overflow-wrap:anywhere;">${escapeHtml(details)}</td>
+        <td style="font-size:0.78rem;color:var(--warning);max-width:240px;overflow-wrap:anywhere;">${escapeHtml(e.reason || "—")}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+// ---------- owner system settings / admin quick lock ----------
+function getSystemSettings() { return Object.assign({}, DEFAULT_SYSTEM_SETTINGS, systemSettingsCache); }
+async function loadSystemSettings() {
+  if (!currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) return;
+  try {
+    const settings = await api("/shop/settings");
+    systemSettingsCache = Object.assign({}, DEFAULT_SYSTEM_SETTINGS, {
+      timeoutMinutes: Number(settings.timeout_minutes),
+      fullLoginHours: Number(settings.full_login_hours),
+      pinConfigured: !!settings.pin_configured,
+    });
+    document.getElementById("setting-timeout").value = String(systemSettingsCache.timeoutMinutes);
+    document.getElementById("setting-full-login").value = String(systemSettingsCache.fullLoginHours);
+    document.getElementById("setting-pin").value = "";
+  } catch (e) { toast(e.message, "error"); }
+}
+async function saveSystemSettings() {
+  if (!currentStaff || currentStaff.role !== "owner") return;
+  const timeoutMinutes = Number(document.getElementById("setting-timeout").value);
+  const fullLoginHours = Number(document.getElementById("setting-full-login").value);
+  const pin = document.getElementById("setting-pin").value.trim();
+  if (pin && !/^\d{4}$/.test(pin)) { toast("The quick unlock PIN must be exactly 4 digits.", "error"); return; }
+  const btn = document.getElementById("save-settings-btn");
+  btn.disabled = true; btn.textContent = "SAVING...";
+  try {
+    const settings = await api("/shop/settings", { method: "PUT", body: JSON.stringify({ timeout_minutes: timeoutMinutes, full_login_hours: fullLoginHours, pin }) });
+    systemSettingsCache = { timeoutMinutes: Number(settings.timeout_minutes), fullLoginHours: Number(settings.full_login_hours), pinConfigured: !!settings.pin_configured };
+    document.getElementById("setting-pin").value = "";
+    toast("System settings saved successfully.", "success");
+  } catch (e) {
+    toast(e.message, "error");
+  } finally { btn.disabled = false; btn.textContent = "SAVE SETTINGS"; }
+}
+function touchAdminActivity() {
+  if (!currentStaff || !ADMIN_ROLES.includes(currentStaff.role) || adminLocked) return;
+  const now = Date.now();
+  if (activityTimer) return;
+  activityTimer = setTimeout(() => { activityTimer = null; localStorage.setItem("glr_admin_last_active", String(Date.now())); }, 500);
+}
+function checkAdminSessionSecurity() {
+  if (!currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) return;
+  const now = Date.now();
+  const started = Number(localStorage.getItem("glr_admin_session_started") || now);
+  const last = Number(localStorage.getItem("glr_admin_last_active") || started);
+  const settings = getSystemSettings();
+  if (now - started >= settings.fullLoginHours * 60 * 60 * 1000) { forceAdminLogin(); return; }
+  if (now - last >= settings.timeoutMinutes * 60 * 1000) showAdminLock("Your admin session has been inactive for a while. Enter your 4-digit PIN to continue.");
+}
+function showAdminLock(message) {
+  if (adminLocked || !currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) return;
+  adminLocked = true;
+  document.getElementById("admin-lock-message").textContent = message;
+  document.getElementById("admin-lock-pin").value = "";
+  document.getElementById("admin-lock-error").textContent = systemSettingsCache.pinConfigured ? "" : "No quick PIN is configured. Use FULL LOGIN.";
+  document.getElementById("admin-lock-modal").style.display = "flex";
+  setTimeout(() => document.getElementById("admin-lock-pin").focus(), 80);
+}
+async function unlockAdminSession() {
+  const entered = document.getElementById("admin-lock-pin").value.trim();
+  const errorEl = document.getElementById("admin-lock-error");
+  if (!systemSettingsCache.pinConfigured) { errorEl.textContent = "No quick PIN is configured. Use FULL LOGIN."; return; }
+  try {
+    await api("/auth/verify-pin", { method: "POST", body: JSON.stringify({ pin: entered }) });
+    adminLocked = false;
+    localStorage.setItem("glr_admin_last_active", String(Date.now()));
+    document.getElementById("admin-lock-modal").style.display = "none";
+    toast("Session unlocked.", "success");
+  } catch (e) {
+    errorEl.textContent = e.message;
+    if (/fresh|sign in again|three incorrect|disabled/i.test(e.message)) forceAdminLogin();
+  }
+}
+function forceAdminLogin() {
+  adminLocked = false;
+  localStorage.removeItem("glr_token"); localStorage.removeItem("glr_staff");
+  authToken = null; currentStaff = null;
+  document.getElementById("admin-lock-modal").style.display = "none";
+  document.getElementById("app").classList.remove("visible");
+  document.getElementById("login-overlay").style.display = "flex";
+  toast("Please sign in again to continue.", "error");
+}
+function initializeAdminSecurity() {
+  if (!currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) return;
+  if (!localStorage.getItem("glr_admin_session_started")) localStorage.setItem("glr_admin_session_started", String(Date.now()));
+  localStorage.setItem("glr_admin_last_active", String(Date.now()));
+  document.addEventListener("click", touchAdminActivity);
+  document.addEventListener("keydown", touchAdminActivity);
+  setInterval(checkAdminSessionSecurity, 15000);
+}
+
+// ---------- sync status ----------
+let currentHistoryPeriod = "today";
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
+}
+
+async function viewSale(saleId) {
+  try {
+    const s = await api(`/sales/${saleId}`);
+    const finance = "profit" in s;
+    const rows = s.items.map(i => `
+      <tr>
+        <td><strong>${escapeHtml(i.product_name || `Product #${i.product_id}`)}</strong></td>
+        <td>${i.quantity}</td><td>${money(i.unit_price)}</td><td>${money(i.subtotal)}</td>
+        ${finance ? `<td>${money(i.profit)}</td>` : ""}
+      </tr>`).join("");
+    const content = `
+      <div class="sale-detail-hero">
+        <div><span class="modal-kicker">TRANSACTION</span><div class="sale-detail-invoice">${escapeHtml(s.invoice_number || "PENDING SYNC")}</div><div class="sale-detail-customer">${escapeHtml(s.customer_name || "Walk-in customer")}</div></div>
+        <div>${statusTag(s.status)}</div>
+      </div>
+      <div class="sale-detail-grid">
+        <div><span>Date &amp; time</span><strong>${new Date(s.created_at).toLocaleString()}</strong></div>
+        <div><span>Payment status</span><strong>${s.status === "completed" ? "Paid in full" : s.status === "voided" ? "Voided" : "Balance outstanding"}</strong></div>
+        <div><span>Total sale</span><strong>${money(s.total_amount)}</strong></div>
+        <div><span>Collected</span><strong>${money(s.amount_paid)}</strong></div>
+        <div><span>Balance</span><strong>${money(s.balance)}</strong></div>
+        ${finance ? `<div><span>Profit</span><strong class="positive-value">${money(s.profit)}</strong></div>` : ""}
+      </div>
+      <div class="sale-items-title">Items sold</div>
+      <div class="table-wrap sale-items-table"><table><thead><tr><th>Product</th><th>Qty</th><th>Unit Price</th><th>Subtotal</th>${finance ? "<th>Profit</th>" : ""}</tr></thead><tbody>${rows}</tbody></table></div>
+      ${s.void_reason ? `<div class="void-note"><strong>Void reason:</strong> ${escapeHtml(s.void_reason)}</div>` : ""}`;
+    document.getElementById("sale-detail-content").innerHTML = content;
+    document.getElementById("sale-detail-modal").style.display = "flex";
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function closeSaleDetail(){document.getElementById("sale-detail-modal").style.display="none";}
+
+function queueHistorySearch() {
+  clearTimeout(historySearchTimer);
+  historySearchTimer = setTimeout(() => loadHistory(currentHistoryPeriod, document.getElementById("history-search").value.trim()), 250);
+}
+
+async function loadHistory(period = "today", search = "") {
+  currentHistoryPeriod = period;
+  document.querySelectorAll(".history-filter").forEach(btn => btn.classList.toggle("active", btn.getAttribute("onclick") === `loadHistory('${period}')`));
+  try {
+    const params = new URLSearchParams({ period, limit: "100" });
+    if (search) params.set("search", search);
+    const sales = await api(`/sales?${params.toString()}`);
+    const valid = sales.filter(s => s.status !== "voided");
+    document.getElementById("hist-count").textContent = valid.length;
+    document.getElementById("hist-revenue").textContent = money(valid.reduce((a,s)=>a+Number(s.total_amount||0),0));
+    document.getElementById("hist-paid").textContent = money(valid.reduce((a,s)=>a+Number(s.amount_paid||0),0));
+    document.getElementById("hist-balance").textContent = money(valid.reduce((a,s)=>a+Number(s.balance||0),0));
+    const finance = valid.some(s => "profit" in s);
+    document.getElementById("hist-profit-card").style.display = finance ? "" : "none";
+    if (finance) document.getElementById("hist-profit").textContent = money(valid.reduce((a,s)=>a+Number(s.profit||0),0));
+    const tbody = document.getElementById("history-table"); tbody.innerHTML = "";
+    const empty = document.getElementById("history-empty"); empty.style.display = valid.length ? "none" : "block";
+    valid.forEach(s => {
+      const tr=document.createElement("tr");
+      tr.innerHTML=`<td style="font-family:'DM Mono',monospace;font-size:.78rem;">${escapeHtml(s.invoice_number||"PENDING SYNC")}</td><td>${new Date(s.created_at).toLocaleString()}</td><td>${escapeHtml(s.customer_name||"Walk-in")}</td><td>${escapeHtml(formatSaleProducts(s.items))}</td><td>${getSaleItemCount(s.items)}</td><td>${money(s.total_amount)}</td><td>${money(s.amount_paid)}</td><td>${money(s.balance)}</td>${"profit" in s?`<td>${money(s.profit)}</td>`:""}<td>${statusTag(s.status)}</td><td class="action-cell"><button class="btn btn-secondary btn-sm" onclick="viewSale('${s.id}')">VIEW</button> ${voidActionCell(s)}</td>`;
+      tbody.appendChild(tr);
+    });
+  } catch(err){ toast(err.message,"error"); }
+}
+
+async function loadShopBranding(){
+  try {
+    const shop=await api("/shop");
+    document.getElementById("header-shop-name").textContent=shop.name||"Management System";
+    [document.getElementById("login-shop-logo"),document.getElementById("header-shop-logo")].forEach(img=>{
+      if(shop.logo_data){ img.src=shop.logo_data; img.style.display="block"; }
+      else { img.style.display="none"; }
+    });
+    const name=document.getElementById("shop-name-input"); if(name) name.value=shop.name||"";
+  } catch(e){}
+}
+
+async function saveShopSettings(){
+  const name=document.getElementById("shop-name-input").value.trim();
+  const file=document.getElementById("shop-logo-input").files[0];
+  let logo_data;
+  if(file) logo_data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file);});
+  try{
+    await api("/shop",{method:"PUT",body:JSON.stringify({name,logo_data})});
+    toast("Shop branding updated.","success");
+    loadShopBranding();
+  }catch(e){
+    if (/central server/i.test(e.message)) toast("This setting can only be saved on the central server. Connect to the internet and try again.", "error");
+    else toast(e.message,"error");
+  }
+}
+
+let syncPollTimer = null;
+function startSyncStatusPolling() {
+  pollSyncStatus();
+  clearInterval(syncPollTimer);
+  syncPollTimer = setInterval(pollSyncStatus, 3000);
+}
+
+async function triggerSync(){
+  try{ await api("/sync/trigger",{method:"POST"}); toast("Synchronization started.","success"); setTimeout(pollSyncStatus,1000); }
+  catch(e){toast(e.message,"error");}
+}
+
+async function pollSyncStatus() {
+  try {
+    const data = await api("/sync/status");
+    const dot = document.getElementById("sync-dot");
+    const label = document.getElementById("sync-label");
+    const badge = document.getElementById("sync-badge");
+
+    dot.classList.add("online");
+    if (data.mode !== "local") { label.textContent = "Central server"; badge.style.display = "none"; return; }
+    if (data.last_sync_error) { label.textContent = "Offline / retrying"; }
+    else if (data.needs_review_count > 0) { label.textContent = "Needs review"; }
+    else if (data.pending_count > 0) { label.textContent = "Syncing"; }
+    else { label.textContent = "Synced"; }
+    if (data.pending_count > 0) { badge.style.display = "inline-block"; badge.textContent = `${data.pending_count} waiting`; }
+    else { badge.style.display = "none"; }
+  } catch (err) {
+    // Can't even reach our OWN local server -- something's actually wrong,
+    // not just central being unreachable (the local server handles that
+    // distinction internally and always answers this endpoint if it's up).
+    document.getElementById("sync-dot").classList.remove("online");
+    document.getElementById("sync-label").textContent = "Not connected";
+  }
+}
+
+async function loadLoginBranding() {
+  try {
+    const res = await fetch(API_BASE + "/shop/public");
+    if (!res.ok) return;
+    const shop = await res.json();
+    const loginLogo = document.getElementById("login-shop-logo");
+    if (loginLogo && shop.logo_data) { loginLogo.src = shop.logo_data; loginLogo.style.display = "block"; }
+  } catch (_) {}
+}
+
+// ---------- boot ----------
+(function boot() {
+  loadLoginBranding();
+  if (authToken && currentStaff) {
+    enterApp();
+  }
+  document.getElementById("login-password").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doLogin();
+  });
+  document.getElementById("s-customer").addEventListener("blur", (e) => normalizeInputName(e.target));
+  document.getElementById("s-customer").addEventListener("input", (e) => { e.target.value = e.target.value.replace(/[^a-zA-Z\s\-'\.]/g, ""); });
+  document.getElementById("admin-lock-pin").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") unlockAdminSession();
+  });
+  setInterval(() => {
+    if (currentStaff && !adminLocked && document.getElementById("panel-sales")?.classList.contains("active")) {
+      loadProducts(true).then(loadSalesPanel);
+    }
+  }, 30000);
+})();

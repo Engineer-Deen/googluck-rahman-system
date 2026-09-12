@@ -1,0 +1,62 @@
+# Preparation schema only. The existing Flask/PostgreSQL backend remains
+# authoritative during migration. SQL Connect should be introduced beside
+# it first, then individual queries/mutations can be moved behind connectors.
+
+type Shop @table(name: "shops", key: ["id"]) {
+  id: Int!
+  name: String!
+  location: String
+  logo_data: String @col(name: "logo_data")
+}
+
+type Product @table(name: "products", key: ["id"]) {
+  id: Int!
+  sku: String!
+  name: String!
+  category: String
+  unit_price: Float!
+  cost_price: Float!
+  is_active: Boolean!
+}
+
+type Staff @table(name: "staff", key: ["id"]) {
+  id: Int!
+  shop_id: Int
+  name: String!
+  email: String!
+  role: String!
+  is_active: Boolean!
+}
+
+type Sale @table(name: "sales", key: ["id"]) {
+  id: String!
+  invoice_number: String
+  shop_id: Int
+  staff_id: Int
+  customer_name: String
+  payment_method: String
+  total_amount: Float!
+  created_at: Timestamp!
+  updated_at: Timestamp!
+  voided_at: Timestamp
+  void_reason: String
+}
+
+type SaleItem @table(name: "sale_items", key: ["id"]) {
+  id: String!
+  sale_id: String!
+  product_id: Int!
+  quantity: Int!
+  unit_price: Float!
+  subtotal: Float!
+  unit_cost: Float!
+}
+
+type SalePayment @table(name: "sale_payments", key: ["id"]) {
+  id: String!
+  sale_id: String!
+  amount: Float!
+  staff_id: Int
+  created_at: Timestamp!
+  updated_at: Timestamp!
+}

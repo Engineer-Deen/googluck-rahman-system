@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Good Luck Rahman Enterprise</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="theme-toggle" id="theme-toggle">
+  <button id="theme-btn-dark" class="active" onclick="setTheme('dark')">DARK</button>
+  <button id="theme-btn-light" onclick="setTheme('light')">LIGHT</button>
+</div>
+
+<!-- LOGIN -->
+<div id="login-overlay">
+  <div class="login-box">
+    <img id="login-shop-logo" class="brand-logo-img login-logo-img" alt="Shop logo" style="display:none;" />
+    <svg class="brand-icon-lg" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg">
+      <polygon points="40,4 56,14 66,32 64,52 50,64 30,64 16,52 14,32 24,14" fill="none" stroke="var(--accent)" stroke-width="2"/>
+      <circle cx="40" cy="38" r="22" fill="#0f2035"/>
+      <ellipse cx="40" cy="50" rx="17" ry="4.5" fill="var(--accent)"/>
+    </svg>
+    <div class="login-title">GOOD LUCK RAHMAN ENTERPRISE</div>
+    <div class="login-tagline">Management System</div>
+
+    <div class="role-select" id="role-select">
+      <button type="button" class="role-btn active" data-role="owner" onclick="setLoginRole('owner')">SHOP OWNER / ADMIN</button>
+      <button type="button" class="role-btn" data-role="seller" onclick="setLoginRole('seller')">SELLER</button>
+    </div>
+
+    <div class="auth-grid">
+      <input type="email" id="login-email" class="auth-input" placeholder="Email address" autocomplete="email">
+      <div class="password-field">
+        <input type="password" id="login-password" class="auth-input" placeholder="Password" autocomplete="current-password">
+        <button type="button" class="password-toggle" onclick="togglePasswordVisibility()">Show</button>
+      </div>
+    </div>
+    <button class="btn-login" id="login-submit-btn" onclick="doLogin()">LOG IN</button>
+    <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- APP SHELL -->
+<div id="app">
+  <header>
+    <div class="brand">
+      <img id="header-shop-logo" class="brand-logo-img" alt="Shop logo" style="display:none;" />
+      <svg class="brand-icon" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg">
+        <polygon points="40,4 56,14 66,32 64,52 50,64 30,64 16,52 14,32 24,14" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <circle cx="40" cy="38" r="22" fill="#0f2035"/>
+        <ellipse cx="40" cy="50" rx="17" ry="4.5" fill="var(--accent)"/>
+      </svg>
+      <div>
+        <div class="brand-name">GOOD LUCK RAHMAN ENTERPRISE</div>
+        <div class="brand-tagline" id="header-shop-name">Management System</div>
+      </div>
+    </div>
+    <div class="header-right" id="header-right">
+      <div class="sync-status">
+        <div class="sync-dot" id="sync-dot"></div>
+        <span id="sync-label">Local mode</span>
+        <span class="badge pending" id="sync-badge" style="display:none;">0 waiting</span><button class="btn btn-secondary" style="padding:.25rem .55rem;font-size:.68rem;" onclick="triggerSync()">SYNC</button>
+      </div>
+      <span id="header-staff-name" style="font-size:0.85rem;color:var(--text-secondary);"></span>
+      <button class="btn-logout" onclick="doLogout()">LOGOUT</button>
+    </div>
+  </header>
+
+  <nav id="main-nav">
+    <button class="nav-tab active" data-panel="dashboard" onclick="showPanel('dashboard')">DASHBOARD</button>
+    <button class="nav-tab" data-panel="sales" onclick="showPanel('sales')">SALES ENTRY</button>
+    <button class="nav-tab" data-panel="payments" onclick="showPanel('payments')">PAYMENT DESK</button>
+    <button class="nav-tab" data-panel="inventory" onclick="showPanel('inventory')">INVENTORY</button>
+    <button class="nav-tab" data-panel="history" onclick="showPanel('history')">TRANSACTION HISTORY</button>
+    <button class="nav-tab admin-only" data-panel="staff" onclick="showPanel('staff')" style="display:none;">STAFF</button>
+    <button class="nav-tab admin-only" data-panel="audit" onclick="showPanel('audit')" style="display:none;">AUDIT LOG</button>
+    <button class="nav-tab admin-only" data-panel="settings" onclick="showPanel('settings')" style="display:none;">SYSTEM SETTINGS</button>
+  </nav>
+
+  <main>
+    <!-- DASHBOARD -->
+    <div class="panel active" id="panel-dashboard">
+      <div class="section-header">
+        <div class="section-title">OVERVIEW</div>
+        <div class="section-line"></div>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Sales Today</div><div class="stat-value" id="stat-sales-count">0</div></div>
+        <div class="stat-card"><div class="stat-label">Revenue Today</div><div class="stat-value" id="stat-revenue">NLe 0.00</div></div>
+        <div class="stat-card"><div class="stat-label">Outstanding Balances</div><div class="stat-value" id="stat-outstanding">NLe 0.00</div></div>
+        <div class="stat-card"><div class="stat-label">Products</div><div class="stat-value" id="stat-products">0</div></div>
+        <div class="stat-card"><div class="stat-label">Low / Negative Stock</div><div class="stat-value" id="stat-low-stock">0</div></div>
+        <div class="stat-card" id="stat-profit-card" style="display:none;"><div class="stat-label">Profit Today</div><div class="stat-value" id="stat-profit">NLe 0.00</div></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Recent Sales</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Sale ID</th><th>Time</th><th>Customer</th><th>Product</th><th>Items</th><th>Total</th><th class="finance-only" style="display:none;">Profit</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody id="dash-recent-sales"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- SALES ENTRY -->
+    <div class="panel" id="panel-sales">
+      <div class="section-header">
+        <div class="section-title">SALES ENTRY DESK</div>
+        <div class="section-line"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">New Sale</div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Customer Name</label>
+            <input type="text" id="s-customer" placeholder="Required">
+          </div>
+          <div class="form-group">
+            <label>Product</label>
+            <select id="s-product" onchange="onSaleProductChange()"><option value="">Select product</option></select>
+          </div>
+          <div class="form-group">
+            <label>Selling Price (NLe)</label>
+            <input type="number" id="s-price" step="0.01" oninput="calcSaleTotal()">
+          </div>
+          <div class="form-group">
+            <label>Quantity</label>
+            <input type="number" id="s-qty" value="1" min="1" oninput="calcSaleTotal()">
+          </div>
+          <div class="form-group">
+            <label>Amount Paid Now (NLe)</label>
+            <input type="number" id="s-amount-paid" step="0.01" placeholder="Leave blank if nothing paid yet" oninput="calcSaleTotal()">
+            <label style="display:flex;align-items:center;gap:0.4rem;margin-top:0.4rem;font-size:0.75rem;color:var(--text-secondary);font-weight:400;">
+              <input type="checkbox" id="s-paid-in-full" onchange="onPaidInFullToggle()"> Paid in full
+            </label>
+          </div>
+        </div>
+        <div style="display:flex;gap:2rem;align-items:center;margin:1rem 0;flex-wrap:wrap;">
+          <div>
+            <div class="stat-label">Total</div>
+            <div style="font-size:1.3rem;color:var(--accent);" id="s-total-disp">NLe 0.00</div>
+          </div>
+          <div id="s-balance-preview" style="display:none;">
+            <div class="stat-label">Balance Due</div>
+            <div style="font-size:1.3rem;color:var(--warning);" id="s-balance-disp">NLe 0.00</div>
+          </div>
+          <div id="s-stock-card" class="stock-availability-card" style="display:none;">
+            <span class="stock-availability-label">AVAILABLE STOCK</span>
+            <strong id="s-stock-count">0</strong>
+            <span>units ready to sell</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:1rem;">
+          <button class="btn btn-primary" id="s-save-btn" onclick="saveSale()">SAVE SALE</button>
+          <button class="btn btn-secondary" onclick="clearSaleForm()">CLEAR</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">This Session</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Sale ID</th><th>Time</th><th>Customer</th><th>Product</th><th>Items</th><th>Total</th><th class="finance-only" style="display:none;">Profit</th><th>Status</th><th></th></tr></thead>
+            <tbody id="session-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAYMENT DESK -->
+    <div class="panel" id="panel-payments">
+      <div class="section-header">
+        <div class="section-title">PAYMENT DESK</div>
+        <div class="section-line"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Find an Open Balance</div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Search by Sale ID or Customer Name</label>
+            <input type="text" id="pd-search" placeholder="Type to filter..." oninput="renderPaymentDeskList()">
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Sale ID</th><th>Customer</th><th>Total</th><th>Paid</th><th>Balance</th><th class="finance-only" style="display:none;">Profit</th><th>Action</th></tr></thead>
+            <tbody id="pd-table"></tbody>
+          </table>
+        </div>
+        <div id="pd-empty" class="empty-state" style="display:none;">No open balances right now.</div>
+      </div>
+      <div class="card" id="pd-pay-card" style="display:none;">
+        <div class="card-title">Record a Payment</div>
+        <div style="margin-bottom:1rem;font-size:0.9rem;color:var(--text-secondary);">
+          Sale <span id="pd-pay-sale-id" style="font-family:'DM Mono',monospace;"></span> --
+          balance due: <strong id="pd-pay-balance" style="color:var(--warning);"></strong>
+        </div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Amount to Pay (NLe)</label>
+            <input type="number" id="pd-pay-amount" step="0.01">
+          </div>
+        </div>
+        <div style="display:flex;gap:1rem;">
+          <button class="btn btn-primary" id="pd-pay-submit-btn" onclick="submitPayment()">RECORD PAYMENT</button>
+          <button class="btn btn-secondary" onclick="cancelPayment()">CANCEL</button>
+        </div>
+        <div id="pd-pay-error" style="margin-top:0.75rem;color:var(--danger);font-size:0.85rem;"></div>
+      </div>
+    </div>
+
+    <!-- TRANSACTION HISTORY -->
+    <div class="panel" id="panel-history">
+      <div class="section-header"><div class="section-title">TRANSACTION HISTORY</div><div class="section-line"></div></div>
+      <div class="card">
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;margin-bottom:1rem;">
+          <div class="history-search-wrap"><span class="history-search-icon">⌕</span><input id="history-search" class="history-search" type="search" placeholder="Search customer or invoice..." autocomplete="off" oninput="queueHistorySearch()"></div>
+          <button class="btn btn-secondary history-filter" onclick="loadHistory('today')">TODAY</button>
+          <button class="btn btn-secondary history-filter" onclick="loadHistory('yesterday')">YESTERDAY</button>
+          <button class="btn btn-secondary history-filter" onclick="loadHistory('7days')">7 DAYS</button>
+          <button class="btn btn-secondary history-filter" onclick="loadHistory('30days')">1 MONTH</button>
+          <button class="btn btn-secondary history-filter" onclick="loadHistory('year')">1 YEAR</button>
+          <button class="btn btn-secondary history-filter" onclick="loadHistory('all')">ALL</button>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card"><div class="stat-label">Transactions</div><div class="stat-value" id="hist-count">0</div></div>
+          <div class="stat-card"><div class="stat-label">Revenue</div><div class="stat-value" id="hist-revenue">NLe 0.00</div></div>
+          <div class="stat-card"><div class="stat-label">Collected</div><div class="stat-value" id="hist-paid">NLe 0.00</div></div>
+          <div class="stat-card"><div class="stat-label">Outstanding</div><div class="stat-value" id="hist-balance">NLe 0.00</div></div>
+          <div class="stat-card finance-only" id="hist-profit-card" style="display:none;"><div class="stat-label">Profit</div><div class="stat-value" id="hist-profit">NLe 0.00</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Transactions</div>
+        <div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Product</th><th>Items</th><th>Revenue</th><th>Paid</th><th>Balance</th><th class="finance-only" style="display:none;">Profit</th><th>Status</th><th>Actions</th></tr></thead><tbody id="history-table"></tbody></table></div>
+        <div id="history-empty" class="empty-state" style="display:none;">No transactions found for this period.</div>
+      </div>
+    </div>
+
+    <!-- INVENTORY -->
+    <div class="panel" id="panel-inventory">
+      <div class="section-header">
+        <div class="section-title">INVENTORY</div>
+        <div class="section-line"></div>
+      </div>
+      <div class="card finance-only" id="add-product-card" style="display:none;">
+        <div class="card-title" id="product-form-title">Add New Product</div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>SKU</label>
+            <input type="text" id="p-sku" placeholder="Automatically assigned" disabled>
+          </div>
+          <div class="form-group">
+            <label>Name</label>
+            <input type="text" id="p-name" placeholder="Product name">
+          </div>
+          <div class="form-group">
+            <label>Category</label>
+            <select id="p-category">
+              <option value="">Select category</option>
+              <option>Mobile Phones</option><option>Mobile Accessories</option>
+              <option>Computers &amp; Laptops</option><option>Computer Accessories</option>
+              <option>Speakers &amp; Audio</option><option>Televisions</option>
+              <option>Home Appliances</option><option>Networking Equipment</option>
+              <option>Cameras &amp; Security</option><option>Gaming</option>
+              <option>Wearables</option><option>Storage &amp; Memory</option>
+              <option>Cables &amp; Chargers</option><option>Other Electronics</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Selling Price (NLe)</label>
+            <input type="number" id="p-unit-price" step="0.01">
+          </div>
+          <div class="form-group">
+            <label>Cost Price (NLe)</label>
+            <input type="number" id="p-cost-price" step="0.01">
+          </div>
+        </div>
+        <div style="display:flex;gap:1rem;">
+          <button class="btn btn-primary" id="p-save-btn" onclick="submitProductForm()">SAVE PRODUCT</button>
+          <button class="btn btn-secondary" id="p-cancel-btn" onclick="clearProductForm()" style="display:none;">CANCEL EDIT</button>
+        </div>
+      </div>
+      <div class="card finance-only" id="restock-card" style="display:none;">
+        <div class="card-title">Restock / Adjust Stock</div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Product</label>
+            <select id="r-product"><option value="">Select product</option></select>
+          </div>
+          <div class="form-group">
+            <label>Reason</label>
+            <select id="r-reason">
+              <option value="restock">Restock</option>
+              <option value="correction">Correction</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Quantity Change (+ or -)</label>
+            <input type="number" id="r-qty" placeholder="e.g. 50 or -3">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="submitRestock()">APPLY</button>
+      </div>
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>Product Catalog</span>
+          <label class="finance-only" id="show-inactive-label" style="display:none;font-size:0.78rem;font-weight:400;color:var(--text-secondary);align-items:center;gap:0.4rem;">
+            <input type="checkbox" id="show-inactive-toggle" onchange="loadInventoryPanel()"> Show deactivated
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>SKU</th><th>Name</th><th>Category</th><th>Unit Price</th><th>Stock</th><th></th></tr></thead>
+            <tbody id="inventory-table"></tbody>
+          </table>
+        </div>
+        <div id="inventory-empty" class="empty-state" style="display:none;">No products yet.</div>
+      </div>
+    </div>
+
+    <!-- STAFF -->
+    <div class="panel" id="panel-staff">
+      <div class="section-header">
+        <div class="section-title">STAFF MANAGEMENT</div>
+        <div class="section-line"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Add a Seller</div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Full Name</label>
+            <input type="text" id="st-name" placeholder="Seller's name">
+          </div>
+          <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="st-email" placeholder="login email">
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="st-password" placeholder="At least 6 characters">
+          </div>
+          <div class="form-group">
+            <label>Role</label>
+            <select id="st-role">
+              <option value="cashier">Seller (Cashier)</option>
+              <option value="manager">Manager</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="createStaff()">CREATE ACCOUNT</button>
+      </div>
+      <div class="card owner-only" id="admin-registration-card" style="display:none;">
+        <div class="card-title">Register Administrator</div>
+        <div class="form-grid">
+          <div class="form-group"><label>Full Name</label><input id="ad-name" placeholder="Administrator name"></div>
+          <div class="form-group"><label>Email</label><input id="ad-email" type="email" placeholder="Administrator email"></div>
+          <div class="form-group"><label>Password</label><input id="ad-password" type="password" placeholder="At least 6 characters"></div>
+        </div>
+        <button class="btn btn-primary" onclick="createAdminAccount()">REGISTER ADMIN</button>
+      </div>
+      <div class="card">
+        <div class="card-title">Staff Accounts</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
+            <tbody id="staff-table"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" id="st-reset-card" style="display:none;">
+        <div class="card-title">Reset Password for <span id="st-reset-name"></span></div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>New Password</label>
+            <input type="password" id="st-reset-password" placeholder="At least 6 characters">
+          </div>
+        </div>
+        <div style="display:flex;gap:1rem;">
+          <button class="btn btn-primary" onclick="submitPasswordReset()">SET NEW PASSWORD</button>
+          <button class="btn btn-secondary" onclick="cancelPasswordReset()">CANCEL</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SYSTEM SETTINGS -->
+    <div class="panel" id="panel-settings">
+      <div class="section-header"><div class="section-title">SYSTEM SETTINGS</div><div class="section-line"></div></div>
+      <div class="card">
+        <div class="card-title">Owner Security &amp; Interface Settings</div>
+        <div class="form-grid">
+          <div class="form-group"><label>Admin inactivity lock</label><select id="setting-timeout"><option value="5">5 minutes</option><option value="10">10 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select></div>
+          <div class="form-group"><label>Full login required after</label><select id="setting-full-login"><option value="2">2 hours</option><option value="4">4 hours</option><option value="8">8 hours</option><option value="12">12 hours</option></select></div>
+          <div class="form-group"><label>4-digit quick unlock PIN</label><input id="setting-pin" inputmode="numeric" maxlength="4" placeholder="Set a 4-digit PIN"></div>
+        </div>
+        <div class="settings-note">The quick PIN is stored as a secure hash in the backend database. Three wrong PIN attempts disable quick unlock and require a fresh admin login.</div>
+        <button class="btn btn-primary" id="save-settings-btn" onclick="saveSystemSettings()">SAVE SETTINGS</button>
+      </div>
+      <div class="card admin-only" id="shop-settings-card" style="display:none;">
+        <div class="card-title">SHOP BRANDING</div>
+        <div class="form-grid">
+          <div class="form-group"><label>Shop Name</label><input id="shop-name-input" type="text" placeholder="Business name"></div>
+          <div class="form-group"><label>Shop Logo</label><input id="shop-logo-input" type="file" accept="image/*"></div>
+        </div>
+        <div class="settings-note">Branding changes are saved on the central server and then synchronized to connected devices.</div>
+        <button class="btn btn-primary" onclick="saveShopSettings()">SAVE BRANDING</button>
+      </div>
+      <div class="card">
+        <div class="card-title">System Behaviour</div>
+        <div class="settings-list">
+          <div><strong>Offline-first sales:</strong> sales are saved immediately on the local database and synchronized automatically when the central server is reachable.</div>
+          <div><strong>Central-only administration:</strong> product catalogue, staff accounts and shop branding changes are saved on the central server.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- AUDIT LOG -->
+    <div class="panel" id="panel-audit">
+      <div class="section-header">
+        <div class="section-title">AUDIT LOG</div>
+        <div class="section-line"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Recent Activity</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Staff</th><th>Action</th><th>Details</th><th>Reason</th></tr></thead>
+            <tbody id="audit-table"></tbody>
+          </table>
+        </div>
+        <div id="audit-empty" class="empty-state" style="display:none;">No activity recorded yet.</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="sale-detail-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;"><div class="card-title">SALE DETAILS</div><button class="btn btn-secondary" onclick="closeSaleDetail()">CLOSE</button></div>
+    <div id="sale-detail-content"></div>
+  </div>
+</div>
+
+<div id="reason-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-card reason-modal-card">
+    <div class="modal-heading"><div><div class="modal-kicker">ACTION REQUIRED</div><div class="modal-title" id="reason-modal-title">Select a reason</div></div><button class="modal-close" onclick="closeReasonModal(null)">×</button></div>
+    <div class="form-group"><label>Reason</label><select id="reason-modal-select"></select></div>
+    <div class="modal-actions"><button class="btn btn-secondary" onclick="closeReasonModal(null)">CANCEL</button><button class="btn btn-primary" onclick="submitReasonModal()">CONTINUE</button></div>
+  </div>
+</div>
+
+<div id="admin-lock-modal" class="modal-overlay" style="display:none;">
+  <div class="modal-card lock-modal-card">
+    <div class="modal-kicker">ADMIN SECURITY</div><div class="modal-title">Session locked</div>
+    <p id="admin-lock-message">Enter your 4-digit PIN to continue.</p>
+    <input id="admin-lock-pin" class="pin-input" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••">
+    <div id="admin-lock-error" class="login-error"></div>
+    <div class="modal-actions"><button class="btn btn-danger" onclick="forceAdminLogin()">FULL LOGIN</button><button class="btn btn-primary" onclick="unlockAdminSession()">UNLOCK</button></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"><div class="toast-icon" id="toast-icon">✓</div><div class="toast-content"><div class="toast-title" id="toast-title">Notification</div><div class="toast-message" id="toast-message"></div></div><button class="toast-ok" onclick="closeToast()">OK</button></div>
+
+<script src="app.js"></script>
+</body>
+</html>

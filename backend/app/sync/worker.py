@@ -1,0 +1,247 @@
+"""Durable background synchronization for local/offline devices."""
+import json
+import threading
+import time
+from datetime import datetime, timezone
+
+import requests
+from flask import current_app
+
+from app.extensions import db
+from app.models import (
+    Product, Shop, Staff, SystemSetting, Sale, SaleItem, SalePayment, StockMovement,
+    SyncOutboxItem, SyncState,
+)
+from app.sync.device import get_current_device_id
+
+SYNC_INTERVAL_SECONDS = 5
+BATCH_SIZE = 50
+REQUEST_TIMEOUT_SECONDS = 8
+LAST_PULL_KEY = "last_pull_at"
+
+
+def _set_state(key, value):
+    row = SyncState.query.get(key)
+    if not row:
+        row = SyncState(key=key)
+        db.session.add(row)
+    row.value = value
+
+
+def push_pending_once(app) -> dict:
+    with app.app_context():
+        items = (SyncOutboxItem.query.filter_by(status="pending")
+                 .order_by(SyncOutboxItem.created_at.asc()).limit(BATCH_SIZE).all())
+        if not items:
+            return {"pushed": 0, "confirmed": 0, "failed": 0}
+
+        device_id = get_current_device_id()
+        batch = [{
+            "outbox_id": item.id,
+            "table_name": item.table_name,
+            "record_id": item.record_id,
+            "payload": json.loads(item.payload_json),
+        } for item in items]
+
+        url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/push"
+        headers = {"X-Sync-Key": current_app.config["SYNC_API_KEY"]}
+        try:
+            resp = requests.post(url, json={"device_id": device_id, "items": batch}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+        except requests.RequestException as exc:
+            for item in items:
+                item.attempt_count = (item.attempt_count or 0) + 1
+                item.last_attempt_at = datetime.now(timezone.utc)
+                item.last_error = str(exc)
+            _set_state("last_sync_error", str(exc))
+            db.session.commit()
+            return {"pushed": 0, "confirmed": 0, "failed": len(items)}
+
+        by_id = {r.get("outbox_id"): r for r in results}
+        confirmed = failed = 0
+        for item in items:
+            result = by_id.get(item.id) or {}
+            if result.get("status") == "ok":
+                if item.table_name == "sales" and result.get("invoice_number"):
+                    sale = Sale.query.get(item.record_id)
+                    if sale and sale.invoice_number != result["invoice_number"]:
+                        sale.invoice_number = result["invoice_number"]
+                db.session.delete(item)
+                confirmed += 1
+            else:
+                item.attempt_count = (item.attempt_count or 0) + 1
+                item.last_attempt_at = datetime.now(timezone.utc)
+                item.last_error = result.get("error", "Unknown synchronization error")
+                # Business-rule conflicts should stop retrying forever and
+                # remain visible to the owner for reconciliation.
+                if result.get("status") == "error" and item.attempt_count >= 3:
+                    error_text = item.last_error.lower()
+                    if any(x in error_text for x in ("exceeds", "unknown sale", "not enough stock", "conflict")):
+                        item.status = "needs_review"
+                failed += 1
+
+        _set_state("last_sync_at", datetime.now(timezone.utc).isoformat())
+        _set_state("last_sync_error", "")
+        db.session.commit()
+        return {"pushed": len(items), "confirmed": confirmed, "failed": failed}
+
+
+def _upsert_transactions(data):
+    # Remote sales are authoritative. Existing local sales keep their UUID;
+    # central invoice/status/timestamp changes are applied without creating
+    # duplicate rows. Relationships are loaded explicitly for speed.
+    for raw in data.get("sales", []):
+        sale = Sale.query.get(raw["id"])
+        if not sale:
+            sale = Sale(id=raw["id"])
+            db.session.add(sale)
+        sale.invoice_number = raw.get("invoice_number")
+        sale.shop_id = raw.get("shop_id")
+        sale.device_id = raw.get("device_id")
+        sale.staff_id = raw.get("staff_id")
+        sale.customer_name = raw.get("customer_name")
+        sale.payment_method = raw.get("payment_method", "cash")
+        sale.total_amount = raw.get("total_amount", 0)
+        sale.created_at = raw.get("created_at")
+        sale.updated_at = raw.get("updated_at") or raw.get("created_at")
+        sale.server_received_at = raw.get("server_received_at")
+        sale.voided_at = raw.get("voided_at")
+        sale.voided_by_staff_id = raw.get("voided_by_staff_id")
+        sale.void_reason = raw.get("void_reason")
+
+    for raw in data.get("sale_items", []):
+        item = SaleItem.query.get(raw["id"])
+        if not item:
+            item = SaleItem(id=raw["id"])
+            db.session.add(item)
+        item.sale_id = raw["sale_id"]
+        item.product_id = raw["product_id"]
+        item.quantity = raw["quantity"]
+        item.unit_price = raw["unit_price"]
+        item.subtotal = raw["subtotal"]
+        item.unit_cost = raw.get("unit_cost", 0)
+
+    for raw in data.get("payments", []):
+        payment = SalePayment.query.get(raw["id"])
+        if not payment:
+            payment = SalePayment(id=raw["id"])
+            db.session.add(payment)
+        payment.sale_id = raw["sale_id"]
+        payment.amount = raw["amount"]
+        payment.device_id = raw.get("device_id")
+        payment.staff_id = raw.get("staff_id")
+        payment.created_at = raw.get("created_at")
+        payment.updated_at = raw.get("updated_at") or raw.get("created_at")
+        payment.server_received_at = raw.get("server_received_at")
+
+    for raw in data.get("stock_movements", []):
+        movement = StockMovement.query.get(raw["id"])
+        if not movement:
+            movement = StockMovement(id=raw["id"])
+            db.session.add(movement)
+        movement.product_id = raw["product_id"]
+        movement.shop_id = raw.get("shop_id")
+        movement.device_id = raw.get("device_id")
+        movement.quantity_delta = raw["quantity_delta"]
+        movement.reason = raw["reason"]
+        movement.reference_id = raw.get("reference_id")
+        movement.created_at = raw.get("created_at")
+        movement.updated_at = raw.get("updated_at") or raw.get("created_at")
+        movement.server_received_at = raw.get("server_received_at")
+
+
+def pull_reference_data_once(app) -> dict:
+    with app.app_context():
+        state = SyncState.query.get(LAST_PULL_KEY)
+        since = state.value if state else None
+        url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/pull"
+        headers = {"X-Sync-Key": current_app.config["SYNC_API_KEY"]}
+        params = {"since": since} if since else {}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            _set_state("last_pull_error", str(exc))
+            db.session.commit()
+            return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
+
+        for raw in data.get("shops", []):
+            shop = Shop.query.get(raw["id"])
+            if not shop:
+                shop = Shop(id=raw["id"])
+                db.session.add(shop)
+            shop.name = raw["name"]
+            shop.location = raw.get("location")
+            shop.logo_data = raw.get("logo_data")
+
+        for raw in data.get("staff", []):
+            staff = Staff.query.get(raw["id"])
+            if not staff:
+                staff = Staff(id=raw["id"])
+                db.session.add(staff)
+            staff.shop_id = raw.get("shop_id")
+            staff.name = raw["name"]
+            staff.email = raw["email"]
+            staff.password_hash = raw["password_hash"]
+            staff.quick_pin_hash = raw.get("quick_pin_hash")
+            staff.role = raw["role"]
+            staff.is_active = raw["is_active"]
+
+        for raw in data.get("settings", []):
+            setting = SystemSetting.query.filter_by(key=raw["key"]).first()
+            if not setting:
+                setting = SystemSetting(key=raw["key"])
+                db.session.add(setting)
+            setting.value = raw.get("value")
+
+        for raw in data.get("products", []):
+            product = Product.query.get(raw["id"])
+            if not product:
+                product = Product(id=raw["id"])
+                db.session.add(product)
+            product.sku = raw["sku"]
+            product.name = raw["name"]
+            product.category = raw.get("category")
+            product.unit_price = raw["unit_price"]
+            product.cost_price = raw.get("cost_price", 0)
+            product.is_active = raw.get("is_active", True)
+
+        _upsert_transactions(data)
+        if not state:
+            state = SyncState(key=LAST_PULL_KEY)
+            db.session.add(state)
+        state.value = data["server_time"]
+        _set_state("last_pull_success", data["server_time"])
+        _set_state("last_pull_error", "")
+        db.session.commit()
+        return {
+            "shops": len(data.get("shops", [])),
+            "staff": len(data.get("staff", [])),
+            "products": len(data.get("products", [])),
+            "settings": len(data.get("settings", [])),
+            "sales": len(data.get("sales", [])),
+            "payments": len(data.get("payments", [])),
+            "stock_movements": len(data.get("stock_movements", [])),
+        }
+
+
+def start_background_sync(app):
+    def loop():
+        while True:
+            try:
+                if app.config.get("GLR_MODE") == "local":
+                    push_pending_once(app)
+                    pull_reference_data_once(app)
+            except Exception:
+                pass
+            time.sleep(SYNC_INTERVAL_SECONDS)
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
+
+
+def trigger_sync_soon(app):
+    thread = threading.Thread(target=lambda: (push_pending_once(app), pull_reference_data_once(app)), daemon=True)
+    thread.start()

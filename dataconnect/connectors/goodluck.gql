@@ -1,0 +1,26 @@
+# Initial read operations. Keep writes behind the Flask service until the
+# migration is explicitly approved; this prevents two competing authorities.
+
+query RecentSales($limit: Int = 100) @auth(level: USER) {
+  sales(orderBy: {created_at: DESC}, limit: $limit) {
+    id
+    invoice_number
+    customer_name
+    total_amount
+    created_at
+    updated_at
+    voided_at
+    void_reason
+  }
+}
+
+query Products($limit: Int = 500) @auth(level: USER) {
+  products(where: {is_active: {eq: true}}, orderBy: {name: ASC}, limit: $limit) {
+    id
+    sku
+    name
+    category
+    unit_price
+    is_active
+  }
+}

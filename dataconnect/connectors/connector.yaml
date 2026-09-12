@@ -1,0 +1,9 @@
+connectorId: goodluckRahman
+generate:
+  javascriptSdk:
+    outputDir: ../generated/web
+    package: "@goodluck-rahman/dataconnect-generated"
+    packageJsonDir: ../..
+    clientCache:
+      maxAge: "30s"
+      storage: "memory"

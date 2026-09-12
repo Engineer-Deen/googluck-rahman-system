@@ -1,0 +1,16 @@
+# Firebase SQL Connect preparation for Good Luck Rahman Enterprise.
+# Replace serviceId, location, database and instanceId with the actual
+# Firebase/Cloud SQL resources before the first production deployment.
+specVersion: "v1"
+serviceId: goodluck-rahman-sql
+location: us-central1
+schema:
+  source: ./schema
+  datasource:
+    postgresql:
+      database: goodluck_rahman
+      cloudSql:
+        instanceId: goodluck-rahman-postgres
+        schemaValidation: COMPATIBLE
+connectorDirs:
+  - ./connectors
