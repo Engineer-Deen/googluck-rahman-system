@@ -29,22 +29,24 @@ products_bp = Blueprint("products", __name__, url_prefix="/api/products")
 FINANCE_ROLES = ("owner", "admin", "manager")
 
 
-def current_stock(product_id):
-    total = (
-        db.session.query(func.coalesce(func.sum(StockMovement.quantity_delta), 0))
-        .filter(StockMovement.product_id == product_id)
-        .scalar()
-    )
+def current_stock(product_id, shop_id=None):
+    query = db.session.query(func.coalesce(func.sum(StockMovement.quantity_delta), 0))
+    query = query.filter(StockMovement.product_id == product_id)
+    if shop_id is not None:
+        query = query.filter(StockMovement.shop_id == shop_id)
+    total = query.scalar()
     return int(total)
 
 
-def stock_map(product_ids=None):
+def stock_map(product_ids=None, shop_id=None):
     query = db.session.query(
         StockMovement.product_id,
         func.coalesce(func.sum(StockMovement.quantity_delta), 0),
     )
     if product_ids:
         query = query.filter(StockMovement.product_id.in_(list(product_ids)))
+    if shop_id is not None:
+        query = query.filter(StockMovement.shop_id == shop_id)
     return {int(pid): int(total or 0) for pid, total in query.group_by(StockMovement.product_id).all()}
 
 
@@ -97,7 +99,8 @@ def list_products():
     if not include_inactive:
         query = query.filter_by(is_active=True)
     products = query.order_by(Product.name).all()
-    stocks = stock_map(p.id for p in products)
+    shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+    stocks = stock_map((p.id for p in products), shop_id=shop_id)
     return jsonify([serialize_product(p, role=g.staff_role, stock_value=stocks.get(p.id, 0)) for p in products])
 
 
@@ -105,7 +108,8 @@ def list_products():
 @login_required
 def get_product(product_id):
     p = Product.query.get_or_404(product_id)
-    return jsonify(serialize_product(p, role=g.staff_role))
+    shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+    return jsonify(serialize_product(p, role=g.staff_role, stock_value=current_stock(product_id, shop_id)))
 
 
 @products_bp.post("")

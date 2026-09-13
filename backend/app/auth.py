@@ -22,6 +22,7 @@ def issue_token(staff: Staff) -> str:
         "staff_id": staff.id,
         "role": staff.role,
         "shop_id": staff.shop_id,
+        "issued_at_ms": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
         "exp": datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(days=7),
         "iat": datetime.datetime.now(datetime.timezone.utc),
@@ -31,6 +32,16 @@ def issue_token(staff: Staff) -> str:
 
 def decode_token(token: str):
     return jwt.decode(token, current_app.config["JWT_SECRET_KEY"], algorithms=[ALGORITHM])
+
+
+def _token_issued_after_staff_update(payload, staff: Staff) -> bool:
+    issued_at_ms = payload.get("issued_at_ms")
+    if issued_at_ms is None or staff.updated_at is None:
+        return True
+    updated_at = staff.updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=datetime.timezone.utc)
+    return issued_at_ms >= int(updated_at.timestamp() * 1000)
 
 
 def login_required(fn):
@@ -47,9 +58,17 @@ def login_required(fn):
         except jwt.InvalidTokenError:
             return jsonify(error="Invalid token"), 401
 
-        g.staff_id = payload["staff_id"]
-        g.staff_role = payload["role"]
-        g.staff_shop_id = payload["shop_id"]
+        staff = Staff.query.get(payload.get("staff_id"))
+        if not staff or not staff.is_active:
+            return jsonify(error="Account is inactive, please log in again"), 401
+        if not _token_issued_after_staff_update(payload, staff):
+            return jsonify(error="Session is no longer valid, please log in again"), 401
+        if payload.get("role") != staff.role or payload.get("shop_id") != staff.shop_id:
+            return jsonify(error="Authorization changed, please log in again"), 401
+
+        g.staff_id = staff.id
+        g.staff_role = staff.role
+        g.staff_shop_id = staff.shop_id
         return fn(*args, **kwargs)
 
     return wrapper

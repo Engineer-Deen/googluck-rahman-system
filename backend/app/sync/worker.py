@@ -65,7 +65,10 @@ def push_pending_once(app) -> dict:
         } for item in items]
 
         url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/push"
-        headers = {"X-Sync-Key": current_app.config["SYNC_API_KEY"]}
+        headers = {
+            "X-Sync-Key": current_app.config["SYNC_API_KEY"],
+            "X-Device-ID": device_id,
+        }
         try:
             resp = requests.post(url, json={"device_id": device_id, "items": batch}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
             resp.raise_for_status()
@@ -177,7 +180,10 @@ def pull_reference_data_once(app) -> dict:
         state = SyncState.query.get(LAST_PULL_KEY)
         since = state.value if state else None
         url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/pull"
-        headers = {"X-Sync-Key": current_app.config["SYNC_API_KEY"]}
+        headers = {
+            "X-Sync-Key": current_app.config["SYNC_API_KEY"],
+            "X-Device-ID": get_current_device_id(),
+        }
         params = {"since": since} if since else {}
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -200,13 +206,16 @@ def pull_reference_data_once(app) -> dict:
         for raw in data.get("staff", []):
             staff = Staff.query.get(raw["id"])
             if not staff:
-                staff = Staff(id=raw["id"])
-                db.session.add(staff)
+                # Authentication secrets are intentionally absent from sync
+                # payloads. A new account must be provisioned through the
+                # authenticated account flow before it can be used offline.
+                continue
             staff.shop_id = raw.get("shop_id")
             staff.name = raw["name"]
             staff.email = raw["email"]
-            staff.password_hash = raw["password_hash"]
-            staff.quick_pin_hash = raw.get("quick_pin_hash")
+            # Authentication secrets are never synchronized. Existing local
+            # credentials remain intact; central account changes require the
+            # normal authenticated login/update flow.
             staff.role = raw["role"]
             staff.is_active = raw["is_active"]
 

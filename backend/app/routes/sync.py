@@ -19,10 +19,10 @@ _check_sync_key() plus a devices table lookup, not a redesign.
 """
 from datetime import datetime, timezone
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy import func
 
-from app.auth import login_required
+from app.auth import login_required, roles_required
 from app.extensions import db
 from app.models import Device, Product, Sale, SaleItem, SalePayment, Shop, Staff, SystemSetting, StockMovement, SyncOutboxItem, SyncState
 from app.routes.sales import apply_payment, apply_sale
@@ -40,20 +40,19 @@ def _check_sync_key() -> bool:
     return bool(expected) and key == expected
 
 
-def _ensure_device_registered(device_id: str):
+def _get_bound_device(device_id: str):
     if not device_id:
-        return
+        return None
     device = Device.query.get(device_id)
-    if not device:
-        # Postgres enforces the foreign key from sales/stock_movements to
-        # devices, so a device must exist here before we can insert
-        # anything referencing it. Auto-register with minimal info; a
-        # richer registration endpoint can fill in shop/name/platform
-        # later without breaking this.
-        device = Device(id=device_id)
-        db.session.add(device)
+    if not device or device.shop_id is None:
+        return None
     device.last_seen_at = datetime.now(timezone.utc)
     db.session.commit()
+    return device
+
+
+def _device_error():
+    return jsonify(error="This device is not registered to an authorized shop"), 403
 
 
 def _parse_cursor(value: str):
@@ -63,13 +62,25 @@ def _parse_cursor(value: str):
     return datetime.fromisoformat(value)
 
 
-def _pull_high_watermark():
+def _pull_high_watermark(shop_id):
     """Return the latest committed update timestamp across pulled entities.
 
     Capture this from persisted data before reading any result rows. It is a
     data boundary, rather than a later application-server wall-clock value.
     """
-    values = [db.session.query(func.max(model.updated_at)).scalar() for model in _PULL_MODELS]
+    scoped_queries = [
+        (Shop, (Shop.id == shop_id,)),
+        (Staff, (Staff.shop_id == shop_id,)),
+        (Product, ()),
+        (Sale, (Sale.shop_id == shop_id,)),
+        (SalePayment, (SalePayment.sale_id.in_(db.session.query(Sale.id).filter(Sale.shop_id == shop_id)),)),
+        (StockMovement, (StockMovement.shop_id == shop_id,)),
+        (SystemSetting, ()),
+    ]
+    values = [
+        db.session.query(func.max(model.updated_at)).filter(*filters).scalar()
+        for model, filters in scoped_queries
+    ]
     values = [value for value in values if value is not None]
     return max(values) if values else None
 
@@ -83,7 +94,9 @@ def push():
     device_id = data.get("device_id")
     items = data.get("items") or []
 
-    _ensure_device_registered(device_id)
+    device = _get_bound_device(device_id)
+    if not device:
+        return _device_error()
 
     results = []
     for item in items:
@@ -94,14 +107,26 @@ def push():
         try:
             result_extra = {}
             if table_name == "sales":
+                if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                    raise ValueError("Sale shop does not match the registered device shop")
+                payload["device_id"] = device.id
                 payload["assign_invoice"] = True
                 payload["validate_stock"] = False
                 sale, _, _ = apply_sale(payload)
                 result_extra = {"invoice_number": sale.invoice_number}
             elif table_name == "sale_payments":
+                sale = Sale.query.get(payload.get("sale_id"))
+                if not sale or sale.shop_id != device.shop_id:
+                    raise ValueError("Payment sale does not match the registered device shop")
+                if payload.get("device_id") not in (None, device.id):
+                    raise ValueError("Payment device does not match the registered device")
+                payload["device_id"] = device.id
                 sale, _, _ = apply_payment(payload)
                 result_extra = {}
             elif table_name == "stock_movements":
+                if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                    raise ValueError("Stock movement shop does not match the registered device shop")
+                payload["device_id"] = device.id
                 apply_stock_movement(payload)
             else:
                 results.append(
@@ -126,6 +151,11 @@ def pull():
     if not _check_sync_key():
         return jsonify(error="Invalid or missing sync key"), 401
 
+    device = _get_bound_device(request.headers.get("X-Device-ID", ""))
+    if not device:
+        return _device_error()
+    shop_id = device.shop_id
+
     since_raw = request.args.get("since")
     since = None
     if since_raw:
@@ -137,7 +167,7 @@ def pull():
     # This endpoint is currently an unpaginated, high-water-mark-bounded pull.
     # If pagination is added later, every page must retain this same upper bound
     # until the client has consumed the complete snapshot.
-    high_watermark = _pull_high_watermark()
+    high_watermark = _pull_high_watermark(shop_id)
 
     def changed(query, model):
         if since:
@@ -150,14 +180,25 @@ def pull():
             query = query.filter(model.updated_at <= high_watermark)
         return query
 
-    shops = changed(Shop.query, Shop).all()
-    staff = changed(Staff.query, Staff).all()
-    products = changed(Product.query, Product).all()
-    sales = changed(Sale.query, Sale).all()
+    shops = changed(Shop.query.filter(Shop.id == shop_id), Shop).all()
+    staff = changed(Staff.query.filter(Staff.shop_id == shop_id), Staff).all()
+    products = changed(
+        Product.query.filter(
+            Product.id.in_(
+                db.session.query(StockMovement.product_id)
+                .filter(StockMovement.shop_id == shop_id)
+            )
+        ),
+        Product,
+    ).all()
+    sales = changed(Sale.query.filter(Sale.shop_id == shop_id), Sale).all()
     sale_ids = [s.id for s in sales]
     sale_items = SaleItem.query.filter(SaleItem.sale_id.in_(sale_ids)).all() if sale_ids else []
-    payments = changed(SalePayment.query, SalePayment).all()
-    movements = changed(StockMovement.query, StockMovement).all()
+    payments = changed(
+        SalePayment.query.join(Sale, Sale.id == SalePayment.sale_id).filter(Sale.shop_id == shop_id),
+        SalePayment,
+    ).all()
+    movements = changed(StockMovement.query.filter(StockMovement.shop_id == shop_id), StockMovement).all()
     settings = changed(SystemSetting.query, SystemSetting).all()
 
     return jsonify(
@@ -169,18 +210,12 @@ def pull():
             {"id": s.id, "name": s.name, "location": s.location, "logo_data": s.logo_data}
             for s in shops
         ],
-        # password_hash is included deliberately -- it's an already-salted
-        # hash (never the plaintext password), and local devices need it
-        # to verify logins while fully offline. Same principle as any
-        # offline-capable auth cache.
         staff=[
             {
                 "id": s.id,
                 "shop_id": s.shop_id,
                 "name": s.name,
                 "email": s.email,
-                "password_hash": s.password_hash,
-                "quick_pin_hash": s.quick_pin_hash,
                 "role": s.role,
                 "is_active": s.is_active,
             }
@@ -225,6 +260,34 @@ def pull():
             "server_received_at": m.server_received_at.isoformat() if m.server_received_at else None
         } for m in movements],
     )
+
+
+@sync_bp.post("/devices")
+@roles_required("owner", "admin")
+def register_device():
+    data = request.get_json(silent=True) or {}
+    device_id = (data.get("device_id") or "").strip()
+    if not device_id:
+        return jsonify(error="device_id is required"), 400
+    try:
+        requested_shop_id = int(data.get("shop_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="shop_id must be a valid shop id"), 400
+    if g.staff_role != "owner" and requested_shop_id != g.staff_shop_id:
+        return jsonify(error="Administrators can only register devices for their own shop"), 403
+    if not Shop.query.get(requested_shop_id):
+        return jsonify(error="The selected shop does not exist"), 400
+
+    device = Device.query.get(device_id)
+    if not device:
+        device = Device(id=device_id)
+        db.session.add(device)
+    device.shop_id = requested_shop_id
+    device.name = data.get("name")
+    device.platform = data.get("platform")
+    device.last_seen_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify(id=device.id, shop_id=device.shop_id, name=device.name, platform=device.platform), 201
 
 
 @sync_bp.post("/trigger")

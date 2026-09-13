@@ -112,18 +112,22 @@ def create_stock_movement():
         trigger_sync_soon(current_app._get_current_object())
 
     product = Product.query.get(payload["product_id"])
+    shop_id = None if g.staff_role == "owner" else g.staff_shop_id
     return jsonify(
         id=movement.id,
-        product=serialize_product(product),
-        new_stock=current_stock(payload["product_id"]),
+        product=serialize_product(product, stock_value=current_stock(payload["product_id"], shop_id)),
+        new_stock=current_stock(payload["product_id"], shop_id),
     ), 201 if created else 200
 
 
 @stock_bp.get("/product/<int:product_id>")
 @login_required
 def stock_history(product_id):
+    query = StockMovement.query.filter_by(product_id=product_id)
+    if g.staff_role != "owner":
+        query = query.filter_by(shop_id=g.staff_shop_id)
     movements = (
-        StockMovement.query.filter_by(product_id=product_id)
+        query
         .order_by(StockMovement.created_at.desc())
         .limit(100)
         .all()

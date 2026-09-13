@@ -1,6 +1,7 @@
 import os
 
 from app import create_app
+from app.config import server_host
 
 app = create_app()
 
@@ -29,4 +30,4 @@ if _should_start_worker():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000 if os.environ.get("GLR_MODE", "local") == "local" else 8000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host=server_host(app.config["GLR_MODE"]), port=port, debug=True)

@@ -1,11 +1,12 @@
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 from flask import Flask
 
 from app.extensions import db
-from app.models import Product, Shop, Staff, SyncState
+from app.models import Device, Product, Shop, Staff, StockMovement, SyncState
 from app.routes.sync import sync_bp
 from app.sync.worker import LAST_PULL_KEY, pull_reference_data_once
 
@@ -30,6 +31,7 @@ class SyncCursorTests(unittest.TestCase):
             GLR_MODE="local",
             SYNC_API_KEY="test-sync-key",
             CENTRAL_SYNC_URL="http://central.test",
+            DEVICE_ID_FILE=Path("cursor-device-id.txt"),
         )
         db.init_app(self.app)
         self.app.register_blueprint(sync_bp)
@@ -38,6 +40,7 @@ class SyncCursorTests(unittest.TestCase):
             db.session.add_all([
                 Shop(id=1, name="Main Shop"),
                 Staff(id=1, name="Admin", email="admin@cursor.test", password_hash="unused", role="admin"),
+                Device(id="cursor-device", shop_id=1),
             ])
             db.session.commit()
 
@@ -45,6 +48,9 @@ class SyncCursorTests(unittest.TestCase):
         with self.app.app_context():
             db.session.remove()
             db.engine.dispose()
+        device_path = self.app.config["DEVICE_ID_FILE"]
+        if device_path.exists():
+            device_path.unlink()
 
     def test_boundary_timestamp_replays_rows_committed_after_prior_pull(self):
         boundary = datetime(2026, 1, 2, 3, 4, 5)
@@ -57,10 +63,15 @@ class SyncCursorTests(unittest.TestCase):
                 id=1, sku="FIRST", name="First", unit_price=1, cost_price=1,
                 created_at=boundary, updated_at=boundary,
             ))
+            db.session.add(StockMovement(
+                id="FIRST-MOVEMENT", product_id=1, shop_id=1, quantity_delta=1,
+                reason="restock", created_at=boundary, updated_at=boundary,
+            ))
             db.session.commit()
 
         client = self.app.test_client()
-        first = client.get("/api/sync/pull", headers={"X-Sync-Key": "test-sync-key"})
+        headers = {"X-Sync-Key": "test-sync-key", "X-Device-ID": "cursor-device"}
+        first = client.get("/api/sync/pull", headers=headers)
         self.assertEqual(first.status_code, 200)
         cursor = first.get_json()["next_cursor"]
         self.assertEqual(cursor, boundary.isoformat())
@@ -72,11 +83,15 @@ class SyncCursorTests(unittest.TestCase):
                 id=2, sku="LATE", name="Late boundary row", unit_price=1, cost_price=1,
                 created_at=boundary, updated_at=boundary,
             ))
+            db.session.add(StockMovement(
+                id="LATE-MOVEMENT", product_id=2, shop_id=1, quantity_delta=1,
+                reason="restock", created_at=boundary, updated_at=boundary,
+            ))
             db.session.commit()
 
         second = client.get(
             "/api/sync/pull", query_string={"since": cursor},
-            headers={"X-Sync-Key": "test-sync-key"},
+            headers=headers,
         )
         self.assertEqual(second.status_code, 200)
         self.assertEqual({row["sku"] for row in second.get_json()["products"]}, {"FIRST", "LATE"})

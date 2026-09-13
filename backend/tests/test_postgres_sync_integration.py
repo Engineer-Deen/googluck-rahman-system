@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from werkzeug.serving import make_server
 
 from app.extensions import db
-from app.models import Product, Sale, Shop, Staff, SyncOutboxItem, SyncState
+from app.models import Device, Product, Sale, Shop, Staff, StockMovement, SyncOutboxItem, SyncState
 from app.routes.sales import apply_sale
 from app.routes.sync import sync_bp
 from app.sync.device import get_current_device_id
@@ -77,6 +77,13 @@ class PostgresSyncIntegrationTests(unittest.TestCase):
                     unit_price=10,
                     cost_price=4,
                 ),
+                StockMovement(
+                    id="integration-restock",
+                    product_id=1,
+                    shop_id=1,
+                    quantity_delta=100,
+                    reason="restock",
+                ),
             ])
             db.session.commit()
 
@@ -132,6 +139,11 @@ class PostgresSyncIntegrationTests(unittest.TestCase):
         sale_timestamp = "2026-01-02T05:04:05+02:00"
 
         try:
+            with device_a.app_context():
+                device_id = get_current_device_id()
+            with self.central_app.app_context():
+                db.session.add(Device(id=device_id, shop_id=1))
+                db.session.commit()
             self.assertEqual(pull_reference_data_once(device_a)["products"], 1)
             device_a.config["CENTRAL_SYNC_URL"] = "http://127.0.0.1:1"
             with device_a.app_context():
@@ -183,6 +195,11 @@ class PostgresSyncIntegrationTests(unittest.TestCase):
 
             device_b = self._make_local_app("device-b", self.central_url)
             try:
+                with device_b.app_context():
+                    device_b_id = get_current_device_id()
+                with self.central_app.app_context():
+                    db.session.add(Device(id=device_b_id, shop_id=1))
+                    db.session.commit()
                 pulled = pull_reference_data_once(device_b)
                 self.assertEqual(pulled["sales"], 1)
                 with device_b.app_context():
@@ -201,6 +218,15 @@ class PostgresSyncIntegrationTests(unittest.TestCase):
                         name="Boundary Item",
                         unit_price=1,
                         cost_price=1,
+                        created_at=boundary,
+                        updated_at=boundary,
+                    ))
+                    db.session.add(StockMovement(
+                        id="BOUNDARY-MOVEMENT",
+                        product_id=2,
+                        shop_id=1,
+                        quantity_delta=1,
+                        reason="restock",
                         created_at=boundary,
                         updated_at=boundary,
                     ))

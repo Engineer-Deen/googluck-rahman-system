@@ -24,7 +24,7 @@ from werkzeug.security import generate_password_hash
 from app.audit import log_action
 from app.auth import roles_required
 from app.extensions import db
-from app.models import Staff
+from app.models import Shop, Staff
 
 staff_bp = Blueprint("staff", __name__, url_prefix="/api/staff")
 
@@ -86,8 +86,18 @@ def create_staff():
     if Staff.query.filter_by(email=email).first():
         return jsonify(error=f"An account with email '{email}' already exists"), 409
 
+    requested_shop_id = data.get("shop_id", g.staff_shop_id)
+    try:
+        requested_shop_id = int(requested_shop_id) if requested_shop_id is not None else None
+    except (TypeError, ValueError):
+        return jsonify(error="shop_id must be a valid shop id"), 400
+    if not requested_shop_id or not Shop.query.get(requested_shop_id):
+        return jsonify(error="The selected shop does not exist"), 400
+    if g.staff_role != "owner" and requested_shop_id != g.staff_shop_id:
+        return jsonify(error="Administrators can only create staff for their own shop"), 403
+
     staff = Staff(
-        shop_id=data.get("shop_id", g.staff_shop_id),
+        shop_id=requested_shop_id,
         name=name,
         email=email,
         password_hash=generate_password_hash(password),

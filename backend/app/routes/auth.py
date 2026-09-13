@@ -1,5 +1,5 @@
 from flask import Blueprint, jsonify, request, g
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from werkzeug.security import check_password_hash
 
 from app.auth import issue_token, login_required
@@ -87,6 +87,16 @@ def login():
             "shop_id": staff.shop_id,
         },
     )
+
+
+@auth_bp.post("/logout")
+@login_required
+def logout():
+    """Invalidate the current token by advancing the staff update timestamp."""
+    staff = Staff.query.get(g.staff_id)
+    staff.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify(ok=True)
 
 @auth_bp.post("/verify-pin")
 @login_required

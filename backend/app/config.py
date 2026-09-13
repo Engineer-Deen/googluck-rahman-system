@@ -39,6 +39,10 @@ def _local_instance_dir() -> Path:
 INSTANCE_DIR = _local_instance_dir()
 
 
+def server_host(mode):
+    return "127.0.0.1" if mode == "local" else "0.0.0.0"
+
+
 class BaseConfig:
     GLR_MODE = os.environ.get("GLR_MODE", "local")
     SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -101,5 +105,19 @@ class CentralConfig(BaseConfig):
 def get_config():
     mode = os.environ.get("GLR_MODE", "local")
     if mode == "central":
+        insecure_defaults = {
+            "DATABASE_URL": "postgresql+psycopg2://glr_user:glr_pass@localhost:5432/glr_central",
+            "JWT_SECRET_KEY": "dev-jwt-secret-change-me",
+            "SYNC_API_KEY": "dev-sync-key-change-me",
+        }
+        invalid = [
+            name for name, default in insecure_defaults.items()
+            if os.environ.get(name, default) == default
+        ]
+        if invalid:
+            raise RuntimeError(
+                "Central mode requires explicit production configuration for: "
+                + ", ".join(invalid)
+            )
         return CentralConfig
     return LocalConfig

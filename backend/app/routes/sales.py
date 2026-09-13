@@ -179,7 +179,7 @@ def apply_sale(payload: dict):
         for item in items_data:
             requested[item["product_id"]] = requested.get(item["product_id"], 0) + int(item["quantity"])
         for pid, qty in requested.items():
-            available = current_stock(pid)
+            available = current_stock(pid, payload.get("shop_id"))
             if qty > available:
                 raise ValueError(f"Not enough stock for {products[pid].name}: only {available} available, {qty} requested")
 
@@ -281,7 +281,7 @@ def apply_sale(payload: dict):
 
     stock_warnings = []
     for item in items_data:
-        remaining = current_stock(item["product_id"])
+        remaining = current_stock(item["product_id"], sale.shop_id)
         if remaining < 0:
             stock_warnings.append(
                 {"product_id": item["product_id"], "stock_after_sale": remaining}
@@ -397,6 +397,8 @@ def apply_void(payload: dict):
 def list_sales():
     from datetime import timedelta
     q = Sale.query
+    if g.staff_role != "owner":
+        q = q.filter(Sale.shop_id == g.staff_shop_id)
     period = (request.args.get("period") or "all").lower()
     search = (request.args.get("search") or "").strip()
     try:
@@ -448,6 +450,8 @@ def update_sale(sale_id):
     if not reason:
         return jsonify(error="A reason is required to update a sale"), 400
     sale = Sale.query.get_or_404(sale_id)
+    if g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
+        return jsonify(error="Sale not found"), 404
     if sale.voided_at:
         return jsonify(error="A voided sale cannot be edited"), 400
     now = datetime.now(timezone.utc)
@@ -507,9 +511,9 @@ def update_sale(sale_id):
             old_qty = old_by_product.get(pid, 0)
             new_qty = new_by_product.get(pid, 0)
             delta = old_qty - new_qty
-            if delta < 0 and current_stock(pid) < -delta:
+            if delta < 0 and current_stock(pid, sale.shop_id) < -delta:
                 product = products.get(pid) or Product.query.get(pid)
-                return jsonify(error=f"Not enough stock for {product.name if product else pid}: {current_stock(pid)} available"), 400
+                return jsonify(error=f"Not enough stock for {product.name if product else pid}: {current_stock(pid, sale.shop_id)} available"), 400
             if delta:
                 db.session.add(StockMovement(product_id=pid, shop_id=sale.shop_id, device_id=None, quantity_delta=delta, reason="sale_correction", reference_id=sale.id))
 
@@ -529,6 +533,8 @@ def update_sale(sale_id):
 @login_required
 def get_sale(sale_id):
     sale = (Sale.query.options(selectinload(Sale.items), selectinload(Sale.payments)).get_or_404(sale_id))
+    if g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
+        return jsonify(error="Sale not found"), 404
     product_ids = {i.product_id for i in sale.items}
     product_map = {p.id: p for p in Product.query.filter(Product.id.in_(product_ids)).all()} if product_ids else {}
     return jsonify(serialize_sale(sale, role=g.staff_role, product_map=product_map))
@@ -559,7 +565,7 @@ def create_sale():
 
     payload = {
         "id": data.get("id") or gen_uuid(),
-        "shop_id": data.get("shop_id", g.staff_shop_id),
+        "shop_id": data.get("shop_id", g.staff_shop_id) if g.staff_role == "owner" else g.staff_shop_id,
         "device_id": device_id,
         "staff_id": g.staff_id,
         "customer_name": data.get("customer_name"),
@@ -613,8 +619,9 @@ def create_sale():
     # capability -- the stock_warning already returned by apply_sale()
     # below is what surfaces that rare case after the fact, for an
     # admin to reconcile.
+    stock_shop_id = None if g.staff_role == "owner" else payload["shop_id"]
     for item in payload["items"]:
-        available = current_stock(item["product_id"])
+        available = current_stock(item["product_id"], stock_shop_id)
         if item["quantity"] > available:
             product = Product.query.get(item["product_id"])
             name = product.name if product else f"product #{item['product_id']}"
@@ -660,6 +667,9 @@ def add_payment(sale_id):
     from flask import current_app
 
     data = request.get_json(silent=True) or {}
+    sale = Sale.query.get(sale_id)
+    if sale and g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
+        return jsonify(error="Sale not found"), 404
     try:
         amount = Decimal(str(data.get("amount", 0)))
     except Exception:
@@ -717,6 +727,8 @@ def void_sale(sale_id):
         sale = Sale.query.get(sale_id)
         if not sale:
             return jsonify(error="Sale not found"), 404
+        if g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
+            return jsonify(error="Sale not found"), 404
         if sale.voided_at:
             return jsonify(serialize_sale(sale, role=g.staff_role)), 200
 
@@ -755,6 +767,8 @@ def void_sale(sale_id):
     import requests
 
     local_sale = Sale.query.get(sale_id)
+    if local_sale and g.staff_role != "owner" and local_sale.shop_id != g.staff_shop_id:
+        return jsonify(error="Sale not found"), 404
     reversal_ids = {item.id: gen_uuid() for item in local_sale.items} if local_sale else {}
 
     payload = {
