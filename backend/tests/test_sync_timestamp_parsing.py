@@ -1,6 +1,4 @@
-import tempfile
 import unittest
-from pathlib import Path
 from datetime import timezone
 
 from flask import Flask
@@ -13,10 +11,9 @@ from app.sync.worker import _parse_datetime, _upsert_transactions
 
 class SyncTimestampParsingTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
         self.app = Flask(__name__)
         self.app.config.update(
-            SQLALCHEMY_DATABASE_URI=f"sqlite:///{Path(self.temp_dir.name) / 'local.sqlite'}",
+            SQLALCHEMY_DATABASE_URI="sqlite://",
             SQLALCHEMY_TRACK_MODIFICATIONS=False,
             GLR_MODE="local",
         )
@@ -34,7 +31,6 @@ class SyncTimestampParsingTests(unittest.TestCase):
         with self.app.app_context():
             db.session.remove()
             db.engine.dispose()
-        self.temp_dir.cleanup()
 
     def test_parse_iso8601_preserves_offset_and_null(self):
         utc_value = _parse_datetime("2026-01-02T03:04:05Z")

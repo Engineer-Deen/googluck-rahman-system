@@ -1,7 +1,5 @@
-import tempfile
 import unittest
 from datetime import datetime
-from pathlib import Path
 from unittest.mock import patch
 
 from flask import Flask
@@ -25,10 +23,9 @@ class _Response:
 
 class SyncCursorTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
         self.app = Flask(__name__)
         self.app.config.update(
-            SQLALCHEMY_DATABASE_URI=f"sqlite:///{Path(self.temp_dir.name) / 'sync.sqlite'}",
+            SQLALCHEMY_DATABASE_URI="sqlite://",
             SQLALCHEMY_TRACK_MODIFICATIONS=False,
             GLR_MODE="local",
             SYNC_API_KEY="test-sync-key",
@@ -48,7 +45,6 @@ class SyncCursorTests(unittest.TestCase):
         with self.app.app_context():
             db.session.remove()
             db.engine.dispose()
-        self.temp_dir.cleanup()
 
     def test_boundary_timestamp_replays_rows_committed_after_prior_pull(self):
         boundary = datetime(2026, 1, 2, 3, 4, 5)

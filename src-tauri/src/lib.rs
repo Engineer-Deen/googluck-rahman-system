@@ -12,7 +12,7 @@ pub fn run() {
             }
 
             let sidecar_command = tauri_plugin_shell::ShellExt::shell(app.handle())
-                .sidecar("goodluck-backend-x86_64-pc-windows-msvc")
+                .sidecar("goodluck-backend")
                 .expect("failed to create backend sidecar command");
 
             tauri::async_runtime::spawn(async move {
