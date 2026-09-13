@@ -81,8 +81,8 @@ function toast(message, kind) {
   if (!el || !msg) return;
   clearTimeout(toastTimer);
   msg.textContent = message;
-  title.textContent = kind === "error" ? "Action needs attention" : kind === "success" ? "Completed" : "Notification";
-  icon.textContent = kind === "error" ? "!" : kind === "success" ? "✓" : "i";
+  title.textContent = kind === "error" ? "Action needs attention" : kind === "warning" ? "Needs attention" : kind === "success" ? "Completed" : "Notification";
+  icon.textContent = kind === "error" ? "!" : kind === "warning" ? "!" : kind === "success" ? "✓" : "i";
   el.className = "toast show" + (kind ? " " + kind : "");
 }
 function closeToast() {
@@ -98,13 +98,38 @@ async function api(path, options = {}) {
   );
   if (authToken) headers["Authorization"] = "Bearer " + authToken;
 
-  const res = await fetch(API_BASE + path, Object.assign({}, options, { headers }));
+  let res;
+  try {
+    res = await fetch(API_BASE + path, Object.assign({}, options, { headers }));
+  } catch (_) {
+    const error = new Error("The local POS server is unavailable.");
+    error.networkFailure = true;
+    throw error;
+  }
   let data = null;
   try { data = await res.json(); } catch (e) { /* no body */ }
 
   if (!res.ok) {
-    const message = (data && data.error) || `Request failed (${res.status})`;
-    throw new Error(message);
+    if (res.status === 401 && !path.endsWith("/auth/login")) {
+      authToken = null;
+      currentStaff = null;
+      localStorage.removeItem("glr_token");
+      localStorage.removeItem("glr_staff");
+      document.getElementById("app").classList.remove("visible");
+      document.getElementById("login-overlay").style.display = "flex";
+      toast("Your session expired. Please log in again.", "error");
+    }
+    const rawMessage = (data && data.error) || `Request failed (${res.status})`;
+    const message = res.status === 403
+      ? `UNAUTHORIZED: ${rawMessage}`
+      : res.status === 503
+        ? `CENTRAL SERVER UNAVAILABLE: ${rawMessage}`
+        : /not enough stock|out of stock/i.test(rawMessage)
+          ? `OUT OF STOCK: ${rawMessage}`
+          : rawMessage;
+    const error = new Error(message);
+    error.authExpired = res.status === 401 && !path.endsWith("/auth/login");
+    throw error;
   }
   return data;
 }
@@ -154,7 +179,10 @@ async function doLogin() {
   }
 }
 
-function doLogout() {
+async function doLogout() {
+  try {
+    if (authToken) await api("/auth/logout", { method: "POST" });
+  } catch (_) {}
   authToken = null;
   currentStaff = null;
   localStorage.removeItem("glr_token");
@@ -555,12 +583,15 @@ async function saveSale() {
       body: JSON.stringify(payload),
     });
 
+    const syncPending = !sale.invoice_number;
     if (sale.stock_warning) {
-      toast("Sale saved, but stock is now negative -- restock needed.", "error");
+      toast(`${syncPending ? "Sale saved locally" : "Sale completed"}, but stock is now negative. Restock needed.`, "warning");
     } else if (sale.status === "incomplete") {
-      toast(`Sale saved. Balance of ${money(sale.balance)} still owed.`, "success");
+      toast(`${syncPending ? "Sale saved locally" : "Sale completed"}. Balance of ${money(sale.balance)} still owed.${syncPending ? " Waiting for synchronization." : ""}`, "success");
+    } else if (syncPending) {
+      toast("Sale saved locally. Waiting for synchronization.", "success");
     } else {
-      toast("Sale saved.", "success");
+      toast("Sale completed and saved.", "success");
     }
 
     sessionSales.unshift(sale);
@@ -570,7 +601,10 @@ async function saveSale() {
     await loadSalesPanel();
     await loadDashboard();
   } catch (err) {
-    toast(err.message, "error");
+    if (err.authExpired) return;
+    toast(err.networkFailure
+      ? "The local POS server is unavailable. The sale status is unknown. Check Transaction History before retrying."
+      : `Sale failed. It was not completed. ${err.message}`, "error");
   } finally {
     btn.disabled = false;
     btn.textContent = "SAVE SALE";
@@ -591,7 +625,7 @@ function watchSaleSync(saleId) {
         if (idx >= 0) sessionSales[idx] = sale;
         renderSessionTable();
         await Promise.all([loadDashboard(), loadPaymentDesk()]);
-        toast(`Server assigned ${sale.invoice_number}.`, "success");
+          toast(`Sale synchronized. Invoice ${sale.invoice_number} assigned.`, "success");
       }
     } catch (_) {}
     if (attempts >= 15) { clearInterval(timer); pendingSaleWatchers.delete(saleId); }
@@ -712,7 +746,11 @@ async function submitPayment() {
     // balance" -- see backend/app/routes/sales.py for why that's a
     // deliberate safety rule, not a bug. err.message already carries
     // that exact explanation from the server.
-    errorEl.textContent = err.message;
+    if (err.authExpired) return;
+    errorEl.textContent = err.networkFailure
+      ? "Payment status is unknown. Check the sale before trying again."
+      : `PAYMENT FAILED: ${err.message}`;
+    toast(errorEl.textContent, "error");
   } finally {
     btn.disabled = false;
     btn.textContent = "RECORD PAYMENT";
@@ -1074,8 +1112,8 @@ async function pollSyncStatus() {
 
     dot.classList.add("online");
     if (data.mode !== "local") { label.textContent = "Central server"; badge.style.display = "none"; return; }
-    if (data.last_sync_error) { label.textContent = "Offline / retrying"; }
-    else if (data.needs_review_count > 0) { label.textContent = "Needs review"; }
+    if (data.last_sync_error) { label.textContent = "Central server unavailable - retrying"; }
+    else if (data.needs_review_count > 0) { label.textContent = "Sync failed - owner review needed"; }
     else if (data.pending_count > 0) { label.textContent = "Syncing"; }
     else { label.textContent = "Synced"; }
     if (data.pending_count > 0) { badge.style.display = "inline-block"; badge.textContent = `${data.pending_count} waiting`; }
@@ -1085,7 +1123,7 @@ async function pollSyncStatus() {
     // not just central being unreachable (the local server handles that
     // distinction internally and always answers this endpoint if it's up).
     document.getElementById("sync-dot").classList.remove("online");
-    document.getElementById("sync-label").textContent = "Not connected";
+    document.getElementById("sync-label").textContent = "POS server unavailable";
   }
 }
 

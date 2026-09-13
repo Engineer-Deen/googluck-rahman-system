@@ -417,6 +417,7 @@ tr:last-child td { border-bottom: none; }
 }
 .toast.show { display: block; }
 .toast.error { border-color: var(--danger); color: var(--danger); }
+.toast.warning { border-color: var(--warning); color: var(--warning); }
 .toast.success { border-color: var(--success); color: var(--success); }
 
 @media (max-width: 640px) {
@@ -534,6 +535,7 @@ button, .btn, .nav-tab, select, input { -webkit-tap-highlight-color: transparent
   background: var(--accent-soft); color: var(--accent); font-weight:900; font-size:1.15rem;
 }
 .toast.error .toast-icon { background:var(--danger-soft); color:var(--danger); }
+.toast.warning .toast-icon { background:var(--warning-soft); color:var(--warning); }
 .toast.success .toast-icon { background:var(--success-soft); color:var(--success); }
 .toast-title { font-weight:800; font-size:.92rem; margin-bottom:.18rem; }
 .toast-message { color:var(--text-secondary); font-size:.82rem; line-height:1.45; }
