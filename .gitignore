@@ -28,6 +28,7 @@ instance/
 build/
 dist/
 *.spec
+!backend/goodluck-backend.spec
 
 # ==============================
 # Node
