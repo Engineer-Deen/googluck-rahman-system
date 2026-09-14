@@ -89,8 +89,19 @@ def push_pending_once(app) -> dict:
             if result.get("status") == "ok":
                 if item.table_name == "sales" and result.get("invoice_number"):
                     sale = Sale.query.get(item.record_id)
-                    if sale and sale.invoice_number != result["invoice_number"]:
-                        sale.invoice_number = result["invoice_number"]
+                    if sale and sale.invoice_number is None:
+                        # Local SQLite can already contain another sale with the
+                        # same invoice number from an earlier sync/replay. In that
+                        # case, the worker must acknowledge the central insert
+                        # without trying to overwrite the local row with a
+                        # duplicate invoice value; a later pull will reconcile
+                        # the authoritative invoice back into this device.
+                        existing = (
+                            Sale.query.filter(Sale.id != sale.id, Sale.invoice_number == result["invoice_number"])
+                            .first()
+                        )
+                        if not existing:
+                            sale.invoice_number = result["invoice_number"]
                 db.session.delete(item)
                 confirmed += 1
             else:
@@ -210,14 +221,35 @@ def pull_reference_data_once(app) -> dict:
                 # payloads. A new account must be provisioned through the
                 # authenticated account flow before it can be used offline.
                 continue
-            staff.shop_id = raw.get("shop_id")
-            staff.name = raw["name"]
-            staff.email = raw["email"]
+
+            # Keep local staff rows stable when the central payload is unchanged.
+            # Re-writing the same values would advance updated_at, which would
+            # invalidate any already-issued JWTs because login_required rechecks
+            # the token against the current staff row timestamp.
+            desired = {
+                "shop_id": raw.get("shop_id"),
+                "name": raw["name"],
+                "email": raw["email"],
+                "role": raw["role"],
+                "is_active": raw["is_active"],
+            }
+            if (
+                staff.shop_id == desired["shop_id"] and
+                staff.name == desired["name"] and
+                staff.email == desired["email"] and
+                staff.role == desired["role"] and
+                staff.is_active == desired["is_active"]
+            ):
+                continue
+
+            staff.shop_id = desired["shop_id"]
+            staff.name = desired["name"]
+            staff.email = desired["email"]
             # Authentication secrets are never synchronized. Existing local
             # credentials remain intact; central account changes require the
             # normal authenticated login/update flow.
-            staff.role = raw["role"]
-            staff.is_active = raw["is_active"]
+            staff.role = desired["role"]
+            staff.is_active = desired["is_active"]
 
         for raw in data.get("settings", []):
             setting = SystemSetting.query.filter_by(key=raw["key"]).first()

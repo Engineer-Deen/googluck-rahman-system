@@ -69,3 +69,14 @@ desktop.ini
 # ==============================
 *.tmp
 *.temp
+
+# ==============================
+# Updater signing (NEVER commit private keys)
+# ==============================
+*.key
+*.key.pub
+.glr-updater-keys/
+secrets/
+*.json
+firebase-service-account.json
+firebase-adminsdk*.json

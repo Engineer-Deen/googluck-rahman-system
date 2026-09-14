@@ -1,9 +1,20 @@
-from flask import Flask, jsonify
+from datetime import datetime, timezone
+
+from flask import Flask, current_app, g, jsonify, request
 from sqlalchemy import inspect, text
 from flask_cors import CORS
 
 from app.config import get_config
 from app.extensions import db
+
+
+# Auth and public probes must not depend on Firestore mirror success.
+# Login reads retained SQL credentials; mirror failures must not become HTTP 500.
+_FIRESTORE_MIRROR_EXEMPT_PATHS = frozenset({
+    "/api/health",
+    "/api/shop/public",
+    "/api/auth/login",
+})
 
 
 def create_app():
@@ -24,7 +35,10 @@ def create_app():
     with app.app_context():
         db.create_all()
         _run_compat_migrations()
-        if app.config.get("BOOTSTRAP_INITIAL_LOCAL_DATA"):
+        if app.config.get("GLR_MODE") == "central":
+            from app.bootstrap import ensure_initial_central_data
+            ensure_initial_central_data()
+        elif app.config.get("BOOTSTRAP_INITIAL_LOCAL_DATA"):
             from app.bootstrap import ensure_initial_local_data
             ensure_initial_local_data()
 
@@ -53,6 +67,36 @@ def create_app():
     app.register_blueprint(shop_bp)
     app.register_blueprint(stock_bp)
     app.register_blueprint(sync_bp)
+
+    if app.config.get("GLR_MODE") == "central" and app.config.get("CENTRAL_DATA_PROVIDER") == "firestore":
+        from app.firestore import get_firestore_sync_service
+
+        @app.before_request
+        def _refresh_firestore_central_state():
+            g.firestore_request_started_at = datetime.now(timezone.utc)
+            if request.path in _FIRESTORE_MIRROR_EXEMPT_PATHS:
+                return None
+            try:
+                get_firestore_sync_service().refresh_sql_mirror()
+            except Exception:
+                current_app.logger.exception("Firestore central mirror refresh failed")
+                db.session.rollback()
+
+        @app.after_request
+        def _mirror_firestore_central_state(response):
+            if request.path in _FIRESTORE_MIRROR_EXEMPT_PATHS:
+                return response
+            try:
+                if response.status_code < 500 and request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    service = get_firestore_sync_service()
+                    started_at = getattr(g, "firestore_request_started_at", None)
+                    if started_at is not None:
+                        service.mirror_recent_sql_state(started_at)
+                        service.mark_central_state_changed()
+            except Exception:
+                current_app.logger.exception("Firestore central mirror write failed")
+                db.session.rollback()
+            return response
 
     return app
 

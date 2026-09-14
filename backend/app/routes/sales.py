@@ -32,6 +32,36 @@ def assign_invoice_number(sale):
     """Assign a central, human-readable invoice number once only."""
     if sale.invoice_number:
         return sale.invoice_number
+    if current_app.config.get("CENTRAL_DATA_PROVIDER") == "firestore":
+        from app.firestore import get_firestore_sync_service
+
+        service = get_firestore_sync_service()
+        year = (sale.created_at or datetime.now(timezone.utc)).year
+        invoice_floor = 1001
+        invoice_prefix = f"INV-{year}-"
+        for (invoice_number,) in Sale.query.with_entities(Sale.invoice_number).filter(
+            Sale.invoice_number.like(f"{invoice_prefix}%")
+        ).all():
+            match = re.fullmatch(rf"INV-{year}-(\d+)", str(invoice_number))
+            if match:
+                invoice_floor = max(invoice_floor, int(match.group(1)) + 1)
+        payload = {
+            "created_at": sale.created_at.isoformat() if sale.created_at else None,
+            "minimum_next": invoice_floor,
+        }
+        for _ in range(5):
+            invoice_number = service.allocate_invoice_number(payload)
+            conflict = Sale.query.filter(
+                Sale.invoice_number == invoice_number,
+                Sale.id != sale.id,
+            ).first()
+            if not conflict:
+                sale.invoice_number = invoice_number
+                return sale.invoice_number
+            match = re.fullmatch(r"INV-(\d+)-(\d+)", str(invoice_number))
+            if match:
+                payload["minimum_next"] = int(match.group(2)) + 1
+        raise RuntimeError("Could not allocate a unique invoice number")
     year = (sale.created_at or datetime.now(timezone.utc)).year
     seq = InvoiceSequence.query.filter_by(year=year).with_for_update().first()
     if not seq:
@@ -633,12 +663,21 @@ def create_sale():
         sale, stock_warnings, created = apply_sale(payload)
     except ValueError as e:
         return jsonify(error=str(e)), 400
+    except RuntimeError as e:
+        db.session.rollback()
+        return jsonify(error=str(e)), 503
 
     if created and current_app.config["GLR_MODE"] == "local":
         from app.sync.worker import trigger_sync_soon
         trigger_sync_soon(current_app._get_current_object())
 
-    response = serialize_sale(sale, role=g.staff_role)
+    product_ids = {i.product_id for i in sale.items}
+    product_map = (
+        {p.id: p for p in Product.query.filter(Product.id.in_(product_ids)).all()}
+        if product_ids
+        else {}
+    )
+    response = serialize_sale(sale, role=g.staff_role, product_map=product_map)
     if stock_warnings:
         response["stock_warning"] = stock_warnings
 

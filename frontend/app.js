@@ -10,7 +10,9 @@ const API_BASE = "http://localhost:5000/api";
 
 let authToken = localStorage.getItem("glr_token") || null;
 let currentStaff = JSON.parse(localStorage.getItem("glr_staff") || "null");
+let currentMode = "local";
 let productsCache = [];
+let inventoryEditProductId = null;
 let sessionSales = [];
 let productsLoadedAt = 0;
 let productsLoadPromise = null;
@@ -30,6 +32,7 @@ let historySearchTimer = null;
 let pendingSaleWatchers = new Map();
 let reasonResolver = null;
 let adminLocked = false;
+let adminSecurityTimer = null;
 let activityTimer = null;
 
 
@@ -71,7 +74,7 @@ function setTheme(name) {
   setTheme(localStorage.getItem("glr_theme") || "dark");
 })();
 
-// ---------- centered notifications ----------
+// ---------- bottom-right toast notifications ----------
 let toastTimer = null;
 function toast(message, kind) {
   const el = document.getElementById("toast");
@@ -84,10 +87,24 @@ function toast(message, kind) {
   title.textContent = kind === "error" ? "Action needs attention" : kind === "warning" ? "Needs attention" : kind === "success" ? "Completed" : "Notification";
   icon.textContent = kind === "error" ? "!" : kind === "warning" ? "!" : kind === "success" ? "✓" : "i";
   el.className = "toast show" + (kind ? " " + kind : "");
+  toastTimer = setTimeout(closeToast, 4000);
 }
 function closeToast() {
   const el = document.getElementById("toast");
   if (el) el.classList.remove("show");
+  clearTimeout(toastTimer);
+  toastTimer = null;
+}
+
+// Sync toasts only on meaningful transitions; identical retries are suppressed.
+let lastSyncToastAt = 0;
+let lastSyncToastMsg = "";
+function syncToast(message, kind) {
+  const now = Date.now();
+  if (message === lastSyncToastMsg && now - lastSyncToastAt < 60000) return;
+  lastSyncToastMsg = message;
+  lastSyncToastAt = now;
+  toast(message, kind);
 }
 
 // ---------- API helper ----------
@@ -96,7 +113,10 @@ async function api(path, options = {}) {
     { "Content-Type": "application/json" },
     options.headers || {}
   );
-  if (authToken) headers["Authorization"] = "Bearer " + authToken;
+  // Capture at request start so a concurrent 401 from an older unauthenticated
+  // poll cannot wipe a token that was set while this request was in flight.
+  const tokenUsed = authToken;
+  if (tokenUsed) headers["Authorization"] = "Bearer " + tokenUsed;
 
   let res;
   try {
@@ -110,7 +130,7 @@ async function api(path, options = {}) {
   try { data = await res.json(); } catch (e) { /* no body */ }
 
   if (!res.ok) {
-    if (res.status === 401 && !path.endsWith("/auth/login")) {
+    if (res.status === 401 && !path.endsWith("/auth/login") && tokenUsed) {
       authToken = null;
       currentStaff = null;
       localStorage.removeItem("glr_token");
@@ -128,7 +148,7 @@ async function api(path, options = {}) {
           ? `OUT OF STOCK: ${rawMessage}`
           : rawMessage;
     const error = new Error(message);
-    error.authExpired = res.status === 401 && !path.endsWith("/auth/login");
+    error.authExpired = res.status === 401 && !path.endsWith("/auth/login") && !!tokenUsed;
     throw error;
   }
   return data;
@@ -170,7 +190,7 @@ async function doLogin() {
       localStorage.setItem("glr_admin_session_started", String(Date.now()));
       localStorage.setItem("glr_admin_last_active", String(Date.now()));
     }
-    enterApp();
+    await enterApp();
   } catch (err) {
     errorEl.textContent = err.message;
   } finally {
@@ -183,6 +203,13 @@ async function doLogout() {
   try {
     if (authToken) await api("/auth/logout", { method: "POST" });
   } catch (_) {}
+  if (syncPollTimer) {
+    clearInterval(syncPollTimer);
+    syncPollTimer = null;
+  }
+  lastSyncSnapshot = { key: null, pending: 0 };
+  lastSyncToastMsg = "";
+  lastSyncToastAt = 0;
   authToken = null;
   currentStaff = null;
   localStorage.removeItem("glr_token");
@@ -199,7 +226,7 @@ async function doLogout() {
   document.body.appendChild(toggle);
 }
 
-function enterApp() {
+async function enterApp() {
   document.getElementById("login-overlay").style.display = "none";
   document.getElementById("app").classList.add("visible");
   document.getElementById("header-staff-name").textContent =
@@ -219,6 +246,11 @@ function enterApp() {
   loadShopBranding();
   if (currentStaff && ADMIN_ROLES.includes(currentStaff.role)) loadSystemSettings();
   startSyncStatusPolling();
+
+  if (authToken && currentStaff) {
+    await ensureDeviceRegistration();
+    await maybeAutoSync();
+  }
 }
 
 // ---------- role-based UI ----------
@@ -237,6 +269,7 @@ function applyRoleVisibility() {
   const isFinance = FINANCE_ROLES.includes(role);
   const isAdmin = ADMIN_ROLES.includes(role);
   const isOwner = role === "owner";
+
   document.querySelectorAll(".owner-only").forEach((el) => { el.style.display = isOwner ? "" : "none"; });
   document.querySelectorAll(".finance-only").forEach((el) => {
     el.style.display = isFinance ? "" : "none";
@@ -244,6 +277,26 @@ function applyRoleVisibility() {
   document.querySelectorAll(".admin-only").forEach((el) => {
     el.style.display = isAdmin ? "" : "none";
   });
+
+  const addProductCard = document.getElementById("add-product-card");
+  if (addProductCard) {
+    addProductCard.style.display = isFinance ? "" : "none";
+  }
+
+  const createStaffCard = document.getElementById("staff-create-card");
+  if (createStaffCard) {
+    createStaffCard.style.display = isAdmin ? "" : "none";
+  }
+
+  const shopSettingsCard = document.getElementById("shop-settings-card");
+  if (shopSettingsCard) {
+    shopSettingsCard.style.display = isAdmin ? "" : "none";
+  }
+
+  const adminRegistrationCard = document.getElementById("admin-registration-card");
+  if (adminRegistrationCard) {
+    adminRegistrationCard.style.display = isOwner ? "" : "none";
+  }
 }
 
 // ---------- panels ----------
@@ -265,6 +318,191 @@ function showPanel(name) {
 async function refreshAll() {
   await loadProducts();
   loadDashboard();
+}
+
+// ---------- inventory management ----------
+async function loadInventoryPanel() {
+  try {
+    const includeInactive = document.getElementById("show-inactive-toggle")?.checked;
+    const products = await api(`/products${includeInactive ? "?include_inactive=true" : ""}`);
+    const tbody = document.getElementById("inventory-table");
+    const empty = document.getElementById("inventory-empty");
+
+    productsCache = products || [];
+    productsLoadedAt = Date.now();
+
+    const restockSelect = document.getElementById("r-product");
+    restockSelect.innerHTML = '<option value="">Select product</option>';
+    products.forEach((product) => {
+      const option = document.createElement("option");
+      option.value = product.id;
+      option.textContent = `${product.name} (${product.stock})`;
+      restockSelect.appendChild(option);
+    });
+
+    const canManageCatalog = currentStaff && FINANCE_ROLES.includes(currentStaff.role);
+
+    tbody.innerHTML = "";
+
+    if (products.length === 0) {
+      empty.style.display = "block";
+      return;
+    }
+
+    empty.style.display = "none";
+
+    products.forEach((product) => {
+      const tr = document.createElement("tr");
+      const actionButtons = canManageCatalog
+        ? `
+            <button class="btn btn-secondary btn-sm" onclick="editProduct(${product.id})">EDIT</button>
+            <button class="btn btn-${product.is_active ? "danger" : "success"} btn-sm" onclick="toggleInventoryProductState(${product.id}, ${!product.is_active})">${product.is_active ? "DEACTIVATE" : "REACTIVATE"}</button>
+          `
+        : '<span class="muted">Sync-managed</span>';
+      tr.innerHTML = `
+        <td style="font-family:'DM Mono',monospace;font-size:0.78rem;">${escapeHtml(product.sku || "-")}</td>
+        <td>${escapeHtml(product.name)}</td>
+        <td>${escapeHtml(product.category)}</td>
+        <td>${money(product.unit_price)}</td>
+        <td>${product.stock}</td>
+        <td class="action-cell">${actionButtons}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+function clearProductForm() {
+  inventoryEditProductId = null;
+  document.getElementById("product-form-title").textContent = "Add New Product";
+  document.getElementById("p-sku").value = "";
+  document.getElementById("p-name").value = "";
+  document.getElementById("p-category").value = "";
+  document.getElementById("p-unit-price").value = "";
+  document.getElementById("p-cost-price").value = "";
+  document.getElementById("p-cancel-btn").style.display = "none";
+}
+
+async function editProduct(productId) {
+  try {
+    const product = await api(`/products/${productId}`);
+    inventoryEditProductId = productId;
+    document.getElementById("product-form-title").textContent = "Edit Product";
+    document.getElementById("p-sku").value = product.sku || "";
+    document.getElementById("p-name").value = product.name || "";
+    document.getElementById("p-category").value = product.category || "";
+    document.getElementById("p-unit-price").value = product.unit_price || "";
+    document.getElementById("p-cost-price").value = product.cost_price || "";
+    document.getElementById("p-cancel-btn").style.display = "inline-block";
+    document.getElementById("add-product-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function submitProductForm() {
+  const name = document.getElementById("p-name").value.trim();
+  const category = document.getElementById("p-category").value;
+  const unitPrice = Number(document.getElementById("p-unit-price").value || 0);
+  const costPrice = Number(document.getElementById("p-cost-price").value || 0);
+
+  if (!name) {
+    toast("Product name is required.", "error");
+    return;
+  }
+  if (!category) {
+    toast("Please select a valid product category.", "error");
+    return;
+  }
+
+  try {
+    if (inventoryEditProductId) {
+      const reason = await openReasonModal("Why are you changing this product?");
+      if (!reason) return;
+      await api(`/products/${inventoryEditProductId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name,
+          category,
+          unit_price: unitPrice,
+          cost_price: costPrice,
+          reason,
+        }),
+      });
+      toast("Product updated.", "success");
+    } else {
+      await api("/products", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          category,
+          unit_price: unitPrice,
+          cost_price: costPrice,
+        }),
+      });
+      toast("Product created.", "success");
+    }
+
+    clearProductForm();
+    await loadProducts(true);
+    await loadInventoryPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function toggleInventoryProductState(productId, makeActive) {
+  try {
+    const reason = await openReasonModal(makeActive ? "Why are you reactivating this product?" : "Why are you deactivating this product?");
+    if (!reason) return;
+    await api(`/products/${productId}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        is_active: makeActive,
+        reason,
+      }),
+    });
+    toast(makeActive ? "Product reactivated." : "Product deactivated.", "success");
+    await loadProducts(true);
+    await loadInventoryPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function submitRestock() {
+  const productId = Number(document.getElementById("r-product").value);
+  const qty = Number(document.getElementById("r-qty").value || 0);
+  const reason = document.getElementById("r-reason").value;
+
+  if (!productId) {
+    toast("Select a product first.", "error");
+    return;
+  }
+  if (!Number.isInteger(qty) || qty === 0) {
+    toast("Enter a valid whole-number quantity change.", "error");
+    return;
+  }
+
+  try {
+    await api("/stock-movements", {
+      method: "POST",
+      body: JSON.stringify({
+        product_id: productId,
+        quantity_delta: qty,
+        reason,
+      }),
+    });
+    toast("Stock updated.", "success");
+    document.getElementById("r-product").value = "";
+    document.getElementById("r-qty").value = "";
+    await loadProducts(true);
+    await loadInventoryPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
 }
 
 // ---------- products (shared cache) ----------
@@ -760,6 +998,7 @@ async function submitPayment() {
 // ---------- staff management ----------
 let staffCache = [];
 let resetPasswordStaffId = null;
+let editingStaffId = null;
 
 async function loadStaffPanel() {
   try {
@@ -777,18 +1016,73 @@ async function loadStaffPanel() {
       ? '<span class="tag tag-ok">active</span>'
       : '<span class="tag tag-danger">deactivated</span>';
     const toggleLabel = s.is_active ? "DEACTIVATE" : "REACTIVATE";
+    const canManageStaff = currentStaff && ADMIN_ROLES.includes(currentStaff.role);
+    const canManageThisStaff = canManageStaff && !["owner", "admin"].includes(s.role);
+    const actions = canManageStaff
+      ? canManageThisStaff
+        ? `
+          <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="startStaffEdit(${s.id})">EDIT</button>
+          <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="startPasswordReset(${s.id})">RESET PW</button>
+          <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="toggleStaffActive(${s.id}, ${!s.is_active})">${toggleLabel}</button>
+        `
+        : '<span class="muted">System-managed</span>'
+      : '<span class="muted">Sync-managed</span>';
     tr.innerHTML = `
       <td>${s.name}</td>
       <td>${s.email}</td>
       <td style="text-transform:capitalize;">${s.role}</td>
       <td>${statusBadge}</td>
-      <td style="white-space:nowrap;">
-        <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="startPasswordReset(${s.id})">RESET PW</button>
-        <button class="btn btn-secondary" style="padding:0.35rem 0.7rem;font-size:0.72rem;" onclick="toggleStaffActive(${s.id}, ${!s.is_active})">${toggleLabel}</button>
-      </td>
+      <td style="white-space:nowrap;">${actions}</td>
     `;
     tbody.appendChild(tr);
   });
+}
+
+function startStaffEdit(staffId) {
+  const staff = staffCache.find((entry) => entry.id === staffId);
+  if (!staff) return;
+
+  editingStaffId = staffId;
+  document.getElementById("st-edit-name").value = staff.name || "";
+  document.getElementById("st-edit-email").value = staff.email || "";
+  document.getElementById("st-edit-role").value = staff.role || "cashier";
+  document.getElementById("st-edit-status").value = String(!!staff.is_active);
+  document.getElementById("staff-edit-card").style.display = "block";
+  document.getElementById("staff-edit-card").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function cancelStaffEdit() {
+  editingStaffId = null;
+  document.getElementById("staff-edit-card").style.display = "none";
+}
+
+async function saveStaffEdit() {
+  if (!editingStaffId) return;
+
+  const name = document.getElementById("st-edit-name").value.trim();
+  const role = document.getElementById("st-edit-role").value;
+  const isActive = document.getElementById("st-edit-status").value === "true";
+
+  if (!name) {
+    toast("Staff name is required.", "error");
+    return;
+  }
+
+  try {
+    await api(`/staff/${editingStaffId}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        name,
+        role,
+        is_active: isActive,
+      }),
+    });
+    toast("Staff account updated.", "success");
+    cancelStaffEdit();
+    await loadStaffPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
 }
 
 async function createStaff() {
@@ -921,7 +1215,10 @@ async function loadSystemSettings() {
   } catch (e) { toast(e.message, "error"); }
 }
 async function saveSystemSettings() {
-  if (!currentStaff || currentStaff.role !== "owner") return;
+  if (!currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) {
+    toast("Only the shop owner or admin can change system settings.", "error");
+    return;
+  }
   const timeoutMinutes = Number(document.getElementById("setting-timeout").value);
   const fullLoginHours = Number(document.getElementById("setting-full-login").value);
   const pin = document.getElementById("setting-pin").value.trim();
@@ -991,7 +1288,8 @@ function initializeAdminSecurity() {
   localStorage.setItem("glr_admin_last_active", String(Date.now()));
   document.addEventListener("click", touchAdminActivity);
   document.addEventListener("keydown", touchAdminActivity);
-  setInterval(checkAdminSessionSecurity, 15000);
+  if (adminSecurityTimer) clearInterval(adminSecurityTimer);
+  adminSecurityTimer = setInterval(checkAdminSessionSecurity, 15000);
 }
 
 // ---------- sync status ----------
@@ -1067,12 +1365,14 @@ async function loadHistory(period = "today", search = "") {
 async function loadShopBranding(){
   try {
     const shop=await api("/shop");
+    currentMode = shop.mode || "local";
     document.getElementById("header-shop-name").textContent=shop.name||"Management System";
     [document.getElementById("login-shop-logo"),document.getElementById("header-shop-logo")].forEach(img=>{
       if(shop.logo_data){ img.src=shop.logo_data; img.style.display="block"; }
       else { img.style.display="none"; }
     });
     const name=document.getElementById("shop-name-input"); if(name) name.value=shop.name||"";
+    applyRoleVisibility();
   } catch(e){}
 }
 
@@ -1092,32 +1392,149 @@ async function saveShopSettings(){
 }
 
 let syncPollTimer = null;
+let lastAutoSyncAt = 0;
+
+function getDesktopPlatformLabel() {
+  const ua = navigator.userAgent || "";
+  if (/Windows/i.test(ua)) return "Windows";
+  if (/Mac/i.test(ua)) return "macOS";
+  if (/Linux/i.test(ua)) return "Linux";
+  return "Unknown";
+}
+
+async function ensureDeviceRegistration() {
+  if (!authToken || !currentStaff || !currentStaff.shop_id) return;
+
+  try {
+    const status = await api("/sync/status");
+    const deviceId = status && status.device_id ? String(status.device_id) : null;
+    if (!deviceId) return;
+
+    localStorage.setItem("glr_device_id", deviceId);
+
+    await api("/sync/devices", {
+      method: "POST",
+      body: JSON.stringify({
+        device_id: deviceId,
+        shop_id: Number(currentStaff.shop_id),
+        name: "Good Luck Rahman Main Device",
+        platform: getDesktopPlatformLabel(),
+      }),
+    });
+  } catch (err) {
+    if (err.authExpired || err.networkFailure) return;
+    if (/This device is not registered|not registered to an authorized shop/i.test(err.message)) {
+      return;
+    }
+  }
+}
+
+async function maybeAutoSync() {
+  if (!authToken || !currentStaff || !navigator.onLine) return;
+  const now = Date.now();
+  if (now - lastAutoSyncAt < 15000) return;
+  lastAutoSyncAt = now;
+  try {
+    await triggerSync({ silent: true });
+  } catch (_) {
+    // Offline or backend availability issues are handled by the server
+    // and the status screen; they should never block the POS.
+  }
+}
+
 function startSyncStatusPolling() {
   pollSyncStatus();
   clearInterval(syncPollTimer);
-  syncPollTimer = setInterval(pollSyncStatus, 3000);
+  syncPollTimer = setInterval(() => {
+    if (document.visibilityState === "visible") {
+      pollSyncStatus();
+    }
+  }, 3000);
 }
 
-async function triggerSync(){
-  try{ await api("/sync/trigger",{method:"POST"}); toast("Synchronization started.","success"); setTimeout(pollSyncStatus,1000); }
-  catch(e){toast(e.message,"error");}
+async function triggerSync(options) {
+  const silent = !!(options && options.silent);
+  try {
+    await api("/sync/trigger", { method: "POST" });
+    if (!silent) syncToast("Synchronization started.", "success");
+    setTimeout(pollSyncStatus, 1000);
+  } catch (e) {
+    if (!e.authExpired && !e.networkFailure && !silent) syncToast(e.message, "error");
+  }
 }
+
+let lastSyncSnapshot = { key: null, pending: 0 };
 
 async function pollSyncStatus() {
+  if (!authToken) return;
   try {
     const data = await api("/sync/status");
     const dot = document.getElementById("sync-dot");
     const label = document.getElementById("sync-label");
     const badge = document.getElementById("sync-badge");
 
-    dot.classList.add("online");
-    if (data.mode !== "local") { label.textContent = "Central server"; badge.style.display = "none"; return; }
-    if (data.last_sync_error) { label.textContent = "Central server unavailable - retrying"; }
-    else if (data.needs_review_count > 0) { label.textContent = "Sync failed - owner review needed"; }
-    else if (data.pending_count > 0) { label.textContent = "Syncing"; }
-    else { label.textContent = "Synced"; }
-    if (data.pending_count > 0) { badge.style.display = "inline-block"; badge.textContent = `${data.pending_count} waiting`; }
-    else { badge.style.display = "none"; }
+    if (data.mode !== "local") {
+      label.textContent = "Central server";
+      badge.style.display = "none";
+      dot.classList.add("online");
+      lastSyncSnapshot = { key: "central", pending: 0 };
+      return;
+    }
+
+    const errored = !!data.last_sync_error;
+    const pending = Number(data.pending_count || 0);
+    const needsReview = Number(data.needs_review_count || 0);
+    const key = errored
+      ? "unavailable"
+      : needsReview > 0
+        ? "review"
+        : pending > 0
+          ? "pending"
+          : "synced";
+
+    if (key === "unavailable") {
+      label.textContent = "Central server unavailable - retrying";
+      dot.classList.remove("online");
+    } else if (key === "review") {
+      label.textContent = "Sync failed - owner review needed";
+      dot.classList.remove("online");
+    } else if (key === "pending") {
+      label.textContent = "Syncing";
+      dot.classList.add("online");
+    } else {
+      label.textContent = "Synced";
+      dot.classList.add("online");
+    }
+
+    if (pending > 0) {
+      badge.style.display = "inline-block";
+      badge.textContent = `${pending} waiting`;
+    } else {
+      badge.style.display = "none";
+    }
+
+    const prev = lastSyncSnapshot;
+    if (prev.key !== key) {
+      if (key === "unavailable") {
+        syncToast("Central synchronization unavailable. Local sales continue normally.", "warning");
+      } else if (prev.key === "unavailable" && (key === "synced" || key === "pending")) {
+        syncToast(
+          key === "synced"
+            ? "Central synchronization restored."
+            : "Central synchronization restored. Syncing queued changes…",
+          "success"
+        );
+      } else if (prev.key === "pending" && key === "synced") {
+        syncToast("Queued changes synchronized.", "success");
+      } else if (key === "review" && prev.key !== "review") {
+        syncToast("Some sync items need owner review.", "warning");
+      }
+    }
+    lastSyncSnapshot = { key, pending };
+
+    if (navigator.onLine && (pending > 0 || errored)) {
+      await maybeAutoSync();
+    }
   } catch (err) {
     // Can't even reach our OWN local server -- something's actually wrong,
     // not just central being unreachable (the local server handles that
@@ -1137,11 +1554,91 @@ async function loadLoginBranding() {
   } catch (_) {}
 }
 
+// ---------- desktop app updater (Tauri only; independent of POS sync) ----------
+let updatePromptDismissedThisSession = false;
+let updateInstallInProgress = false;
+let pendingUpdateInfo = null;
+
+function tauriInvoke(cmd, args) {
+  const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+  if (typeof invoke !== "function") return Promise.resolve(null);
+  return invoke(cmd, args || {});
+}
+
+function showUpdateToast(info) {
+  const el = document.getElementById("update-toast");
+  const msg = document.getElementById("update-toast-message");
+  const nowBtn = document.getElementById("update-now-btn");
+  const laterBtn = document.getElementById("update-later-btn");
+  if (!el || !msg || !info) return;
+  pendingUpdateInfo = info;
+  msg.textContent = `New version ${info.version} is available.`;
+  if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = "Update now"; }
+  if (laterBtn) laterBtn.disabled = false;
+  el.classList.add("show");
+  el.style.display = "grid";
+}
+
+function hideUpdateToast() {
+  const el = document.getElementById("update-toast");
+  if (!el) return;
+  el.classList.remove("show");
+  el.style.display = "none";
+}
+
+function dismissAppUpdate() {
+  updatePromptDismissedThisSession = true;
+  hideUpdateToast();
+}
+
+async function installAppUpdate() {
+  if (updateInstallInProgress) return;
+  updateInstallInProgress = true;
+  const nowBtn = document.getElementById("update-now-btn");
+  const laterBtn = document.getElementById("update-later-btn");
+  if (nowBtn) { nowBtn.disabled = true; nowBtn.textContent = "Updating..."; }
+  if (laterBtn) laterBtn.disabled = true;
+  try {
+    await tauriInvoke("glr_install_update");
+    // Process should relaunch; if it returns, keep UI honest.
+  } catch (err) {
+    updateInstallInProgress = false;
+    if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = "Update now"; }
+    if (laterBtn) laterBtn.disabled = false;
+    toast(err && err.message ? err.message : "Update failed. You can try again later.", "error");
+  }
+}
+
+async function checkForAppUpdate() {
+  if (updatePromptDismissedThisSession || updateInstallInProgress) return;
+  try {
+    const info = await tauriInvoke("glr_check_update");
+    if (info && info.version) showUpdateToast(info);
+  } catch (_) {
+    // Network/GitHub unavailable must never interrupt POS.
+  }
+}
+
+function scheduleAppUpdateCheck() {
+  // One delayed background check after UI is ready. No recurring timer —
+  // avoids sync/session races and notification floods.
+  setTimeout(() => { checkForAppUpdate(); }, 8000);
+}
+
 // ---------- boot ----------
 (function boot() {
   loadLoginBranding();
+  scheduleAppUpdateCheck();
+  window.addEventListener("online", async () => {
+    if (authToken && currentStaff) {
+      try {
+        await ensureDeviceRegistration();
+        await maybeAutoSync();
+      } catch (_) {}
+    }
+  });
   if (authToken && currentStaff) {
-    enterApp();
+    enterApp().catch(() => {});
   }
   document.getElementById("login-password").addEventListener("keydown", (e) => {
     if (e.key === "Enter") doLogin();

@@ -103,7 +103,7 @@ def get_system_settings():
 
 
 @shop_bp.put("/settings")
-@roles_required("owner")
+@roles_required("owner", "admin")
 def save_system_settings():
     if current_app.config["GLR_MODE"] != "central":
         return jsonify(error="System settings can only be saved on the central server. Connect to the internet and try again."), 403

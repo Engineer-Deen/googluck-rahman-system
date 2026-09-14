@@ -30,4 +30,5 @@ if _should_start_worker():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000 if os.environ.get("GLR_MODE", "local") == "local" else 8000))
-    app.run(host=server_host(app.config["GLR_MODE"]), port=port, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host=server_host(app.config["GLR_MODE"]), port=port, debug=debug)

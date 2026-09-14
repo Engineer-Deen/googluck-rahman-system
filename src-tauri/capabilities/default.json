@@ -7,6 +7,9 @@
   ],
   "permissions": [
     "core:default",
-    "shell:allow-execute"
+    "shell:allow-execute",
+    "updater:default",
+    "allow-glr-check-update",
+    "allow-glr-install-update"
   ]
 }

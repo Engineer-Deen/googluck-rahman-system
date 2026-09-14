@@ -327,7 +327,7 @@
         <div class="section-title">STAFF MANAGEMENT</div>
         <div class="section-line"></div>
       </div>
-      <div class="card">
+      <div class="card" id="staff-create-card">
         <div class="card-title">Add a Seller</div>
         <div class="form-grid">
           <div class="form-group">
@@ -351,6 +351,37 @@
           </div>
         </div>
         <button class="btn btn-primary" onclick="createStaff()">CREATE ACCOUNT</button>
+      </div>
+      <div class="card" id="staff-edit-card" style="display:none;">
+        <div class="card-title">Edit Staff Account</div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Full Name</label>
+            <input type="text" id="st-edit-name" placeholder="Staff name">
+          </div>
+          <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="st-edit-email" placeholder="login email" readonly>
+          </div>
+          <div class="form-group">
+            <label>Role</label>
+            <select id="st-edit-role">
+              <option value="cashier">Seller (Cashier)</option>
+              <option value="manager">Manager</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Status</label>
+            <select id="st-edit-status">
+              <option value="true">Active</option>
+              <option value="false">Deactivated</option>
+            </select>
+          </div>
+        </div>
+        <div style="display:flex;gap:1rem;">
+          <button class="btn btn-primary" onclick="saveStaffEdit()">SAVE CHANGES</button>
+          <button class="btn btn-secondary" onclick="cancelStaffEdit()">CANCEL</button>
+        </div>
       </div>
       <div class="card owner-only" id="admin-registration-card" style="display:none;">
         <div class="card-title">Register Administrator</div>
@@ -396,7 +427,7 @@
           <div class="form-group"><label>4-digit quick unlock PIN</label><input id="setting-pin" inputmode="numeric" maxlength="4" placeholder="Set a 4-digit PIN"></div>
         </div>
         <div class="settings-note">The quick PIN is stored as a secure hash in the backend database. Three wrong PIN attempts disable quick unlock and require a fresh admin login.</div>
-        <button class="btn btn-primary" id="save-settings-btn" onclick="saveSystemSettings()">SAVE SETTINGS</button>
+        <button class="btn btn-primary admin-only" id="save-settings-btn" onclick="saveSystemSettings()" style="display:none;">SAVE SETTINGS</button>
       </div>
       <div class="card admin-only" id="shop-settings-card" style="display:none;">
         <div class="card-title">SHOP BRANDING</div>
@@ -462,6 +493,18 @@
 </div>
 
 <div class="toast" id="toast"><div class="toast-icon" id="toast-icon">✓</div><div class="toast-content"><div class="toast-title" id="toast-title">Notification</div><div class="toast-message" id="toast-message"></div></div><button class="toast-ok" onclick="closeToast()">OK</button></div>
+
+<div class="update-toast" id="update-toast" style="display:none;" aria-live="polite">
+  <div class="update-toast-icon">↑</div>
+  <div class="update-toast-content">
+    <div class="update-toast-title">Update available</div>
+    <div class="update-toast-message" id="update-toast-message">A newer version is ready.</div>
+    <div class="update-toast-actions">
+      <button type="button" class="btn btn-secondary btn-sm" id="update-later-btn" onclick="dismissAppUpdate()">Later</button>
+      <button type="button" class="btn btn-primary btn-sm" id="update-now-btn" onclick="installAppUpdate()">Update now</button>
+    </div>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

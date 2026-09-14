@@ -18,8 +18,12 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+load_dotenv(BASE_DIR / ".env", override=False)
 
 
 def _local_instance_dir() -> Path:
@@ -60,6 +64,18 @@ class BaseConfig:
     # Shared secret local devices send when pushing to the central
     # server's /api/sync/push endpoint. Must match on both sides.
     SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "dev-sync-key-change-me")
+
+    # Central cloud data provider. PostgreSQL remains the default fallback;
+    # Firestore is opt-in until its credentials and deployment are configured.
+    CENTRAL_DATA_PROVIDER = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
+    FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+    FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get(
+        "FIREBASE_SERVICE_ACCOUNT_FILE",
+        "/etc/secrets/firebase-service-account.json",
+    )
+    FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
+    FIRESTORE_MIRROR_REFRESH_SECONDS = int(os.environ.get("FIRESTORE_MIRROR_REFRESH_SECONDS", "30"))
 
     # Firebase SQL Connect preparation. These are intentionally optional:
     # the Flask/PostgreSQL service remains authoritative until the Firebase
@@ -102,9 +118,50 @@ class CentralConfig(BaseConfig):
     }
 
 
+def _apply_runtime_config_values():
+    """Refresh config classes from the current environment for tests and runtime reloads."""
+    BaseConfig.GLR_MODE = os.environ.get("GLR_MODE", "local")
+    BaseConfig.SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+    BaseConfig.JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-jwt-secret-change-me")
+    BaseConfig.SQLALCHEMY_TRACK_MODIFICATIONS = False
+    BaseConfig.DEVICE_ID_FILE = INSTANCE_DIR / "device_id.txt"
+    BaseConfig.CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", "http://localhost:8000")
+    BaseConfig.SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "dev-sync-key-change-me")
+    BaseConfig.CENTRAL_DATA_PROVIDER = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
+    BaseConfig.FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+    BaseConfig.FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get(
+        "FIREBASE_SERVICE_ACCOUNT_FILE",
+        "/etc/secrets/firebase-service-account.json",
+    )
+    BaseConfig.FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    BaseConfig.FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
+    BaseConfig.FIRESTORE_MIRROR_REFRESH_SECONDS = int(os.environ.get("FIRESTORE_MIRROR_REFRESH_SECONDS", "30"))
+    BaseConfig.FIREBASE_SQL_CONNECT_ENABLED = os.environ.get("FIREBASE_SQL_CONNECT_ENABLED", "false").lower() == "true"
+    BaseConfig.FIREBASE_SQL_CONNECT_SERVICE_ID = os.environ.get("FIREBASE_SQL_CONNECT_SERVICE_ID", "goodluck-rahman-sql")
+
+    LocalConfig.INSTANCE_DIR = INSTANCE_DIR
+    LocalConfig.BOOTSTRAP_INITIAL_LOCAL_DATA = IS_FROZEN
+    LocalConfig.SQLALCHEMY_DATABASE_URI = os.environ.get(
+        "LOCAL_DATABASE_URL", f"sqlite:///{INSTANCE_DIR / 'glr_local.sqlite'}"
+    )
+
+    CentralConfig._default_pg = "postgresql+psycopg2://glr_user:glr_pass@localhost:5432/glr_central"
+    CentralConfig.SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", CentralConfig._default_pg)
+    CentralConfig.SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,
+        "pool_size": int(os.environ.get("DB_POOL_SIZE", "20")),
+        "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", "30")),
+        "pool_recycle": int(os.environ.get("DB_POOL_RECYCLE", "1800")),
+    }
+
+
 def get_config():
+    _apply_runtime_config_values()
     mode = os.environ.get("GLR_MODE", "local")
     if mode == "central":
+        provider = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
+        if provider not in {"postgres", "firestore"}:
+            raise RuntimeError("CENTRAL_DATA_PROVIDER must be 'postgres' or 'firestore'")
         insecure_defaults = {
             "DATABASE_URL": "postgresql+psycopg2://glr_user:glr_pass@localhost:5432/glr_central",
             "JWT_SECRET_KEY": "dev-jwt-secret-change-me",
@@ -118,6 +175,20 @@ def get_config():
             raise RuntimeError(
                 "Central mode requires explicit production configuration for: "
                 + ", ".join(invalid)
+            )
+        firebase_file = os.environ.get(
+            "FIREBASE_SERVICE_ACCOUNT_FILE",
+            "/etc/secrets/firebase-service-account.json",
+        )
+        if provider == "firestore" and not (
+            os.path.isfile(firebase_file)
+            or os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+            or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        ):
+            raise RuntimeError(
+                "Firestore mode requires the Render service-account file, "
+                "FIREBASE_SERVICE_ACCOUNT_JSON, or "
+                "GOOGLE_APPLICATION_CREDENTIALS"
             )
         return CentralConfig
     return LocalConfig

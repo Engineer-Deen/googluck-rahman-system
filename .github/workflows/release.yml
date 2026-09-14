@@ -1,0 +1,113 @@
+name: Release Desktop App
+
+# Publish a signed Windows installer + Tauri updater artifacts to GitHub Releases.
+# Trigger: push a version tag such as v0.1.1
+#
+# Required repository secrets:
+#   TAURI_SIGNING_PRIVATE_KEY - full contents of the updater private key
+#
+# This project's signing key is not password-protected. GitHub rejects empty
+# repository secrets, so do NOT create TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+# The build step sets TAURI_SIGNING_PRIVATE_KEY_PASSWORD to a literal empty
+# string in the workflow env (not a secret) so the Tauri CLI does not prompt.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync app version from tag
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          if ($version.StartsWith("v")) { $version = $version.Substring(1) }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Tag must look like v0.1.1 (got $($env:GITHUB_REF_NAME))"
+          }
+          Write-Host "Release version=$version"
+
+          $cargo = Get-Content "src-tauri/Cargo.toml" -Raw
+          $cargo = [regex]::Replace($cargo, '(?m)^version\s*=\s*"[^"]+"', "version = `"$version`"")
+          Set-Content -Path "src-tauri/Cargo.toml" -Value $cargo -NoNewline
+
+          $confPath = "src-tauri/tauri.conf.json"
+          $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+          $conf.version = $version
+          $conf | ConvertTo-Json -Depth 100 | Set-Content -Path $confPath
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build backend sidecar (PyInstaller)
+        shell: pwsh
+        run: |
+          cd backend
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\pip.exe install -r requirements.txt
+          .\.venv\Scripts\pip.exe install pyinstaller
+          if (-not (Test-Path "goodluck-backend.spec")) {
+            throw "backend/goodluck-backend.spec is required for release builds"
+          }
+          .\.venv\Scripts\pyinstaller.exe --noconfirm goodluck-backend.spec
+          if (-not (Test-Path "dist\goodluck-backend.exe")) {
+            throw "PyInstaller did not produce dist/goodluck-backend.exe"
+          }
+          New-Item -ItemType Directory -Force -Path "..\src-tauri\binaries" | Out-Null
+          Copy-Item -Force "dist\goodluck-backend.exe" "..\src-tauri\binaries\goodluck-backend.exe"
+          Copy-Item -Force "dist\goodluck-backend.exe" "..\src-tauri\binaries\goodluck-backend-x86_64-pc-windows-msvc.exe"
+          Get-FileHash -Algorithm SHA256 "..\src-tauri\binaries\goodluck-backend.exe" | Format-List
+
+      - name: Setup Node (required by tauri-action)
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install WebView2 runtime (Windows)
+        shell: pwsh
+        run: |
+          # GitHub windows-latest normally includes WebView2; keep this as a no-op safeguard.
+          Write-Host "WebView2 expected on windows-latest runner"
+
+      - name: Build and publish Tauri release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Literal empty string (NOT a repository secret). Required so the
+          # Tauri CLI does not interactively prompt for a password in CI.
+          # Omitting this env var hangs the Windows runner on a password prompt.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          projectPath: src-tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Good Luck Rahman Enterprise ${{ github.ref_name }}"
+          releaseBody: |
+            Desktop release for Good Luck Rahman Enterprise.
+
+            - New installs: download and run the Windows installer from Assets.
+            - Existing installs: the in-app updater reads `latest.json` and installs the signed update automatically.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true

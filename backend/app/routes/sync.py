@@ -55,6 +55,10 @@ def _device_error():
     return jsonify(error="This device is not registered to an authorized shop"), 403
 
 
+def _uses_firestore():
+    return current_app.config.get("CENTRAL_DATA_PROVIDER", "postgres") == "firestore"
+
+
 def _parse_cursor(value: str):
     """Parse the ISO-8601 cursor format returned by this endpoint."""
     if value.endswith(("Z", "z")):
@@ -98,6 +102,11 @@ def push():
     if not device:
         return _device_error()
 
+    firestore_service = None
+    if _uses_firestore():
+        from app.firestore import get_firestore_sync_service
+        firestore_service = get_firestore_sync_service()
+
     results = []
     for item in items:
         outbox_id = item.get("outbox_id")
@@ -106,6 +115,18 @@ def push():
 
         try:
             result_extra = {}
+            if firestore_service is not None:
+                if table_name == "sales":
+                    if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                        raise ValueError("Sale shop does not match the registered device shop")
+                    payload["device_id"] = device.id
+                elif table_name == "stock_movements":
+                    if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                        raise ValueError("Stock movement shop does not match the registered device shop")
+                    payload["device_id"] = device.id
+                result_extra = firestore_service.push_item(device, table_name, payload)
+                results.append({"outbox_id": outbox_id, "status": "ok", **result_extra})
+                continue
             if table_name == "sales":
                 if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
                     raise ValueError("Sale shop does not match the registered device shop")
@@ -163,6 +184,14 @@ def pull():
             since = _parse_cursor(since_raw)
         except ValueError:
             return jsonify(error="`since` must be an ISO timestamp"), 400
+
+    if _uses_firestore():
+        from app.firestore import get_firestore_sync_service
+        try:
+            return jsonify(get_firestore_sync_service().pull(shop_id, since))
+        except Exception as exc:
+            current_app.logger.exception("Firestore pull failed")
+            return jsonify(error=f"Central Firestore unavailable: {exc}"), 503
 
     # This endpoint is currently an unpaginated, high-water-mark-bounded pull.
     # If pagination is added later, every page must retain this same upper bound
