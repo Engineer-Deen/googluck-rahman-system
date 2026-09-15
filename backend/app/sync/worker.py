@@ -53,6 +53,10 @@ def push_pending_once(app) -> dict:
     with app.app_context():
         items = (SyncOutboxItem.query.filter_by(status="pending")
                  .order_by(SyncOutboxItem.created_at.asc()).limit(BATCH_SIZE).all())
+        if not current_app.config.get("SYNC_API_KEY"):
+            _set_state("last_sync_error", "Cloud synchronization is not configured on this device.")
+            db.session.commit()
+            return {"pushed": 0, "confirmed": 0, "failed": len(items)}
         if not items:
             return {"pushed": 0, "confirmed": 0, "failed": 0}
 
@@ -193,6 +197,10 @@ def _upsert_transactions(data):
 
 def pull_reference_data_once(app) -> dict:
     with app.app_context():
+        if not current_app.config.get("SYNC_API_KEY"):
+            _set_state("last_pull_error", "Cloud synchronization is not configured on this device.")
+            db.session.commit()
+            return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
         state = SyncState.query.get(LAST_PULL_KEY)
         since = state.value if state else None
         url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/pull"

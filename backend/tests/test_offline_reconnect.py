@@ -13,12 +13,12 @@ from werkzeug.security import generate_password_hash
 
 from app.extensions import db
 from app.firestore.service import FirestoreSyncService
-from app.models import Device, Product, Sale, SaleItem, SalePayment, Shop, Staff, StockMovement, SyncOutboxItem
+from app.models import Device, Product, Sale, SaleItem, SalePayment, Shop, Staff, StockMovement, SyncOutboxItem, SyncState
 from app.routes.auth import auth_bp
 from app.routes.sales import sales_bp
 from app.routes.sync import sync_bp
 from app.sync.outbox import enqueue_outbox
-from app.sync.worker import push_pending_once
+from app.sync.worker import pull_reference_data_once, push_pending_once
 from tests.test_firestore_provider import FakeFirestoreClient, _seed_catalog_product
 
 
@@ -129,6 +129,31 @@ class OfflineReconnectTests(unittest.TestCase):
             self.assertEqual(item.attempt_count, 1)
             self.assertIn("offline", item.last_error)
             self.assertIsNotNone(db.session.get(Sale, "pending-sale"))
+
+    def test_missing_sync_key_keeps_local_pos_and_reports_configuration(self):
+        self.app.config["SYNC_API_KEY"] = ""
+        with self.app.app_context():
+            db.session.add(SyncOutboxItem(
+                id=12,
+                table_name="sales",
+                record_id="pending-sale",
+                status="pending",
+                payload_json='{"id":"pending-sale","items":[]}',
+            ))
+            db.session.commit()
+
+        with patch("app.sync.worker.requests.post") as post, patch("app.sync.worker.requests.get") as get:
+            pushed = push_pending_once(self.app)
+            pulled = pull_reference_data_once(self.app)
+
+        self.assertEqual(pushed["failed"], 1)
+        self.assertEqual(pulled["sales"], 0)
+        self.assertFalse(post.called)
+        self.assertFalse(get.called)
+        with self.app.app_context():
+            state = {row.key: row.value for row in SyncState.query.all()}
+            self.assertEqual(state["last_sync_error"], "Cloud synchronization is not configured on this device.")
+            self.assertEqual(state["last_pull_error"], "Cloud synchronization is not configured on this device.")
 
     def test_reconnect_confirms_outbox_idempotently_without_duplicate_rows(self):
         with self.app.app_context():

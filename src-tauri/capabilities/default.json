@@ -10,6 +10,7 @@
     "shell:allow-execute",
     "updater:default",
     "allow-glr-check-update",
-    "allow-glr-install-update"
+    "allow-glr-install-update",
+    "allow-glr-local-backend-status"
   ]
 }

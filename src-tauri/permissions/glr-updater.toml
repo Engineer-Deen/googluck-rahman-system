@@ -7,3 +7,8 @@ commands.allow = ["glr_check_update"]
 identifier = "allow-glr-install-update"
 description = "Allows the frontend to download, verify, and install a signed update"
 commands.allow = ["glr_install_update"]
+
+[[permission]]
+identifier = "allow-glr-local-backend-status"
+description = "Allows the frontend to read local POS sidecar spawn status"
+commands.allow = ["glr_local_backend_status"]

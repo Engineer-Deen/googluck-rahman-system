@@ -7,6 +7,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 struct BackendSidecar {
     child: Mutex<Option<CommandChild>>,
+    spawn_error: Mutex<Option<String>>,
     #[cfg(windows)]
     job: Mutex<Option<windows_job::JobHandle>>,
 }
@@ -227,6 +228,33 @@ fn stop_backend_sidecar(app: &tauri::AppHandle) {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct LocalBackendStatus {
+    spawned: bool,
+    spawn_error: Option<String>,
+}
+
+/// Report whether the local POS sidecar was spawned, or why spawn failed.
+#[tauri::command]
+fn glr_local_backend_status(app: AppHandle) -> LocalBackendStatus {
+    let state = app.state::<BackendSidecar>();
+    let spawned = state
+        .child
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false);
+    let spawn_error = state
+        .spawn_error
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    LocalBackendStatus {
+        spawned,
+        spawn_error,
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateAvailableInfo {
     version: String,
     current_version: String,
@@ -286,10 +314,15 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(BackendSidecar {
             child: Mutex::new(None),
+            spawn_error: Mutex::new(None),
             #[cfg(windows)]
             job: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![glr_check_update, glr_install_update])
+        .invoke_handler(tauri::generate_handler![
+            glr_check_update,
+            glr_install_update,
+            glr_local_backend_status
+        ])
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -306,7 +339,8 @@ pub fn run() {
                 .sidecar("goodluck-backend")
                 .expect("failed to create backend sidecar command")
                 .env("GLR_MODE", "local")
-                .env("PORT", "5000");
+                .env("PORT", "5000")
+                .env("CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com");
 
             match sidecar_command.spawn() {
                 Ok((_rx, child)) => {
@@ -324,10 +358,21 @@ pub fn run() {
                         .child
                         .lock()
                         .expect("sidecar lock") = Some(child);
+                    *app.state::<BackendSidecar>()
+                        .spawn_error
+                        .lock()
+                        .expect("spawn error lock") = None;
                     println!("Good Luck Rahman backend started successfully.");
                 }
                 Err(error) => {
-                    eprintln!("Failed to start Good Luck Rahman backend: {error}");
+                    let message = format!(
+                        "Local POS server failed to start ({error}). Reinstall Good Luck Rahman or contact support."
+                    );
+                    eprintln!("{message}");
+                    *app.state::<BackendSidecar>()
+                        .spawn_error
+                        .lock()
+                        .expect("spawn error lock") = Some(message);
                 }
             }
 
@@ -348,4 +393,37 @@ pub fn run() {
                 stop_backend_sidecar(app_handle);
             }
         });
+}
+
+#[cfg(test)]
+mod local_backend_status_tests {
+    use super::LocalBackendStatus;
+
+    #[test]
+    fn serializes_spawn_error_for_frontend() {
+        let status = LocalBackendStatus {
+            spawned: false,
+            spawn_error: Some(
+                "Local POS server failed to start (missing binary). Reinstall Good Luck Rahman or contact support."
+                    .to_string(),
+            ),
+        };
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json["spawned"], false);
+        assert_eq!(
+            json["spawnError"],
+            "Local POS server failed to start (missing binary). Reinstall Good Luck Rahman or contact support."
+        );
+    }
+
+    #[test]
+    fn serializes_successful_spawn_without_error() {
+        let status = LocalBackendStatus {
+            spawned: true,
+            spawn_error: None,
+        };
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json["spawned"], true);
+        assert!(json.get("spawnError").unwrap().is_null());
+    }
 }

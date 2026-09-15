@@ -63,7 +63,7 @@ class BaseConfig:
 
     # Shared secret local devices send when pushing to the central
     # server's /api/sync/push endpoint. Must match on both sides.
-    SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "dev-sync-key-change-me")
+    SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
 
     # Central cloud data provider. PostgreSQL remains the default fallback;
     # Firestore is opt-in until its credentials and deployment are configured.
@@ -126,7 +126,7 @@ def _apply_runtime_config_values():
     BaseConfig.SQLALCHEMY_TRACK_MODIFICATIONS = False
     BaseConfig.DEVICE_ID_FILE = INSTANCE_DIR / "device_id.txt"
     BaseConfig.CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", "http://localhost:8000")
-    BaseConfig.SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "dev-sync-key-change-me")
+    BaseConfig.SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
     BaseConfig.CENTRAL_DATA_PROVIDER = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
     BaseConfig.FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
     BaseConfig.FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get(

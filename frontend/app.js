@@ -1,12 +1,18 @@
 /*
   This frontend only ever talks to ITS OWN local Flask server at
-  localhost:5000 -- never directly to the central server. That's
+  127.0.0.1:5000 -- never directly to the central server. That's
   deliberate: the local server is the thing that's always reachable
   (even offline), and it's the local server's own background worker
   that handles reaching central when possible. The UI never needs to
   know or care whether central is reachable right now.
+
+  Use 127.0.0.1 (not localhost): on Windows, localhost can resolve to
+  IPv6 ::1 first while the Tauri sidecar binds IPv4 only.
 */
-const API_BASE = "http://localhost:5000/api";
+const API_BASE = "http://127.0.0.1:5000/api";
+const LOCAL_BACKEND_READY_TIMEOUT_MS = 45000;
+const LOCAL_BACKEND_POLL_MS = 250;
+let localBackendReady = false;
 
 let authToken = localStorage.getItem("glr_token") || null;
 let currentStaff = JSON.parse(localStorage.getItem("glr_staff") || "null");
@@ -109,6 +115,9 @@ function syncToast(message, kind) {
 
 // ---------- API helper ----------
 async function api(path, options = {}) {
+  if (!localBackendReady) {
+    await waitForLocalBackend();
+  }
   const headers = Object.assign(
     { "Content-Type": "application/json" },
     options.headers || {}
@@ -1574,6 +1583,58 @@ function tauriInvoke(cmd, args) {
   return invoke(cmd, args || {});
 }
 
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function probeLocalBackendHealth() {
+  const res = await fetch(API_BASE + "/health", { method: "GET" });
+  return !!res && res.ok;
+}
+
+/**
+ * Wait until the local sidecar answers /api/health on 127.0.0.1.
+ * If Tauri reports a spawn failure, surface that message immediately.
+ */
+async function waitForLocalBackend(options = {}) {
+  if (localBackendReady) return true;
+
+  const timeoutMs = options.timeoutMs != null ? options.timeoutMs : LOCAL_BACKEND_READY_TIMEOUT_MS;
+  const intervalMs = options.intervalMs != null ? options.intervalMs : LOCAL_BACKEND_POLL_MS;
+  const startedAt = Date.now();
+
+  try {
+    const status = await tauriInvoke("glr_local_backend_status");
+    if (status && status.spawnError) {
+      const error = new Error(String(status.spawnError));
+      error.networkFailure = true;
+      error.sidecarFailed = true;
+      throw error;
+    }
+  } catch (err) {
+    if (err && err.sidecarFailed) throw err;
+    // Non-Tauri browsers / missing command: fall through to health polling.
+  }
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      if (await probeLocalBackendHealth()) {
+        localBackendReady = true;
+        return true;
+      }
+    } catch (_) {
+      // Sidecar still starting (PyInstaller extract / Flask boot).
+    }
+    await sleepMs(intervalMs);
+  }
+
+  const error = new Error(
+    "The local POS server did not become ready. Confirm Good Luck Rahman is fully started, then try again."
+  );
+  error.networkFailure = true;
+  throw error;
+}
+
 function showUpdateToast(info) {
   const el = document.getElementById("update-toast");
   const msg = document.getElementById("update-toast-message");
@@ -1635,7 +1696,25 @@ function scheduleAppUpdateCheck() {
 }
 
 // ---------- boot ----------
-(function boot() {
+(async function boot() {
+  const syncDot = document.getElementById("sync-dot");
+  const syncLabel = document.getElementById("sync-label");
+  if (syncLabel) syncLabel.textContent = "Starting local POS server...";
+
+  try {
+    await waitForLocalBackend();
+    if (syncLabel && syncLabel.textContent === "Starting local POS server...") {
+      syncLabel.textContent = "Ready";
+    }
+  } catch (err) {
+    if (syncDot) syncDot.classList.remove("online");
+    if (syncLabel) syncLabel.textContent = "POS server unavailable";
+    toast(
+      (err && err.message) || "The local POS server is unavailable.",
+      "error"
+    );
+  }
+
   loadLoginBranding();
   scheduleAppUpdateCheck();
   window.addEventListener("online", async () => {
@@ -1646,7 +1725,7 @@ function scheduleAppUpdateCheck() {
       } catch (_) {}
     }
   });
-  if (authToken && currentStaff) {
+  if (authToken && currentStaff && localBackendReady) {
     enterApp().catch(() => {});
   }
   document.getElementById("login-password").addEventListener("keydown", (e) => {
