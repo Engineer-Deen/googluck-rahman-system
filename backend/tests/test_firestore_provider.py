@@ -11,7 +11,7 @@ from werkzeug.security import generate_password_hash
 from app.extensions import db
 from app.config import get_config
 from app.firestore.service import FirestoreSyncService, _clean_staff
-from app.models import Device, Product, Sale, SaleItem, Staff, Shop
+from app.models import Device, Product, Sale, SaleItem, Staff, Shop, StockMovement
 from app.routes.sync import sync_bp
 
 
@@ -95,7 +95,16 @@ class FakeCollection:
         self.client.stream_calls += 1
         docs = []
         for data in self.client.collections.get(self.name, {}).values():
-            if self._field is None or (self._op == "==" and data.get(self._field) == self._value):
+            if self._field is None:
+                matches = True
+            elif self._op == "==":
+                matches = data.get(self._field) == self._value
+            elif self._op == "array_contains":
+                field_value = data.get(self._field)
+                matches = isinstance(field_value, (list, tuple)) and self._value in field_value
+            else:
+                matches = False
+            if matches:
                 docs.append(FakeDocumentSnapshot(True, dict(data)))
         if self._limit is not None:
             docs = docs[: self._limit]
@@ -167,11 +176,26 @@ class FakeFirestoreClient:
         return FakeTransaction(self)
 
 
+def _seed_catalog_product(client, product_id, shop_ids=None):
+    client.collections["products"][str(product_id)] = {
+        "id": product_id,
+        "sku": f"P-{product_id}",
+        "name": f"Product {product_id}",
+        "category": "General",
+        "unit_price": "10.00",
+        "cost_price": "5.00",
+        "is_active": True,
+        "shop_ids": shop_ids or [1],
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
 class FirestoreAdapterTests(unittest.TestCase):
     def setUp(self):
         self.client = FakeFirestoreClient()
         self.service = FirestoreSyncService(self.client)
         self.device = type("DeviceLike", (), {"id": "device-a", "shop_id": 1})()
+        _seed_catalog_product(self.client, 10)
 
     def test_firestore_adapter_creates_sales_documents_and_initial_payment(self):
         payload = {
@@ -292,6 +316,52 @@ class FirestoreAdapterTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "device does not match the registered device"):
             self.service.push_item(self.device, "sales", payload)
+
+    def test_firestore_push_rejects_unknown_product_for_stock_movement(self):
+        with self.assertRaisesRegex(ValueError, "Unknown product_id 999"):
+            self.service.push_item(self.device, "stock_movements", {
+                "id": "mov-bad",
+                "product_id": 999,
+                "quantity_delta": 1,
+                "reason": "restock",
+            })
+
+    def test_firestore_push_rejects_unknown_product_for_sale(self):
+        with self.assertRaisesRegex(ValueError, "Unknown product_id 999"):
+            self.service.push_item(self.device, "sales", {
+                "id": "sale-bad",
+                "shop_id": 1,
+                "device_id": "device-a",
+                "staff_id": 7,
+                "items": [{"id": "item-bad", "product_id": 999, "quantity": 1, "unit_price": "10.00"}],
+            })
+
+    def test_firestore_pull_includes_parent_product_for_incremental_child_rows(self):
+        self.client.collections["products"]["7"] = {
+            "id": 7,
+            "sku": "P-7",
+            "name": "Existing Product",
+            "unit_price": "15.00",
+            "cost_price": "8.00",
+            "is_active": True,
+            "shop_ids": [1],
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        self.client.collections["stock_movements"]["mov-7"] = {
+            "id": "mov-7",
+            "product_id": 7,
+            "shop_id": 1,
+            "device_id": "device-a",
+            "quantity_delta": -1,
+            "reason": "sale",
+            "reference_id": "sale-7",
+            "updated_at": "2026-01-02T06:00:00+00:00",
+        }
+        since = datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+        payload = self.service.pull(1, since)
+        product_ids = {row["id"] for row in payload["products"]}
+        self.assertIn(7, product_ids)
+        self.assertEqual(len(payload["stock_movements"]), 1)
 
     def test_firestore_pull_uses_next_cursor_and_sanitizes_staff_rows(self):
         self.client.collections["shops"]["1"] = {"id": 1, "name": "Shop A", "updated_at": "2026-01-02T01:00:00+00:00"}
@@ -542,6 +612,72 @@ class FirestoreMirrorTests(unittest.TestCase):
         with self.app.app_context():
             db.session.remove()
             db.engine.dispose()
+
+    def test_refresh_sql_mirror_skips_orphan_stock_movement(self):
+        self.client.collections["stock_movements"]["orphan"] = {
+            "id": "orphan",
+            "product_id": 7,
+            "shop_id": 1,
+            "device_id": "device-a",
+            "quantity_delta": -1,
+            "reason": "sale",
+            "reference_id": "missing-sale",
+            "updated_at": "2026-01-02T06:00:00+00:00",
+        }
+        with self.app.app_context():
+            self.service.refresh_sql_mirror(force=True)
+            self.assertIsNone(db.session.get(StockMovement, "orphan"))
+            conflicts = self.client.collections.get("provider_conflicts", {})
+            self.assertTrue(any(key.startswith("stock_movements:") for key in conflicts))
+
+    def test_refresh_sql_mirror_skips_orphan_sale_item(self):
+        self.client.collections["products"]["11"] = {
+            "id": 11,
+            "sku": "P-11",
+            "name": "Valid Product",
+            "category": "Gaming",
+            "unit_price": "30.00",
+            "cost_price": "12.00",
+            "is_active": True,
+        }
+        self.client.collections["sales"]["sale-valid"] = {
+            "id": "sale-valid",
+            "invoice_number": "INV-2027-3001",
+            "shop_id": 1,
+            "staff_id": 1,
+            "customer_name": "Valid",
+            "payment_method": "cash",
+            "total_amount": "30.00",
+            "created_at": "2027-01-01T00:00:00+00:00",
+            "updated_at": "2027-01-01T00:00:00+00:00",
+        }
+        self.client.collections["sale_items"]["item-valid"] = {
+            "id": "item-valid",
+            "sale_id": "sale-valid",
+            "product_id": 11,
+            "quantity": 1,
+            "unit_price": "30.00",
+            "subtotal": "30.00",
+            "unit_cost": "12.00",
+        }
+        self.client.collections["sale_items"]["item-orphan"] = {
+            "id": "item-orphan",
+            "sale_id": "sale-valid",
+            "product_id": 999,
+            "quantity": 1,
+            "unit_price": "10.00",
+            "subtotal": "10.00",
+            "unit_cost": "5.00",
+        }
+        with self.app.app_context():
+            self.service.refresh_sql_mirror(force=True)
+            self.assertIsNone(db.session.get(SaleItem, "item-orphan"))
+            valid = db.session.get(SaleItem, "item-valid")
+            self.assertIsNotNone(valid)
+            self.assertEqual(valid.product_id, 11)
+            self.assertEqual(str(valid.subtotal), "30.00")
+            conflicts = self.client.collections.get("provider_conflicts", {})
+            self.assertTrue(any(key.startswith("sale_items:") for key in conflicts))
 
     def test_mirror_preserves_relationships_and_excludes_staff_secrets(self):
         with self.app.app_context():

@@ -96,6 +96,42 @@ class SyncCursorTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual({row["sku"] for row in second.get_json()["products"]}, {"FIRST", "LATE"})
 
+    def test_pull_includes_unchanged_product_referenced_by_changed_movement(self):
+        old = datetime(2026, 1, 1, 0, 0, 0)
+        boundary = datetime(2026, 1, 2, 3, 4, 5)
+        with self.app.app_context():
+            shop = db.session.get(Shop, 1)
+            staff = db.session.get(Staff, 1)
+            shop.created_at = shop.updated_at = old
+            staff.created_at = staff.updated_at = old
+            db.session.add(Product(
+                id=7, sku="P-7", name="Product Seven", unit_price=10, cost_price=5,
+                created_at=old, updated_at=old,
+            ))
+            db.session.commit()
+
+        client = self.app.test_client()
+        headers = {"X-Sync-Key": "test-sync-key", "X-Device-ID": "cursor-device"}
+        first = client.get("/api/sync/pull", headers=headers)
+        self.assertEqual(first.status_code, 200)
+        cursor = first.get_json()["next_cursor"]
+
+        with self.app.app_context():
+            db.session.add(StockMovement(
+                id="MOV-7", product_id=7, shop_id=1, quantity_delta=-1,
+                reason="sale", created_at=boundary, updated_at=boundary,
+            ))
+            db.session.commit()
+
+        second = client.get(
+            "/api/sync/pull", query_string={"since": cursor},
+            headers=headers,
+        )
+        self.assertEqual(second.status_code, 200)
+        payload = second.get_json()
+        self.assertEqual({row["id"] for row in payload["products"]}, {7})
+        self.assertEqual(len(payload["stock_movements"]), 1)
+
     def test_worker_prefers_next_cursor_over_legacy_server_time(self):
         response = _Response({
             "next_cursor": "2026-01-02T03:04:05",

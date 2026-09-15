@@ -211,15 +211,6 @@ def pull():
 
     shops = changed(Shop.query.filter(Shop.id == shop_id), Shop).all()
     staff = changed(Staff.query.filter(Staff.shop_id == shop_id), Staff).all()
-    products = changed(
-        Product.query.filter(
-            Product.id.in_(
-                db.session.query(StockMovement.product_id)
-                .filter(StockMovement.shop_id == shop_id)
-            )
-        ),
-        Product,
-    ).all()
     sales = changed(Sale.query.filter(Sale.shop_id == shop_id), Sale).all()
     sale_ids = [s.id for s in sales]
     sale_items = SaleItem.query.filter(SaleItem.sale_id.in_(sale_ids)).all() if sale_ids else []
@@ -228,6 +219,20 @@ def pull():
         SalePayment,
     ).all()
     movements = changed(StockMovement.query.filter(StockMovement.shop_id == shop_id), StockMovement).all()
+    referenced_product_ids = {m.product_id for m in movements} | {i.product_id for i in sale_items}
+    shop_product_ids = (
+        db.session.query(StockMovement.product_id)
+        .filter(StockMovement.shop_id == shop_id)
+        .distinct()
+    )
+    products_by_id = {
+        p.id: p
+        for p in changed(Product.query.filter(Product.id.in_(shop_product_ids)), Product).all()
+    }
+    if referenced_product_ids:
+        for product in Product.query.filter(Product.id.in_(referenced_product_ids)).all():
+            products_by_id.setdefault(product.id, product)
+    products = list(products_by_id.values())
     settings = changed(SystemSetting.query, SystemSetting).all()
 
     return jsonify(

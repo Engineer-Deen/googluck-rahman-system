@@ -185,6 +185,10 @@ class FirestoreSyncService:
             model_map = self._model_map()
             skipped_sales: set[str] = set()
             product_costs: dict[str, str] = {}
+            materialized_product_ids = {
+                product_id
+                for (product_id,) in db.session.query(model_map["products"].id).all()
+            }
             with db.session.no_autoflush:
                 for collection, _ in _CENTRAL_TABLES:
                     model = model_map[collection]
@@ -227,6 +231,31 @@ class FirestoreSyncService:
                                 continue
                         if collection in {"sale_items", "sale_payments"} and str(incoming.get("sale_id")) in skipped_sales:
                             continue
+                        # Compatibility SQL mirror still enforces relational FKs.
+                        # Never materialize child rows that reference a missing product.
+                        if collection in {"sale_items", "stock_movements"}:
+                            product_id = incoming.get("product_id")
+                            try:
+                                product_key = int(product_id)
+                            except (TypeError, ValueError):
+                                self._record_conflict(
+                                    collection,
+                                    document_id,
+                                    {"reason": "invalid_product_id"},
+                                    {key: _iso(value) for key, value in incoming.items()},
+                                )
+                                continue
+                            if (
+                                product_key not in materialized_product_ids
+                                and db.session.get(model_map["products"], product_key) is None
+                            ):
+                                self._record_conflict(
+                                    collection,
+                                    document_id,
+                                    {"reason": "missing_product", "product_id": product_key},
+                                    {key: _iso(value) for key, value in incoming.items()},
+                                )
+                                continue
                         row = db.session.get(model, document_id)
                         if row is None:
                             if collection == "staff":
@@ -254,6 +283,8 @@ class FirestoreSyncService:
                             if name.endswith("_at") or name in {"created_at", "updated_at", "server_received_at", "voided_at"}:
                                 value = self._parse_datetime(value)
                             setattr(row, name, value)
+                        if collection == "products":
+                            materialized_product_ids.add(int(document_id))
             db.session.commit()
             self._last_refresh_monotonic = time.monotonic()
             self._last_refresh_generation = generation
@@ -427,6 +458,19 @@ class FirestoreSyncService:
 
         raise ValueError(f"Unknown table_name '{table_name}'")
 
+    def _require_product_document(self, product_id) -> dict:
+        """Reject sync writes that reference a product Firestore does not know."""
+        if product_id in (None, ""):
+            raise ValueError("product_id is required")
+        snapshot = self._collection("products").document(str(product_id)).get()
+        if not snapshot.exists:
+            raise ValueError(f"Unknown product_id {product_id}")
+        data = snapshot.to_dict() or {}
+        # Stub shop-membership docs without catalog fields are not sellable products.
+        if not data.get("sku") or not data.get("name"):
+            raise ValueError(f"Unknown product_id {product_id}")
+        return data
+
     def push_item(self, device, table_name: str, payload: dict) -> dict:
         """Idempotently write one existing outbox item and acknowledge it."""
         self._validate_device_scope(device, payload, table_name)
@@ -438,6 +482,14 @@ class FirestoreSyncService:
             if existing.exists:
                 existing_data = existing.to_dict() or {}
                 return {"invoice_number": existing_data.get("invoice_number")}
+
+            items = payload.get("items", [])
+            if not items:
+                raise ValueError("Sale items are required")
+            product_data_by_id = {
+                item["product_id"]: self._require_product_document(item["product_id"])
+                for item in items
+            }
 
             invoice = payload.get("invoice_number") or self._allocate_invoice(payload)
             sale = {
@@ -455,10 +507,9 @@ class FirestoreSyncService:
             }
             batch = self.client.batch()
             batch.set(sale_ref, sale, merge=True)
-            for item in payload.get("items", []):
+            for item in items:
                 item_id = item.get("id") or f"{sale_id}:{item['product_id']}"
-                product_snapshot = self._collection("products").document(str(item["product_id"])).get()
-                product_data = product_snapshot.to_dict() or {}
+                product_data = product_data_by_id[item["product_id"]]
                 quantity = int(item["quantity"])
                 unit_price = Decimal(str(item.get("unit_price", product_data.get("unit_price", "0"))))
                 batch.set(
@@ -485,7 +536,7 @@ class FirestoreSyncService:
                     "created_at": _utcnow(),
                     "updated_at": _utcnow(),
                 }, merge=True)
-            for item in payload.get("items", []):
+            for item in items:
                 movement_id = item.get("stock_movement_id") or f"{sale_id}:{item['product_id']}:sale"
                 batch.set(self._collection("stock_movements").document(movement_id), {
                     "id": movement_id,
@@ -499,7 +550,7 @@ class FirestoreSyncService:
                     "updated_at": _utcnow(),
                 }, merge=True)
             batch.commit()
-            for item in payload.get("items", []):
+            for item in items:
                 self._mark_product_shop(item["product_id"], device.shop_id)
             return {"invoice_number": invoice}
 
@@ -519,6 +570,7 @@ class FirestoreSyncService:
 
         if table_name == "stock_movements":
             movement_id = payload["id"]
+            self._require_product_document(payload.get("product_id"))
             self._write("stock_movements", movement_id, {
                 **payload,
                 "id": movement_id,
@@ -526,6 +578,7 @@ class FirestoreSyncService:
                 "device_id": device.id,
                 "updated_at": _utcnow(),
             })
+            self._mark_product_shop(payload["product_id"], device.shop_id)
             return {}
 
         raise ValueError(f"Unknown table_name '{table_name}'")
@@ -542,6 +595,7 @@ class FirestoreSyncService:
             "settings": list(self._collection("system_settings").stream()),
         }
         rows = {name: [doc.to_dict() or {} for doc in docs] for name, docs in collections.items()}
+        all_products = list(rows["products"])
         if since:
             for name, values in rows.items():
                 rows[name] = [value for value in values if _iso(value.get("updated_at")) and _iso(value["updated_at"]) >= _iso(since)]
@@ -554,6 +608,20 @@ class FirestoreSyncService:
             value = doc.to_dict() or {}
             if value.get("sale_id") in sale_ids:
                 sale_items.append(value)
+
+        # Incremental pulls must still include product parents for any child
+        # rows that crossed the cursor, even when the product itself is unchanged.
+        needed_product_ids = {
+            str(value.get("product_id"))
+            for value in (*rows["stock_movements"], *sale_items)
+            if value.get("product_id") is not None
+        }
+        products_by_id = {str(product.get("id")): product for product in rows["products"]}
+        for product in all_products:
+            product_id = str(product.get("id"))
+            if product_id in needed_product_ids and product_id not in products_by_id:
+                products_by_id[product_id] = product
+        rows["products"] = list(products_by_id.values())
 
         rows["staff"] = [
             _clean_staff({**staff, "shop_id": shop_id})

@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Flask
 
@@ -19,6 +19,7 @@ class SyncSecurityTests(unittest.TestCase):
         )
         db.init_app(self.app)
         self.app.register_blueprint(sync_bp)
+        baseline = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
         with self.app.app_context():
             db.create_all()
             db.session.add_all([
@@ -27,12 +28,18 @@ class SyncSecurityTests(unittest.TestCase):
                 Device(id="device-a", shop_id=1),
                 Staff(id=1, shop_id=1, name="A Cashier", email="a@test", password_hash="a-password-hash", quick_pin_hash="a-pin-hash", role="cashier"),
                 Staff(id=2, shop_id=2, name="B Cashier", email="b@test", password_hash="b-password-hash", quick_pin_hash="b-pin-hash", role="cashier"),
-                Product(id=1, sku="A-1", name="A Product", unit_price=10, cost_price=5),
-                Product(id=2, sku="B-1", name="B Product", unit_price=20, cost_price=10),
-                Sale(id="sale-a", shop_id=1, staff_id=1, customer_name="A Customer", total_amount=10),
-                Sale(id="sale-b", shop_id=2, staff_id=2, customer_name="B Customer", total_amount=20),
-                StockMovement(id="move-a", product_id=1, shop_id=1, quantity_delta=5, reason="restock"),
-                StockMovement(id="move-b", product_id=2, shop_id=2, quantity_delta=8, reason="restock"),
+                Product(id=1, sku="A-1", name="A Product", unit_price=10, cost_price=5, created_at=baseline, updated_at=baseline),
+                Product(id=2, sku="B-1", name="B Product", unit_price=20, cost_price=10, created_at=baseline, updated_at=baseline),
+                Sale(id="sale-a", shop_id=1, staff_id=1, customer_name="A Customer", total_amount=10, created_at=baseline, updated_at=baseline),
+                Sale(id="sale-b", shop_id=2, staff_id=2, customer_name="B Customer", total_amount=20, created_at=baseline, updated_at=baseline),
+                StockMovement(
+                    id="move-a", product_id=1, shop_id=1, quantity_delta=5, reason="restock",
+                    created_at=baseline, updated_at=baseline,
+                ),
+                StockMovement(
+                    id="move-b", product_id=2, shop_id=2, quantity_delta=8, reason="restock",
+                    created_at=baseline, updated_at=baseline,
+                ),
             ])
             db.session.commit()
 

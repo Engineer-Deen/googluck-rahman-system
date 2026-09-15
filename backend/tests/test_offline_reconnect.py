@@ -19,7 +19,7 @@ from app.routes.sales import sales_bp
 from app.routes.sync import sync_bp
 from app.sync.outbox import enqueue_outbox
 from app.sync.worker import push_pending_once
-from tests.test_firestore_provider import FakeFirestoreClient
+from tests.test_firestore_provider import FakeFirestoreClient, _seed_catalog_product
 
 
 class OfflineReconnectTests(unittest.TestCase):
@@ -168,6 +168,7 @@ class FirestoreProviderFailureTests(unittest.TestCase):
         self.app = Flask(__name__)
         self.client = FakeFirestoreClient()
         self.service = FirestoreSyncService(self.client)
+        _seed_catalog_product(self.client, 10)
         self.app.config.update(
             SQLALCHEMY_DATABASE_URI="sqlite://",
             SQLALCHEMY_TRACK_MODIFICATIONS=False,

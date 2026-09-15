@@ -146,6 +146,9 @@ def _upsert_transactions(data):
         sale.void_reason = raw.get("void_reason")
 
     for raw in data.get("sale_items", []):
+        if not Product.query.get(raw.get("product_id")):
+            # Parent product must arrive in the same pull before child rows.
+            continue
         item = SaleItem.query.get(raw["id"])
         if not item:
             item = SaleItem(id=raw["id"])
@@ -171,6 +174,8 @@ def _upsert_transactions(data):
         payment.server_received_at = _parse_datetime(raw.get("server_received_at"))
 
     for raw in data.get("stock_movements", []):
+        if not Product.query.get(raw.get("product_id")):
+            continue
         movement = StockMovement.query.get(raw["id"])
         if not movement:
             movement = StockMovement(id=raw["id"])

@@ -41,6 +41,29 @@ class SyncTimestampParsingTests(unittest.TestCase):
         self.assertEqual(offset_value.isoformat(), "2026-01-02T03:04:05+00:00")
         self.assertIsNone(_parse_datetime(None))
 
+    def test_upsert_skips_stock_movement_when_product_missing(self):
+        payload = {
+            "sales": [],
+            "sale_items": [],
+            "payments": [],
+            "stock_movements": [{
+                "id": "orphan-movement",
+                "product_id": 99,
+                "shop_id": 1,
+                "device_id": None,
+                "quantity_delta": -1,
+                "reason": "sale",
+                "reference_id": "sale-x",
+                "created_at": "2026-01-02T03:04:05Z",
+                "updated_at": "2026-01-02T03:04:05Z",
+                "server_received_at": None,
+            }],
+        }
+        with self.app.app_context():
+            _upsert_transactions(payload)
+            db.session.commit()
+            self.assertIsNone(db.session.get(StockMovement, "orphan-movement"))
+
     def test_upsert_commits_iso_timestamps_and_nullable_fields(self):
         payload = {
             "sales": [{
