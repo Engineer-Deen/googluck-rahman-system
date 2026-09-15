@@ -79,9 +79,9 @@ def _require_central_mode():
     if current_app.config["GLR_MODE"] != "central":
         return jsonify(
             error=(
-                "Products can only be created or edited on the central server "
-                "(while online), then they sync down to this device automatically. "
-                "This keeps product ids consistent everywhere."
+                "Products can only be added or edited while online. Connect to "
+                "the internet, update the catalogue, and the change will sync "
+                "to this shop computer automatically."
             )
         ), 403
     return None

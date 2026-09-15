@@ -41,6 +41,10 @@ def create_app():
         elif app.config.get("BOOTSTRAP_INITIAL_LOCAL_DATA"):
             from app.bootstrap import ensure_initial_local_data
             ensure_initial_local_data()
+        else:
+            # Allow one-time credential updates even when create/seed is skipped.
+            from app.bootstrap import apply_one_time_credential_bootstrap
+            apply_one_time_credential_bootstrap()
 
     @app.get("/api/health")
     def health():

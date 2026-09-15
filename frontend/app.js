@@ -141,11 +141,13 @@ async function api(path, options = {}) {
     }
     const rawMessage = (data && data.error) || `Request failed (${res.status})`;
     const message = res.status === 403
-      ? `UNAUTHORIZED: ${rawMessage}`
+      ? rawMessage
       : res.status === 503
-        ? `CENTRAL SERVER UNAVAILABLE: ${rawMessage}`
+        ? (rawMessage && !/^CENTRAL SERVER/i.test(rawMessage)
+            ? rawMessage
+            : "The online server is temporarily unavailable. You can keep selling offline; try again when the connection returns.")
         : /not enough stock|out of stock/i.test(rawMessage)
-          ? `OUT OF STOCK: ${rawMessage}`
+          ? rawMessage
           : rawMessage;
     const error = new Error(message);
     error.authExpired = res.status === 401 && !path.endsWith("/auth/login") && !!tokenUsed;
@@ -1386,8 +1388,7 @@ async function saveShopSettings(){
     toast("Shop branding updated.","success");
     loadShopBranding();
   }catch(e){
-    if (/central server/i.test(e.message)) toast("This setting can only be saved on the central server. Connect to the internet and try again.", "error");
-    else toast(e.message,"error");
+    toast(e.message,"error");
   }
 }
 
@@ -1550,7 +1551,15 @@ async function loadLoginBranding() {
     if (!res.ok) return;
     const shop = await res.json();
     const loginLogo = document.getElementById("login-shop-logo");
-    if (loginLogo && shop.logo_data) { loginLogo.src = shop.logo_data; loginLogo.style.display = "block"; }
+    if (loginLogo && shop.logo_data) {
+      loginLogo.src = shop.logo_data;
+      loginLogo.style.display = "block";
+      const fallbackIcon = document.querySelector("#login-overlay .brand-icon-lg");
+      if (fallbackIcon) fallbackIcon.style.display = "none";
+    }
+    const title = document.getElementById("login-shop-title");
+    if (title && shop.name) title.textContent = String(shop.name).toUpperCase();
+    if (shop.name) document.title = shop.name;
   } catch (_) {}
 }
 

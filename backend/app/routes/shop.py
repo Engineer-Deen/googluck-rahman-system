@@ -63,7 +63,7 @@ def get_shop():
 @roles_required("owner", "admin")
 def update_shop():
     if current_app.config["GLR_MODE"] != "central":
-        return jsonify(error="Shop branding can only be saved on the central server. Connect to the internet and try again."), 403
+        return jsonify(error="Shop name and logo can only be saved while online. Connect to the internet and try again."), 403
     shop = Shop.query.get(g.staff_shop_id) if g.staff_shop_id else Shop.query.first()
     if not shop:
         return jsonify(error="Shop not found"), 404
@@ -106,7 +106,7 @@ def get_system_settings():
 @roles_required("owner", "admin")
 def save_system_settings():
     if current_app.config["GLR_MODE"] != "central":
-        return jsonify(error="System settings can only be saved on the central server. Connect to the internet and try again."), 403
+        return jsonify(error="These system settings can only be saved while online. Connect to the internet and try again."), 403
 
     data = request.get_json(silent=True) or {}
     try:

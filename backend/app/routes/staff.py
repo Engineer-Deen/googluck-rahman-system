@@ -36,9 +36,9 @@ def _require_central_mode():
     if current_app.config["GLR_MODE"] != "central":
         return jsonify(
             error=(
-                "Staff accounts can only be created or edited on the central "
-                "server (while online), then they sync down to every device "
-                "automatically."
+                "Staff accounts can only be added or changed while this shop "
+                "computer is online. Connect to the internet, make the change, "
+                "and it will sync to your other devices automatically."
             )
         ), 403
     return None

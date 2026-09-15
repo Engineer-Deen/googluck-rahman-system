@@ -22,8 +22,8 @@
       <circle cx="40" cy="38" r="22" fill="#0f2035"/>
       <ellipse cx="40" cy="50" rx="17" ry="4.5" fill="var(--accent)"/>
     </svg>
-    <div class="login-title">GOOD LUCK RAHMAN ENTERPRISE</div>
-    <div class="login-tagline">Management System</div>
+    <div class="login-title" id="login-shop-title">GOOD LUCK RAHMAN ENTERPRISE</div>
+    <div class="login-tagline">Shop Management</div>
 
     <div class="role-select" id="role-select">
       <button type="button" class="role-btn active" data-role="owner" onclick="setLoginRole('owner')">SHOP OWNER / ADMIN</button>
@@ -327,8 +327,16 @@
         <div class="section-title">STAFF MANAGEMENT</div>
         <div class="section-line"></div>
       </div>
+      <div class="card">
+        <div class="card-title">What works offline vs online</div>
+        <div class="settings-list">
+          <div><strong>Works offline:</strong> viewing the staff list already stored on this computer, and sellers logging in with their existing accounts.</div>
+          <div><strong>Needs internet:</strong> adding a seller, editing a staff account, registering an administrator, resetting a password, or activating/deactivating an account.</div>
+        </div>
+      </div>
       <div class="card" id="staff-create-card">
         <div class="card-title">Add a Seller</div>
+        <div class="settings-note" style="margin-bottom:0.85rem;">Requires an internet connection. The new account will then sync to other shop computers.</div>
         <div class="form-grid">
           <div class="form-group">
             <label>Full Name</label>
@@ -435,14 +443,15 @@
           <div class="form-group"><label>Shop Name</label><input id="shop-name-input" type="text" placeholder="Business name"></div>
           <div class="form-group"><label>Shop Logo</label><input id="shop-logo-input" type="file" accept="image/*"></div>
         </div>
-        <div class="settings-note">Branding changes are saved on the central server and then synchronized to connected devices.</div>
+        <div class="settings-note">Branding is saved online and then synchronized to connected shop computers. Update the shop name and logo here so customers and staff see the correct business identity on the login screen and header.</div>
         <button class="btn btn-primary" onclick="saveShopSettings()">SAVE BRANDING</button>
       </div>
       <div class="card">
-        <div class="card-title">System Behaviour</div>
+        <div class="card-title">What works offline vs online</div>
         <div class="settings-list">
-          <div><strong>Offline-first sales:</strong> sales are saved immediately on the local database and synchronized automatically when the central server is reachable.</div>
-          <div><strong>Central-only administration:</strong> product catalogue, staff accounts and shop branding changes are saved on the central server.</div>
+          <div><strong>Works offline:</strong> recording sales, taking payments, viewing local history, and checking stock already stored on this computer.</div>
+          <div><strong>Needs internet:</strong> saving shop branding, changing system security settings, managing staff accounts, and updating the product catalogue.</div>
+          <div><strong>Automatic sync:</strong> when the connection returns, pending sales and stock changes are sent online and shared updates are pulled down to this computer.</div>
         </div>
       </div>
     </div>
