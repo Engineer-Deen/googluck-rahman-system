@@ -169,4 +169,11 @@ def _run_compat_migrations():
     for index_name, table, columns in indexes:
         if table in inspector.get_table_names():
             db.session.execute(text(f'CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({columns})'))
+
+    # Firestore (and some sync paths) insert integer PKs explicitly. That leaves
+    # PostgreSQL SERIAL/IDENTITY sequences behind MAX(id); repair before seed/
+    # bootstrap so new ORM rows do not collide (e.g. system_settings id=2).
+    from app.db_compat import resync_postgres_serial_sequences
+
+    resync_postgres_serial_sequences()
     db.session.commit()

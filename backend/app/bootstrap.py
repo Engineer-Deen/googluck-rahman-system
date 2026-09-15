@@ -103,21 +103,8 @@ def _read_credential_marker() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def apply_one_time_credential_bootstrap() -> dict:
-    """Apply a one-shot owner/admin credential update when configured.
-
-    Requires BOOTSTRAP_CREDENTIAL_UPDATE_TOKEN, BOOTSTRAP_TARGET_EMAIL, and
-    BOOTSTRAP_NEW_PASSWORD. After a successful apply, the token fingerprint is
-    stored in system_settings so later restarts with the same token are no-ops.
-    Missing or incomplete configuration is ignored safely.
-    """
-    token = _seed_value("BOOTSTRAP_CREDENTIAL_UPDATE_TOKEN")
-    target_email = _seed_value("BOOTSTRAP_TARGET_EMAIL").lower()
-    new_password = _seed_value("BOOTSTRAP_NEW_PASSWORD")
-    if not token or not target_email or not new_password:
-        return {"applied": False, "reason": "missing_config"}
-
-    token_fp = _token_fingerprint(token)
+def _apply_credential_bootstrap_once(token_fp: str, target_email: str, new_password: str) -> dict:
+    """Mutate the target staff row and durable marker in one transaction."""
     marker = _read_credential_marker()
     if marker.get("token_fp") == token_fp:
         return {"applied": False, "reason": "already_applied"}
@@ -155,8 +142,49 @@ def apply_one_time_credential_bootstrap() -> dict:
             "email": staff.email,
         }
     )
+    # Credential changes and the applied marker commit together so a failed
+    # marker insert cannot leave updated credentials without a durable marker.
     db.session.commit()
     return {"applied": True, "staff_id": staff.id, "email": staff.email}
+
+
+def apply_one_time_credential_bootstrap() -> dict:
+    """Apply a one-shot owner/admin credential update when configured.
+
+    Requires BOOTSTRAP_CREDENTIAL_UPDATE_TOKEN, BOOTSTRAP_TARGET_EMAIL, and
+    BOOTSTRAP_NEW_PASSWORD. After a successful apply, the token fingerprint is
+    stored in system_settings so later restarts with the same token are no-ops.
+    Missing or incomplete configuration is ignored safely.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db_compat import resync_postgres_serial_sequences
+
+    token = _seed_value("BOOTSTRAP_CREDENTIAL_UPDATE_TOKEN")
+    target_email = _seed_value("BOOTSTRAP_TARGET_EMAIL").lower()
+    new_password = _seed_value("BOOTSTRAP_NEW_PASSWORD")
+    if not token or not target_email or not new_password:
+        return {"applied": False, "reason": "missing_config"}
+
+    token_fp = _token_fingerprint(token)
+
+    try:
+        return _apply_credential_bootstrap_once(token_fp, target_email, new_password)
+    except IntegrityError:
+        # Stale PostgreSQL sequences after explicit-ID inserts can collide on
+        # system_settings.id. Roll back so staff updates are not kept without
+        # a marker, repair sequences, and retry once.
+        db.session.rollback()
+        resync_postgres_serial_sequences()
+        db.session.commit()
+        try:
+            return _apply_credential_bootstrap_once(token_fp, target_email, new_password)
+        except IntegrityError:
+            db.session.rollback()
+            raise
+    except Exception:
+        db.session.rollback()
+        raise
 
 
 def ensure_initial_local_data() -> None:
