@@ -6,6 +6,8 @@ from flask import Flask
 from app.extensions import db
 from app.models import Device, Product, Sale, SaleItem, SalePayment, Shop, Staff, StockMovement
 from app.routes.sync import sync_bp
+from tests.test_firestore_provider import FakeFirestoreClient
+from app.firestore.service import FirestoreSyncService
 
 
 class SyncSecurityTests(unittest.TestCase):
@@ -42,6 +44,35 @@ class SyncSecurityTests(unittest.TestCase):
                 ),
             ])
             db.session.commit()
+        self.firestore_client = FakeFirestoreClient()
+        self.firestore_service = FirestoreSyncService(self.firestore_client)
+        self.firestore_client.collections["shops"].update({
+            "1": {"id": 1, "name": "Shop A"}, "2": {"id": 2, "name": "Shop B"},
+        })
+        self.firestore_client.collections["devices"]["device-a"] = {
+            "id": "device-a", "shop_id": 1, "authorized": True,
+        }
+        for staff_id, shop_id, name, email in ((1, 1, "A Cashier", "a@test"), (2, 2, "B Cashier", "b@test")):
+            self.firestore_client.collections["staff"][str(staff_id)] = {
+                "id": staff_id, "shop_id": shop_id, "name": name, "email": email,
+                "password_hash": "a-password-hash" if staff_id == 1 else "b-password-hash",
+                "quick_pin_hash": "a-pin-hash" if staff_id == 1 else "b-pin-hash",
+                "role": "cashier", "is_active": True,
+                "updated_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+            }
+        self.firestore_client.collections["products"].update({
+            "1": {"id": 1, "sku": "A-1", "name": "A Product", "unit_price": "10", "cost_price": "5", "is_active": True, "shop_ids": [1]},
+            "2": {"id": 2, "sku": "B-1", "name": "B Product", "unit_price": "20", "cost_price": "10", "is_active": True, "shop_ids": [2]},
+        })
+        self.firestore_client.collections["sales"].update({
+            "sale-a": {"id": "sale-a", "shop_id": 1, "staff_id": 1, "customer_name": "A Customer", "total_amount": "10", "created_at": baseline, "updated_at": baseline},
+            "sale-b": {"id": "sale-b", "shop_id": 2, "staff_id": 2, "customer_name": "B Customer", "total_amount": "20", "created_at": baseline, "updated_at": baseline},
+        })
+        self.firestore_client.collections["stock_movements"].update({
+            "move-a": {"id": "move-a", "product_id": 1, "shop_id": 1, "quantity_delta": 5, "reason": "restock", "created_at": baseline, "updated_at": baseline},
+            "move-b": {"id": "move-b", "product_id": 2, "shop_id": 2, "quantity_delta": 8, "reason": "restock", "created_at": baseline, "updated_at": baseline},
+        })
+        self.app.config["FIRESTORE_SYNC_SERVICE"] = self.firestore_service
 
     def tearDown(self):
         with self.app.app_context():
@@ -103,8 +134,7 @@ class SyncSecurityTests(unittest.TestCase):
         )
         self.assertEqual(cross_shop.status_code, 200)
         self.assertEqual(cross_shop.get_json()["results"][0]["status"], "error")
-        with self.app.app_context():
-            self.assertIsNone(db.session.get(Sale, "pushed-b"))
+        self.assertNotIn("pushed-b", self.firestore_client.collections["sales"])
 
     def test_pull_contains_only_bound_shop_data_and_no_credentials(self):
         response = self.app.test_client().get("/api/sync/pull", headers=self._headers())
@@ -123,10 +153,7 @@ class SyncSecurityTests(unittest.TestCase):
 
     def test_cursor_boundary_still_replays_authorized_shop_rows(self):
         boundary = datetime(2026, 1, 2, 3, 4, 5)
-        with self.app.app_context():
-            product = db.session.get(Product, 1)
-            product.updated_at = boundary
-            db.session.commit()
+        self.firestore_client.collections["products"]["1"]["updated_at"] = boundary
 
         client = self.app.test_client()
         first = client.get("/api/sync/pull", headers=self._headers())
@@ -134,13 +161,17 @@ class SyncSecurityTests(unittest.TestCase):
         cursor = first.get_json()["next_cursor"]
         cursor_time = datetime.fromisoformat(cursor)
 
-        with self.app.app_context():
-            db.session.add(Product(id=3, sku="A-LATE", name="A Late Product", unit_price=1, cost_price=1, updated_at=cursor_time, created_at=cursor_time))
-            db.session.add(Product(id=4, sku="B-LATE", name="B Late Product", unit_price=1, cost_price=1, updated_at=cursor_time, created_at=cursor_time))
-            db.session.add(StockMovement(id="move-a-late", product_id=3, shop_id=1, quantity_delta=1, reason="restock", updated_at=cursor_time, created_at=cursor_time))
-            db.session.add(StockMovement(id="move-b-late", product_id=4, shop_id=2, quantity_delta=1, reason="restock", updated_at=cursor_time, created_at=cursor_time))
-            db.session.commit()
+        self.firestore_client.collections["products"].update({
+            "3": {"id": 3, "sku": "A-LATE", "name": "A Late Product", "unit_price": "1", "cost_price": "1", "updated_at": cursor_time, "created_at": cursor_time, "is_active": True, "shop_ids": [1]},
+            "4": {"id": 4, "sku": "B-LATE", "name": "B Late Product", "unit_price": "1", "cost_price": "1", "updated_at": cursor_time, "created_at": cursor_time, "is_active": True, "shop_ids": [2]},
+        })
+        self.firestore_client.collections["stock_movements"].update({
+            "move-a-late": {"id": "move-a-late", "product_id": 3, "shop_id": 1, "quantity_delta": 1, "reason": "restock", "updated_at": cursor_time, "created_at": cursor_time},
+            "move-b-late": {"id": "move-b-late", "product_id": 4, "shop_id": 2, "quantity_delta": 1, "reason": "restock", "updated_at": cursor_time, "created_at": cursor_time},
+        })
 
         second = client.get("/api/sync/pull", query_string={"since": cursor}, headers=self._headers())
         self.assertEqual(second.status_code, 200)
-        self.assertEqual({row["sku"] for row in second.get_json()["products"]}, {"A-LATE"})
+        second_products = {row["sku"] for row in second.get_json()["products"]}
+        self.assertIn("A-LATE", second_products)
+        self.assertNotIn("B-LATE", second_products)

@@ -208,6 +208,9 @@ class FirestoreProviderFailureTests(unittest.TestCase):
             db.create_all()
             db.session.add_all([Shop(id=1, name="Shop A"), Device(id="device-a", shop_id=1)])
             db.session.commit()
+        self.client.collections["devices"]["device-a"] = {
+            "id": "device-a", "shop_id": 1, "authorized": True,
+        }
 
     def tearDown(self):
         with self.app.app_context():
@@ -240,6 +243,12 @@ class FirestoreProviderFailureTests(unittest.TestCase):
 
     def test_firestore_unavailable_on_pull_returns_503_without_false_success(self):
         class BoomService:
+            def get_device(self, device_id):
+                return {"id": device_id, "shop_id": 1, "authorized": True}
+
+            def save_device(self, device_id, **fields):
+                return {"id": device_id, "shop_id": 1, "authorized": True, **fields}
+
             def pull(self, shop_id, since):
                 raise RuntimeError("quota exceeded")
 
@@ -253,6 +262,12 @@ class FirestoreProviderFailureTests(unittest.TestCase):
 
     def test_firestore_push_item_failure_is_reported_per_item_with_rollback(self):
         class BoomPushService:
+            def get_device(self, device_id):
+                return {"id": device_id, "shop_id": 1, "authorized": True}
+
+            def save_device(self, device_id, **fields):
+                return {"id": device_id, "shop_id": 1, "authorized": True, **fields}
+
             def push_item(self, device, table_name, payload):
                 raise RuntimeError("deadline exceeded")
 

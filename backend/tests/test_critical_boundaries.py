@@ -18,6 +18,8 @@ from pathlib import Path
 from unittest.mock import patch
 import os
 import unittest
+from tests.test_firestore_provider import FakeFirestoreClient
+from app.firestore.service import FirestoreSyncService
 
 
 class CriticalBoundaryTests(unittest.TestCase):
@@ -81,200 +83,37 @@ class CriticalBoundaryTests(unittest.TestCase):
                 Sale(id="sale-two", shop_id=2, staff_id=2, customer_name="Other Shop", total_amount=10),
             ])
             db.session.commit()
-
-    def test_firestore_sale_retries_invoice_collision_without_duplicate_rows(self):
-        class Allocator:
-            def __init__(self):
-                self.calls = 0
-                self.requests = []
-
-            def allocate_invoice_number(self, payload):
-                self.calls += 1
-                self.requests.append(dict(payload))
-                if self.calls == 1:
-                    return "INV-2026-1010"
-                return f"INV-2026-{payload['minimum_next']}"
-
-        allocator = Allocator()
-        self.app.config["CENTRAL_DATA_PROVIDER"] = "firestore"
-        with self.app.app_context(), patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            db.session.add(Sale(id="existing-invoice", invoice_number="INV-2026-1010", total_amount=10))
-            payload = {
-                "id": "new-invoice",
-                "shop_id": 1,
-                "staff_id": 1,
-                "customer_name": "Invoice Collision Customer",
-                "payment_method": "cash",
-                "amount_paid": "10.00",
-                "payment_id": "new-payment",
-                "assign_invoice": True,
-                "items": [{
-                    "id": "new-item",
-                    "product_id": 1,
-                    "quantity": 1,
-                    "unit_price": "10.00",
-                    "stock_movement_id": "new-movement",
-                }],
+        self.firestore_client = FakeFirestoreClient()
+        self.firestore_service = FirestoreSyncService(self.firestore_client)
+        self.firestore_client.collections["shops"].update({
+            "1": {"id": 1, "name": "Shop One"},
+            "2": {"id": 2, "name": "Shop Two"},
+        })
+        for staff in (
+            (1, 1, "Cashier One", "one@critical.test", "cashier"),
+            (2, 2, "Cashier Two", "two@critical.test", "cashier"),
+            (3, 1, "Shop Admin", "admin@critical.test", "admin"),
+            (4, 1, "Owner", "owner@critical.test", "owner"),
+        ):
+            staff_id, shop_id, name, email, role = staff
+            self.firestore_client.collections["staff"][str(staff_id)] = {
+                "id": staff_id, "shop_id": shop_id, "name": name, "email": email,
+                "role": role, "is_active": True, "updated_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+                "password_hash": generate_password_hash("secret"),
             }
-
-            sale, warnings, created = apply_sale(payload)
-
-            self.assertTrue(created)
-            self.assertEqual(warnings, [])
-            self.assertEqual(sale.invoice_number, "INV-2026-1011")
-            self.assertEqual(allocator.calls, 2)
-            self.assertEqual(allocator.requests[1]["minimum_next"], 1011)
-            self.assertEqual(Sale.query.filter_by(id="new-invoice").count(), 1)
-            self.assertEqual(SaleItem.query.filter_by(sale_id="new-invoice").count(), 1)
-            self.assertEqual(SalePayment.query.filter_by(sale_id="new-invoice").count(), 1)
-            self.assertEqual(StockMovement.query.filter_by(reference_id="new-invoice").count(), 1)
-
-    def test_sales_route_retries_invoice_collision_before_commit(self):
-        class Allocator:
-            def __init__(self):
-                self.calls = 0
-                self.requests = []
-
-            def allocate_invoice_number(self, payload):
-                self.calls += 1
-                self.requests.append(dict(payload))
-                if self.calls == 1:
-                    return "INV-2026-1010"
-                return f"INV-2026-{payload['minimum_next']}"
-
-        allocator = Allocator()
-        self.app.config.update(GLR_MODE="central", CENTRAL_DATA_PROVIDER="firestore")
-        client, headers = self._cashier_client()
-        with self.app.app_context(), patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            db.session.add(Sale(id="route-existing-invoice", invoice_number="INV-2026-1010", total_amount=10))
-            db.session.commit()
-
-        payload = {
-            "id": "route-collision-sale",
-            "customer_name": "Route Collision Customer",
-            "payment_method": "cash",
-            "amount_paid": "10.00",
-            "items": [{"product_id": 1, "quantity": 1, "unit_price": "10.00"}],
+        self.firestore_client.collections["products"]["1"] = {
+            "id": 1, "sku": "P-1", "name": "Shared Product", "unit_price": "10.00",
+            "cost_price": "5.00", "is_active": True, "shop_ids": [1, 2],
         }
-        with patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            response = client.post("/api/sales", headers=headers, json=payload)
-
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.get_json()["invoice_number"], "INV-2026-1011")
-        self.assertEqual(allocator.calls, 2)
-        self.assertEqual(allocator.requests[1]["minimum_next"], 1011)
-        with self.app.app_context():
-            self.assertEqual(Sale.query.filter_by(id="route-collision-sale").count(), 1)
-            self.assertEqual(SaleItem.query.filter_by(sale_id="route-collision-sale").count(), 1)
-            self.assertEqual(SalePayment.query.filter_by(sale_id="route-collision-sale").count(), 1)
-            self.assertEqual(StockMovement.query.filter_by(reference_id="route-collision-sale").count(), 1)
-
-        with patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            replay = client.post("/api/sales", headers=headers, json=payload)
-
-        self.assertEqual(replay.status_code, 200)
-        self.assertEqual(replay.get_json()["invoice_number"], "INV-2026-1011")
-        self.assertEqual(allocator.calls, 2)
-        with self.app.app_context():
-            self.assertEqual(Sale.query.filter_by(id="route-collision-sale").count(), 1)
-            self.assertEqual(SaleItem.query.filter_by(sale_id="route-collision-sale").count(), 1)
-            self.assertEqual(SalePayment.query.filter_by(sale_id="route-collision-sale").count(), 1)
-            self.assertEqual(StockMovement.query.filter_by(reference_id="route-collision-sale").count(), 1)
-
-    def test_sales_route_starts_after_sql_invoice_floor_when_firestore_sequence_is_behind(self):
-        class Allocator:
-            def __init__(self):
-                self.requests = []
-
-            def allocate_invoice_number(self, payload):
-                self.requests.append(dict(payload))
-                return f"INV-2026-{payload.get('minimum_next', 1001)}"
-
-        allocator = Allocator()
-        self.app.config.update(GLR_MODE="central", CENTRAL_DATA_PROVIDER="firestore")
-        client, headers = self._cashier_client()
-        with self.app.app_context(), patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            db.session.add_all([
-                Sale(id="floor-1008", invoice_number="INV-2026-1008", total_amount=10),
-                Sale(id="floor-1009", invoice_number="INV-2026-1009", total_amount=10),
-                Sale(id="floor-1010", invoice_number="INV-2026-1010", total_amount=10),
-                Sale(id="floor-1011", invoice_number="INV-2026-1011", total_amount=10),
-                Product(id=7, sku="P-7", name="Floor Product", unit_price=15, cost_price=10),
-                StockMovement(id="floor-stock", product_id=7, shop_id=1, quantity_delta=2, reason="restock"),
-            ])
-            db.session.commit()
-
-        payload = {
-            "id": "floor-sale",
-            "customer_name": "Floor Customer",
-            "payment_method": "cash",
-            "amount_paid": "15.00",
-            "items": [{"product_id": 7, "quantity": 1, "unit_price": "15.00"}],
+        self.firestore_client.collections["stock_movements"].update({
+            "movement-one": {"id": "movement-one", "product_id": 1, "shop_id": 1, "quantity_delta": 3, "reason": "restock"},
+            "movement-two": {"id": "movement-two", "product_id": 1, "shop_id": 2, "quantity_delta": 7, "reason": "restock"},
+        })
+        self.firestore_client.collections["sales"]["sale-two"] = {
+            "id": "sale-two", "shop_id": 2, "staff_id": 2, "customer_name": "Other Shop",
+            "total_amount": "10.00", "created_at": datetime.now(timezone.utc),
         }
-        with patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            response = client.post("/api/sales", headers=headers, json=payload)
-
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.get_json()["invoice_number"], "INV-2026-1012")
-        self.assertEqual(allocator.requests[0]["minimum_next"], 1012)
-        self.assertEqual(response.get_json()["amount_paid"], "15.00")
-        with self.app.app_context():
-            self.assertEqual(Sale.query.filter_by(id="floor-sale").count(), 1)
-            self.assertEqual(SaleItem.query.filter_by(sale_id="floor-sale").count(), 1)
-            self.assertEqual(SalePayment.query.filter_by(sale_id="floor-sale").count(), 1)
-            self.assertEqual(StockMovement.query.filter_by(reference_id="floor-sale").count(), 1)
-            self.assertEqual(current_stock(7, 1), 1)
-
-        with patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            replay = client.post("/api/sales", headers=headers, json=payload)
-
-        self.assertEqual(replay.status_code, 200)
-        self.assertEqual(replay.get_json()["invoice_number"], "INV-2026-1012")
-        with self.app.app_context():
-            self.assertEqual(Sale.query.filter_by(id="floor-sale").count(), 1)
-            self.assertEqual(SaleItem.query.filter_by(sale_id="floor-sale").count(), 1)
-            self.assertEqual(SalePayment.query.filter_by(sale_id="floor-sale").count(), 1)
-            self.assertEqual(StockMovement.query.filter_by(reference_id="floor-sale").count(), 1)
-            self.assertEqual(current_stock(7, 1), 1)
-
-    def test_exhausted_invoice_allocation_rolls_back_pending_sale_rows(self):
-        class ExhaustedAllocator:
-            def allocate_invoice_number(self, payload):
-                return "INV-2026-1010"
-
-        self.app.config["CENTRAL_DATA_PROVIDER"] = "firestore"
-        allocator = ExhaustedAllocator()
-        with self.app.app_context(), patch("app.firestore.get_firestore_sync_service", return_value=allocator):
-            db.session.add_all([
-                Sale(id="exhausted-existing-1010", invoice_number="INV-2026-1010", total_amount=10),
-                Sale(id="exhausted-existing-1011", invoice_number="INV-2026-1011", total_amount=10),
-            ])
-            db.session.commit()
-            payload = {
-                "id": "exhausted-sale",
-                "shop_id": 1,
-                "staff_id": 1,
-                "customer_name": "Exhausted Allocation Customer",
-                "amount_paid": "10.00",
-                "payment_id": "exhausted-payment",
-                "assign_invoice": True,
-                "items": [{
-                    "id": "exhausted-item",
-                    "product_id": 1,
-                    "quantity": 1,
-                    "unit_price": "10.00",
-                    "stock_movement_id": "exhausted-movement",
-                }],
-            }
-
-            with self.assertRaisesRegex(RuntimeError, "Could not allocate a unique invoice number"):
-                apply_sale(payload)
-            db.session.rollback()
-
-            self.assertEqual(Sale.query.filter_by(id="exhausted-sale").count(), 0)
-            self.assertEqual(SaleItem.query.filter_by(sale_id="exhausted-sale").count(), 0)
-            self.assertEqual(SalePayment.query.filter_by(sale_id="exhausted-sale").count(), 0)
-            self.assertEqual(StockMovement.query.filter_by(reference_id="exhausted-sale").count(), 0)
+        self.app.config["FIRESTORE_SYNC_SERVICE"] = self.firestore_service
 
     def tearDown(self):
         with self.app.app_context():
@@ -395,7 +234,11 @@ class CriticalBoundaryTests(unittest.TestCase):
         self.assertEqual(reset.status_code, 200)
 
         with self.app.app_context():
-            actions = {entry.action for entry in AuditLogEntry.query.filter(AuditLogEntry.entity_id == str(staff_id)).all()}
+            actions = {
+                entry.get("action")
+                for entry in self.firestore_client.collections["audit_log"].values()
+                if entry.get("entity_id") == str(staff_id)
+            }
             self.assertTrue({"staff_created", "staff_updated", "staff_password_reset"}.issubset(actions))
 
     def test_cashier_cannot_manage_staff(self):
@@ -438,10 +281,9 @@ class CriticalBoundaryTests(unittest.TestCase):
         self.assertEqual(settings.get_json()["timeout_minutes"], 30)
         self.assertEqual(settings.get_json()["full_login_hours"], 12)
 
-        with self.app.app_context():
-            audit = AuditLogEntry.query.filter_by(action="system_settings_updated").order_by(AuditLogEntry.id.desc()).first()
-            self.assertIsNotNone(audit)
-            self.assertEqual(audit.actor_staff_id, 3)
+        audit_rows = [row for row in self.firestore_client.collections["audit_log"].values() if row.get("action") == "system_settings_updated"]
+        self.assertTrue(audit_rows)
+        self.assertEqual(audit_rows[-1]["actor_staff_id"], 3)
 
     def test_push_pending_once_ignores_conflicting_invoice_reassignment(self):
         self.app.config["CENTRAL_SYNC_URL"] = "http://central.test"
@@ -727,18 +569,11 @@ class CriticalBoundaryTests(unittest.TestCase):
 
     def test_audit_log_authorization_and_formatting(self):
         self.app.config["GLR_MODE"] = "central"
-        with self.app.app_context():
-            db.session.add(AuditLogEntry(
-                actor_staff_id=3,
-                actor_name="Shop Admin",
-                actor_role="admin",
-                action="staff_created",
-                entity_type="staff",
-                entity_id="99",
-                details_json='{"name": "Temp", "email": "temp@test", "role": "cashier"}',
-                details="Created cashier account for Temp (temp@test).",
-            ))
-            db.session.commit()
+        self.firestore_service.write_audit(
+            "audit-99", actor_staff_id=3, actor_name="Shop Admin", actor_role="admin",
+            action="staff_created", entity_type="staff", entity_id="99",
+            details={"name": "Temp", "email": "temp@test", "role": "cashier"},
+        )
 
         cashier, cashier_headers = self._cashier_client()
         self.assertEqual(cashier.get("/api/audit-log", headers=cashier_headers).status_code, 403)

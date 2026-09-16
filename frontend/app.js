@@ -210,6 +210,70 @@ async function doLogin() {
   }
 }
 
+async function loadProvisioningStatus() {
+  const panel = document.getElementById("provisioning-panel");
+  const stateEl = document.getElementById("provisioning-state");
+  const deviceEl = document.getElementById("provisioning-device");
+  if (!panel || !stateEl || !deviceEl || !localBackendReady) return;
+  try {
+    const res = await fetch(API_BASE + "/sync/provisioning/status");
+    const data = await res.json();
+    const state = data.state || "NOT_ENROLLED";
+    stateEl.textContent = state;
+    deviceEl.textContent = data.device_id ? `Device: ${data.device_id}` : "";
+    panel.style.display = state === "READY" ? "none" : "block";
+    if (state === "SYNC_ERROR" && data.last_pull_error) {
+      document.getElementById("provisioning-error").textContent = data.last_pull_error;
+    }
+  } catch (_) {
+    stateEl.textContent = "SYNC ERROR";
+    panel.style.display = "block";
+  }
+}
+
+async function provisionDesktop() {
+  const email = document.getElementById("central-enrollment-email").value.trim();
+  const password = document.getElementById("central-enrollment-password").value;
+  const localPassword = document.getElementById("local-enrollment-password").value;
+  const errorEl = document.getElementById("provisioning-error");
+  const button = document.getElementById("provision-submit-btn");
+  errorEl.textContent = "";
+  if (!email || !password || localPassword.length < 8) {
+    errorEl.textContent = "Enter central owner/admin credentials and a local password of at least 8 characters.";
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "AUTHORIZING...";
+  try {
+    const provisioned = await fetch(API_BASE + "/sync/provisioning/enroll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        central_email: email,
+        central_password: password,
+        local_password: localPassword,
+        name: "Good Luck Rahman Main Device",
+        platform: getDesktopPlatformLabel(),
+      }),
+    });
+    const provisionedData = await provisioned.json();
+    if (!provisioned.ok) throw new Error(provisionedData.error || "Desktop provisioning failed.");
+
+    document.getElementById("central-enrollment-password").value = "";
+    document.getElementById("local-enrollment-password").value = "";
+    document.getElementById("login-email").value = provisionedData.staff.email;
+    document.getElementById("login-password").value = localPassword;
+    document.getElementById("provisioning-error").textContent = "Desktop is ready. Use the local password to sign in.";
+    await loadProvisioningStatus();
+  } catch (err) {
+    errorEl.textContent = err.message || "Desktop provisioning failed.";
+  } finally {
+    button.disabled = false;
+    button.textContent = "AUTHORIZE DESKTOP";
+  }
+}
+
 async function doLogout() {
   try {
     if (authToken) await api("/auth/logout", { method: "POST" });
@@ -1378,27 +1442,8 @@ async function loadShopBranding(){
     const shop=await api("/shop");
     currentMode = shop.mode || "local";
     document.getElementById("header-shop-name").textContent=shop.name||"Management System";
-    [document.getElementById("login-shop-logo"),document.getElementById("header-shop-logo")].forEach(img=>{
-      if(shop.logo_data){ img.src=shop.logo_data; img.style.display="block"; }
-      else { img.style.display="none"; }
-    });
-    const name=document.getElementById("shop-name-input"); if(name) name.value=shop.name||"";
     applyRoleVisibility();
   } catch(e){}
-}
-
-async function saveShopSettings(){
-  const name=document.getElementById("shop-name-input").value.trim();
-  const file=document.getElementById("shop-logo-input").files[0];
-  let logo_data;
-  if(file) logo_data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file);});
-  try{
-    await api("/shop",{method:"PUT",body:JSON.stringify({name,logo_data})});
-    toast("Shop branding updated.","success");
-    loadShopBranding();
-  }catch(e){
-    toast(e.message,"error");
-  }
 }
 
 let syncPollTimer = null;
@@ -1422,15 +1467,7 @@ async function ensureDeviceRegistration() {
 
     localStorage.setItem("glr_device_id", deviceId);
 
-    await api("/sync/devices", {
-      method: "POST",
-      body: JSON.stringify({
-        device_id: deviceId,
-        shop_id: Number(currentStaff.shop_id),
-        name: "Good Luck Rahman Main Device",
-        platform: getDesktopPlatformLabel(),
-      }),
-    });
+    await loadProvisioningStatus();
   } catch (err) {
     if (err.authExpired || err.networkFailure) return;
     if (/This device is not registered|not registered to an authorized shop/i.test(err.message)) {
@@ -1466,7 +1503,7 @@ async function triggerSync(options) {
   const silent = !!(options && options.silent);
   try {
     await api("/sync/trigger", { method: "POST" });
-    if (!silent) syncToast("Synchronization started.", "success");
+    if (!silent) syncToast("Synchronization requested. Checking the saved result.", "info");
     setTimeout(pollSyncStatus, 1000);
   } catch (e) {
     if (!e.authExpired && !e.networkFailure && !silent) syncToast(e.message, "error");
@@ -1491,6 +1528,17 @@ async function pollSyncStatus() {
       return;
     }
 
+    if (data.provisioning_state === "NOT_ENROLLED") {
+      label.textContent = "Not enrolled";
+      dot.classList.remove("online");
+      return;
+    }
+    if (data.provisioning_state === "ENROLLED / PROVISIONING") {
+      label.textContent = "Provisioning";
+      dot.classList.add("online");
+      return;
+    }
+
     const errored = !!data.last_sync_error;
     const pending = Number(data.pending_count || 0);
     const needsReview = Number(data.needs_review_count || 0);
@@ -1502,7 +1550,18 @@ async function pollSyncStatus() {
           ? "pending"
           : "synced";
 
-    if (key === "unavailable") {
+    const specificErrorLabel = data.sync_error_kind === "SYNC_API_KEY_MISSING"
+      ? "Sync key missing"
+      : data.sync_error_kind === "DEVICE_NOT_AUTHORIZED"
+        ? "Device not authorized"
+        : data.sync_error_kind === "RENDER_UNREACHABLE"
+          ? "Render unreachable - retrying"
+          : null;
+
+    if (specificErrorLabel) {
+      label.textContent = specificErrorLabel;
+      dot.classList.remove("online");
+    } else if (key === "unavailable") {
       label.textContent = "Central server unavailable - retrying";
       dot.classList.remove("online");
     } else if (key === "review") {
@@ -1559,13 +1618,6 @@ async function loadLoginBranding() {
     const res = await fetch(API_BASE + "/shop/public");
     if (!res.ok) return;
     const shop = await res.json();
-    const loginLogo = document.getElementById("login-shop-logo");
-    if (loginLogo && shop.logo_data) {
-      loginLogo.src = shop.logo_data;
-      loginLogo.style.display = "block";
-      const fallbackIcon = document.querySelector("#login-overlay .brand-icon-lg");
-      if (fallbackIcon) fallbackIcon.style.display = "none";
-    }
     const title = document.getElementById("login-shop-title");
     if (title && shop.name) title.textContent = String(shop.name).toUpperCase();
     if (shop.name) document.title = shop.name;
@@ -1716,6 +1768,7 @@ function scheduleAppUpdateCheck() {
   }
 
   loadLoginBranding();
+  loadProvisioningStatus();
   scheduleAppUpdateCheck();
   window.addEventListener("online", async () => {
     if (authToken && currentStaff) {

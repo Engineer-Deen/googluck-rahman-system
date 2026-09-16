@@ -39,7 +39,20 @@ def apply_stock_movement(payload: dict):
     if not movement_id:
         raise ValueError("payload.id is required")
 
-    existing = StockMovement.query.get(movement_id)
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        product_id = payload.get("product_id")
+        reason = payload.get("reason")
+        if not product_id or reason not in ALLOWED_REASONS:
+            raise ValueError(f"product_id is required and reason must be one of {sorted(ALLOWED_REASONS)}")
+        try:
+            payload["quantity_delta"] = int(payload["quantity_delta"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("quantity_delta must be a whole number")
+        return service.create_stock_movement(payload)
+
+    existing = db.session.get(StockMovement, movement_id)
     if existing:
         return existing, False
 
@@ -50,7 +63,7 @@ def apply_stock_movement(payload: dict):
             f"product_id is required and reason must be one of {sorted(ALLOWED_REASONS)}"
         )
 
-    if not Product.query.get(product_id):
+    if not db.session.get(Product, product_id):
         raise ValueError(f"Unknown product_id {product_id}")
 
     try:
@@ -107,12 +120,24 @@ def create_stock_movement():
     except ValueError as e:
         return jsonify(error=str(e)), 400
 
+    shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+
     if created and current_app.config["GLR_MODE"] == "local":
         from app.sync.worker import trigger_sync_soon
         trigger_sync_soon(current_app._get_current_object())
 
-    product = Product.query.get(payload["product_id"])
-    shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        product = service.get_product(payload["product_id"])
+        stock_value = service.stock_map([payload["product_id"]], shop_id).get(int(payload["product_id"]), 0)
+        return jsonify(
+            id=movement["id"],
+            product=serialize_product(product, stock_value=stock_value),
+            new_stock=stock_value,
+        ), 201 if created else 200
+
+    product = db.session.get(Product, payload["product_id"])
     return jsonify(
         id=movement.id,
         product=serialize_product(product, stock_value=current_stock(payload["product_id"], shop_id)),
@@ -123,6 +148,22 @@ def create_stock_movement():
 @stock_bp.get("/product/<int:product_id>")
 @login_required
 def stock_history(product_id):
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        if not service.get_product(product_id):
+            return jsonify(error="Product not found"), 404
+        movements = service.list_stock_movements(product_id, None if g.staff_role == "owner" else g.staff_shop_id)
+        return jsonify([
+            {
+                "id": movement.get("id"),
+                "quantity_delta": movement.get("quantity_delta"),
+                "reason": movement.get("reason"),
+                "reference_id": movement.get("reference_id"),
+                "created_at": movement.get("created_at").isoformat() if hasattr(movement.get("created_at"), "isoformat") else movement.get("created_at"),
+            }
+            for movement in movements
+        ])
     query = StockMovement.query.filter_by(product_id=product_id)
     if g.staff_role != "owner":
         query = query.filter_by(shop_id=g.staff_shop_id)

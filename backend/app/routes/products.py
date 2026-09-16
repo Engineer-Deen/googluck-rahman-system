@@ -30,6 +30,9 @@ FINANCE_ROLES = ("owner", "admin", "manager")
 
 
 def current_stock(product_id, shop_id=None):
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        return get_firestore_sync_service().stock_map([product_id], shop_id).get(int(product_id), 0)
     query = db.session.query(func.coalesce(func.sum(StockMovement.quantity_delta), 0))
     query = query.filter(StockMovement.product_id == product_id)
     if shop_id is not None:
@@ -39,6 +42,9 @@ def current_stock(product_id, shop_id=None):
 
 
 def stock_map(product_ids=None, shop_id=None):
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        return get_firestore_sync_service().stock_map(product_ids, shop_id)
     query = db.session.query(
         StockMovement.product_id,
         func.coalesce(func.sum(StockMovement.quantity_delta), 0),
@@ -51,13 +57,14 @@ def stock_map(product_ids=None, shop_id=None):
 
 
 def serialize_product(p, include_stock=True, role=None, stock_value=None):
+    value = lambda key, default=None: p.get(key, default) if isinstance(p, dict) else getattr(p, key, default)
     data = {
-        "id": p.id,
-        "sku": p.sku,
-        "name": p.name,
-        "category": p.category,
-        "unit_price": str(p.unit_price),
-        "is_active": p.is_active,
+        "id": value("id"),
+        "sku": value("sku"),
+        "name": value("name"),
+        "category": value("category"),
+        "unit_price": str(value("unit_price", 0)),
+        "is_active": value("is_active", True),
     }
     if include_stock:
         data["stock"] = current_stock(p.id) if stock_value is None else int(stock_value)
@@ -65,7 +72,7 @@ def serialize_product(p, include_stock=True, role=None, stock_value=None):
     # should see it -- a cashier gets the selling price and stock, same
     # as the old system kept cost data away from front-line staff.
     if role in FINANCE_ROLES:
-        data["cost_price"] = str(p.cost_price)
+        data["cost_price"] = str(value("cost_price", 0))
     return data
 
 
@@ -95,6 +102,13 @@ def list_products():
     # for with ?include_inactive=true (useful for an admin screen that
     # wants to see/reactivate them).
     include_inactive = request.args.get("include_inactive") == "true"
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        products = service.list_products(include_inactive=include_inactive)
+        shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+        stocks = service.stock_map((product.get("id") for product in products), shop_id=shop_id)
+        return jsonify([serialize_product(product, role=g.staff_role, stock_value=stocks.get(int(product["id"]), 0)) for product in products])
     query = Product.query
     if not include_inactive:
         query = query.filter_by(is_active=True)
@@ -107,6 +121,13 @@ def list_products():
 @products_bp.get("/<int:product_id>")
 @login_required
 def get_product(product_id):
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        product = get_firestore_sync_service().get_product(product_id)
+        if not product:
+            return jsonify(error="Product not found"), 404
+        shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+        return jsonify(serialize_product(product, role=g.staff_role, stock_value=current_stock(product_id, shop_id)))
     p = Product.query.get_or_404(product_id)
     shop_id = None if g.staff_role == "owner" else g.staff_shop_id
     return jsonify(serialize_product(p, role=g.staff_role, stock_value=current_stock(product_id, shop_id)))
@@ -134,19 +155,23 @@ def create_product():
     except (TypeError, ValueError):
         return jsonify(error="unit_price and cost_price must be numbers"), 400
 
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        product_id = service._allocate_product_id()
+        product = service.save_product(product_id, sku=f"GLR-{CATEGORY_CODES[category]}-{product_id:06d}", name=name, category=category, unit_price=str(unit_price), cost_price=str(cost_price), is_active=True, shop_ids=[])
+        service.write_audit(f"product-created-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_created", entity_type="product", entity_id=str(product_id), details={"sku": product["sku"], "name": name, "category": category})
+        return jsonify(serialize_product(product, role=g.staff_role, stock_value=0)), 201
     product = Product(
-        sku=f"TEMP-{uuid.uuid4().hex}",
-        name=name,
-        category=category,
-        unit_price=unit_price,
-        cost_price=cost_price,
+        sku=f"TEMP-{uuid.uuid4().hex}", name=name, category=category,
+        unit_price=unit_price, cost_price=cost_price,
     )
     db.session.add(product)
     db.session.flush()
     product.sku = f"GLR-{CATEGORY_CODES[category]}-{product.id:06d}"
     db.session.commit()
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(
         g.staff_id, actor.name if actor else None, g.staff_role,
         "product_created", "product", product.id,
@@ -163,6 +188,31 @@ def update_product(product_id):
     if blocked:
         return blocked
 
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        product = service.get_product(product_id)
+        if not product:
+            return jsonify(error="Product not found"), 404
+        data = request.get_json(silent=True) or {}
+        reason = (data.get("reason") or "").strip()
+        if not reason:
+            return jsonify(error="A reason is required to update a product"), 400
+        before = dict(product)
+        updates = {key: data[key] for key in ("name", "is_active") if key in data}
+        if "category" in data:
+            if data["category"] not in CATEGORY_CODES:
+                return jsonify(error="Please select a valid product category"), 400
+            updates["category"] = data["category"]
+        for key in ("unit_price", "cost_price"):
+            if key in data:
+                try:
+                    updates[key] = str(float(data[key]))
+                except (TypeError, ValueError):
+                    return jsonify(error=f"{key} must be a number"), 400
+        product = service.save_product(product_id, **updates)
+        service.write_audit(f"product-updated-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_updated", entity_type="product", entity_id=str(product_id), details={"reason": reason, "before": before, "after": product})
+        return jsonify(serialize_product(product, role=g.staff_role, stock_value=current_stock(product_id, g.staff_shop_id)))
     p = Product.query.get_or_404(product_id)
     data = request.get_json(silent=True) or {}
     reason = (data.get("reason") or "").strip()
@@ -193,7 +243,7 @@ def update_product(product_id):
 
     db.session.commit()
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(
         g.staff_id, actor.name if actor else None, g.staff_role,
         "product_updated", "product", p.id, {"reason": reason, "before": before, "after": {"sku": p.sku, "name": p.name, "category": p.category, "unit_price": str(p.unit_price), "cost_price": str(p.cost_price), "is_active": p.is_active}},
@@ -216,13 +266,23 @@ def delete_product(product_id):
     if blocked:
         return blocked
 
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        product = service.get_product(product_id)
+        if not product:
+            return jsonify(error="Product not found"), 404
+        data = request.get_json(silent=True) or {}
+        product = service.save_product(product_id, is_active=False)
+        service.write_audit(f"product-deleted-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_deleted", entity_type="product", entity_id=str(product_id), details={"sku": product.get("sku"), "name": product.get("name"), "reason": data.get("reason")})
+        return jsonify(serialize_product(product, role=g.staff_role, stock_value=current_stock(product_id, g.staff_shop_id)))
     p = Product.query.get_or_404(product_id)
     data = request.get_json(silent=True) or {}
     reason = (data.get("reason") or "").strip()
     p.is_active = False
     db.session.commit()
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(
         g.staff_id, actor.name if actor else None, g.staff_role,
         "product_deleted", "product", p.id,

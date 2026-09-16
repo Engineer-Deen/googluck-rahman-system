@@ -1,6 +1,4 @@
-from datetime import datetime, timezone
-
-from flask import Flask, current_app, g, jsonify, request
+from flask import Flask, jsonify
 from sqlalchemy import inspect, text
 from flask_cors import CORS
 
@@ -8,13 +6,15 @@ from app.config import get_config
 from app.extensions import db
 
 
-# Auth and public probes must not depend on Firestore mirror success.
-# Login reads retained SQL credentials; mirror failures must not become HTTP 500.
-_FIRESTORE_MIRROR_EXEMPT_PATHS = frozenset({
-    "/api/health",
-    "/api/shop/public",
-    "/api/auth/login",
-})
+def _configure_cors(app):
+    configured_origins = app.config.get("CORS_ALLOWED_ORIGINS", "")
+    origins = [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+    if origins:
+        CORS(app, origins=origins)
+    elif app.config.get("GLR_MODE") == "central":
+        CORS(app, origins=[])
+    else:
+        CORS(app, origins="*")
 
 
 def create_app():
@@ -22,40 +22,46 @@ def create_app():
     config = get_config()
     app.config.from_object(config)
 
-    db.init_app(app)
+    is_local = app.config.get("GLR_MODE") == "local"
+    if is_local:
+        db.init_app(app)
 
     # The frontend (running as a Tauri desktop webview, or a plain browser
     # tab) talks to this server over plain HTTP, exactly like any other
     # web client -- so it needs normal CORS headers, same as any API that
     # serves a separate frontend origin.
-    CORS(app)
+    _configure_cors(app)
 
     from app import models  # noqa: F401  (ensures models are registered)
 
     with app.app_context():
-        db.create_all()
-        _run_compat_migrations()
-        if app.config.get("GLR_MODE") == "central":
+        if is_local:
+            db.create_all()
+            _run_compat_migrations()
+            if app.config.get("BOOTSTRAP_INITIAL_LOCAL_DATA"):
+                from app.bootstrap import ensure_initial_local_data
+                ensure_initial_local_data()
+            else:
+                # Allow one-time credential updates even when create/seed is skipped.
+                from app.bootstrap import apply_one_time_credential_bootstrap
+                apply_one_time_credential_bootstrap()
+        else:
+            from app.firestore import get_firestore_sync_service
+            get_firestore_sync_service()
             from app.bootstrap import ensure_initial_central_data
             ensure_initial_central_data()
-        elif app.config.get("BOOTSTRAP_INITIAL_LOCAL_DATA"):
-            from app.bootstrap import ensure_initial_local_data
-            ensure_initial_local_data()
-        else:
-            # Allow one-time credential updates even when create/seed is skipped.
-            from app.bootstrap import apply_one_time_credential_bootstrap
-            apply_one_time_credential_bootstrap()
 
     @app.get("/api/health")
     def health():
         return jsonify(
             status="ok",
             mode=app.config["GLR_MODE"],
-            database=_safe_db_label(app.config["SQLALCHEMY_DATABASE_URI"]),
+            database=("sqlite" if is_local else "firestore"),
         )
 
     from app.routes.audit import audit_bp
     from app.routes.auth import auth_bp
+    from app.routes.diagnostics import diagnostics_bp
     from app.routes.products import products_bp
     from app.routes.sales import sales_bp
     from app.routes.staff import staff_bp
@@ -65,42 +71,13 @@ def create_app():
 
     app.register_blueprint(audit_bp)
     app.register_blueprint(auth_bp)
+    app.register_blueprint(diagnostics_bp)
     app.register_blueprint(products_bp)
     app.register_blueprint(sales_bp)
     app.register_blueprint(staff_bp)
     app.register_blueprint(shop_bp)
     app.register_blueprint(stock_bp)
     app.register_blueprint(sync_bp)
-
-    if app.config.get("GLR_MODE") == "central" and app.config.get("CENTRAL_DATA_PROVIDER") == "firestore":
-        from app.firestore import get_firestore_sync_service
-
-        @app.before_request
-        def _refresh_firestore_central_state():
-            g.firestore_request_started_at = datetime.now(timezone.utc)
-            if request.path in _FIRESTORE_MIRROR_EXEMPT_PATHS:
-                return None
-            try:
-                get_firestore_sync_service().refresh_sql_mirror()
-            except Exception:
-                current_app.logger.exception("Firestore central mirror refresh failed")
-                db.session.rollback()
-
-        @app.after_request
-        def _mirror_firestore_central_state(response):
-            if request.path in _FIRESTORE_MIRROR_EXEMPT_PATHS:
-                return response
-            try:
-                if response.status_code < 500 and request.method not in {"GET", "HEAD", "OPTIONS"}:
-                    service = get_firestore_sync_service()
-                    started_at = getattr(g, "firestore_request_started_at", None)
-                    if started_at is not None:
-                        service.mirror_recent_sql_state(started_at)
-                        service.mark_central_state_changed()
-            except Exception:
-                current_app.logger.exception("Firestore central mirror write failed")
-                db.session.rollback()
-            return response
 
     return app
 
@@ -109,12 +86,10 @@ def _safe_db_label(uri: str) -> str:
     """Never echo credentials back in a health check response."""
     if uri.startswith("sqlite"):
         return "sqlite"
-    if "@" in uri:
-        return "postgresql (" + uri.split("@")[-1] + ")"
     return uri.split("://")[0]
 
 def _run_compat_migrations():
-    """Small non-destructive migration layer for existing SQLite/Postgres installs."""
+    """Small non-destructive migration layer for existing SQLite installs."""
     inspector = inspect(db.engine)
     dialect = db.engine.dialect.name
     migrations = {
@@ -170,10 +145,4 @@ def _run_compat_migrations():
         if table in inspector.get_table_names():
             db.session.execute(text(f'CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({columns})'))
 
-    # Firestore (and some sync paths) insert integer PKs explicitly. That leaves
-    # PostgreSQL SERIAL/IDENTITY sequences behind MAX(id); repair before seed/
-    # bootstrap so new ORM rows do not collide (e.g. system_settings id=2).
-    from app.db_compat import resync_postgres_serial_sequences
-
-    resync_postgres_serial_sequences()
     db.session.commit()

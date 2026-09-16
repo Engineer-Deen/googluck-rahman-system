@@ -8,10 +8,6 @@ import os
 
 from werkzeug.security import generate_password_hash
 
-from app.extensions import db
-from app.models import Product, Shop, Staff, SystemSetting
-
-
 BOOTSTRAP_CREDENTIAL_MARKER_KEY = "bootstrap_credential_update_applied"
 _ALLOWED_BOOTSTRAP_ROLES = frozenset({"owner", "admin", "manager", "cashier"})
 
@@ -44,6 +40,8 @@ def _resolve_account(role: str, demo_email: str, demo_password: str, demo_name: 
 
 
 def _ensure_shop() -> Shop:
+    from app.extensions import db
+    from app.models import Shop
     shop_name = _seed_value("INITIAL_SHOP_NAME", "Good Luck Rahman Enterprise")
     shop_location = _seed_value("INITIAL_SHOP_LOCATION", "")
     shop = Shop.query.filter_by(name=shop_name).first()
@@ -62,6 +60,8 @@ def _ensure_shop() -> Shop:
 
 
 def _ensure_staff_accounts(shop: Shop, include_owner: bool) -> None:
+    from app.extensions import db
+    from app.models import Staff
     specs = []
     if include_owner:
         specs.append(_resolve_account("owner", "owner@glr.test", "owner123", "Owner"))
@@ -93,6 +93,8 @@ def _token_fingerprint(token: str) -> str:
 
 
 def _read_credential_marker() -> dict:
+    from app.extensions import db
+    from app.models import SystemSetting
     row = SystemSetting.query.filter_by(key=BOOTSTRAP_CREDENTIAL_MARKER_KEY).first()
     if not row or not row.value:
         return {}
@@ -105,6 +107,8 @@ def _read_credential_marker() -> dict:
 
 def _apply_credential_bootstrap_once(token_fp: str, target_email: str, new_password: str) -> dict:
     """Mutate the target staff row and durable marker in one transaction."""
+    from app.extensions import db
+    from app.models import Staff, SystemSetting
     marker = _read_credential_marker()
     if marker.get("token_fp") == token_fp:
         return {"applied": False, "reason": "already_applied"}
@@ -156,10 +160,6 @@ def apply_one_time_credential_bootstrap() -> dict:
     stored in system_settings so later restarts with the same token are no-ops.
     Missing or incomplete configuration is ignored safely.
     """
-    from sqlalchemy.exc import IntegrityError
-
-    from app.db_compat import resync_postgres_serial_sequences
-
     token = _seed_value("BOOTSTRAP_CREDENTIAL_UPDATE_TOKEN")
     target_email = _seed_value("BOOTSTRAP_TARGET_EMAIL").lower()
     new_password = _seed_value("BOOTSTRAP_NEW_PASSWORD")
@@ -168,20 +168,42 @@ def apply_one_time_credential_bootstrap() -> dict:
 
     token_fp = _token_fingerprint(token)
 
+    if os.environ.get("GLR_MODE", "local") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        marker = service.get_setting(BOOTSTRAP_CREDENTIAL_MARKER_KEY, {})
+        if isinstance(marker, str):
+            try:
+                marker = json.loads(marker)
+            except (TypeError, ValueError):
+                marker = {}
+        if isinstance(marker, dict) and marker.get("token_fp") == token_fp:
+            return {"applied": False, "reason": "already_applied"}
+        staff = service.get_staff_by_email(target_email)
+        if not staff:
+            return {"applied": False, "reason": "target_not_found"}
+        new_email = _seed_value("BOOTSTRAP_NEW_EMAIL").lower()
+        if new_email and new_email != target_email and service.staff_email_exists(new_email, excluding_id=staff.get("id")):
+            return {"applied": False, "reason": "new_email_taken"}
+        updates = {"password_hash": generate_password_hash(new_password)}
+        if new_email and new_email != target_email:
+            updates["email"] = new_email
+        new_name = _seed_value("BOOTSTRAP_NEW_NAME")
+        if new_name:
+            updates["name"] = new_name
+        new_role = _seed_value("BOOTSTRAP_NEW_ROLE").lower()
+        if new_role:
+            if new_role not in _ALLOWED_BOOTSTRAP_ROLES:
+                return {"applied": False, "reason": "invalid_role"}
+            updates["role"] = new_role
+        updated = service.save_staff(staff["id"], **updates)
+        service.save_setting(BOOTSTRAP_CREDENTIAL_MARKER_KEY, json.dumps({"token_fp": token_fp, "staff_id": updated["id"], "email": updated.get("email")}))
+        return {"applied": True, "staff_id": updated["id"], "email": updated.get("email")}
+
+    from app.extensions import db
+
     try:
         return _apply_credential_bootstrap_once(token_fp, target_email, new_password)
-    except IntegrityError:
-        # Stale PostgreSQL sequences after explicit-ID inserts can collide on
-        # system_settings.id. Roll back so staff updates are not kept without
-        # a marker, repair sequences, and retry once.
-        db.session.rollback()
-        resync_postgres_serial_sequences()
-        db.session.commit()
-        try:
-            return _apply_credential_bootstrap_once(token_fp, target_email, new_password)
-        except IntegrityError:
-            db.session.rollback()
-            raise
     except Exception:
         db.session.rollback()
         raise
@@ -198,6 +220,7 @@ def ensure_initial_local_data() -> None:
     (and optional cashier values). Demo accounts are created only when
     ALLOW_DEMO_SEED=true.
     """
+    from app.extensions import db
     shop = _ensure_shop()
     _ensure_staff_accounts(shop, include_owner=False)
     db.session.commit()
@@ -205,23 +228,40 @@ def ensure_initial_local_data() -> None:
 
 
 def ensure_initial_central_data() -> None:
-    """Create a safe initial central shop and accounts if the central database is empty."""
-    shop = _ensure_shop()
-    _ensure_staff_accounts(shop, include_owner=True)
+    """Create a safe initial central shop and accounts in Firestore."""
+    from app.firestore import get_firestore_sync_service
+    service = get_firestore_sync_service()
+    shop_name = _seed_value("INITIAL_SHOP_NAME", "Good Luck Rahman Enterprise")
+    shop = service.get_first_shop()
+    if not shop:
+        shop = service.save_shop(1, name=shop_name, location=_seed_value("INITIAL_SHOP_LOCATION") or None)
+    elif shop_name and shop.get("name") != shop_name:
+        shop = service.save_shop(shop["id"], name=shop_name, location=shop.get("location"))
+
+    specs = [
+        _resolve_account("owner", "owner@glr.test", "owner123", "Owner"),
+        _resolve_account("admin", "admin@glr.test", "admin123", "Admin"),
+        _resolve_account("cashier", "cashier@glr.test", "cashier123", "Cashier"),
+    ]
+    for resolved in specs:
+        if not resolved:
+            continue
+        name, email, password, role = resolved
+        existing = service.get_staff_by_email(email)
+        if existing:
+            if not existing.get("shop_id"):
+                service.save_staff(existing["id"], shop_id=shop["id"])
+            continue
+        service.save_staff(service.allocate_staff_id(), shop_id=shop["id"], name=name, email=email, password_hash=generate_password_hash(password), role=role, is_active=True, quick_pin_failed_attempts=0)
 
     product_sku = _seed_value("INITIAL_PRODUCT_SKU")
     if not product_sku and _demo_seed_allowed():
         product_sku = "RICE-50KG"
-    if product_sku and not Product.query.filter_by(sku=product_sku).first():
-        db.session.add(
-            Product(
-                sku=product_sku,
-                name=_seed_value("INITIAL_PRODUCT_NAME", "Bag of Rice (50kg)"),
-                category=_seed_value("INITIAL_PRODUCT_CATEGORY", "Grains"),
-                unit_price=_seed_value("INITIAL_PRODUCT_UNIT_PRICE", "450"),
-                cost_price=_seed_value("INITIAL_PRODUCT_COST_PRICE", "350"),
-            )
-        )
-
-    db.session.commit()
+    if product_sku and not any(product.get("sku") == product_sku for product in service.list_products(include_inactive=True)):
+        product_id = service._allocate_product_id()
+        service.save_product(product_id, sku=product_sku, name=_seed_value("INITIAL_PRODUCT_NAME", "Bag of Rice (50kg)"), category=_seed_value("INITIAL_PRODUCT_CATEGORY", "Grains"), unit_price=_seed_value("INITIAL_PRODUCT_UNIT_PRICE", "450"), cost_price=_seed_value("INITIAL_PRODUCT_COST_PRICE", "350"), is_active=True, shop_ids=[shop["id"]])
+    if service.get_setting("admin_timeout_minutes") is None:
+        service.save_setting("admin_timeout_minutes", "15")
+    if service.get_setting("admin_full_login_hours") is None:
+        service.save_setting("admin_full_login_hours", "8")
     apply_one_time_credential_bootstrap()

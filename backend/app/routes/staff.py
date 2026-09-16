@@ -20,6 +20,7 @@ database access), not a runtime one.
 """
 from flask import Blueprint, current_app, g, jsonify, request
 from werkzeug.security import generate_password_hash
+import uuid
 
 from app.audit import log_action
 from app.auth import roles_required
@@ -45,6 +46,11 @@ def _require_central_mode():
 
 
 def serialize_staff(s: Staff):
+    if isinstance(s, dict):
+        return {
+            "id": s.get("id"), "shop_id": s.get("shop_id"), "name": s.get("name"),
+            "email": s.get("email"), "role": s.get("role"), "is_active": s.get("is_active", True),
+        }
     return {
         "id": s.id,
         "shop_id": s.shop_id,
@@ -58,6 +64,9 @@ def serialize_staff(s: Staff):
 @staff_bp.get("")
 @roles_required("owner", "admin")
 def list_staff():
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        return jsonify([serialize_staff(staff) for staff in get_firestore_sync_service().list_staff()])
     staff = Staff.query.order_by(Staff.name).all()
     return jsonify([serialize_staff(s) for s in staff])
 
@@ -83,7 +92,13 @@ def create_staff():
         ), 400
     if len(password) < 6:
         return jsonify(error="password must be at least 6 characters"), 400
-    if Staff.query.filter_by(email=email).first():
+    service = None
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        if service.staff_email_exists(email):
+            return jsonify(error=f"An account with email '{email}' already exists"), 409
+    elif Staff.query.filter_by(email=email).first():
         return jsonify(error=f"An account with email '{email}' already exists"), 409
 
     requested_shop_id = data.get("shop_id", g.staff_shop_id)
@@ -91,23 +106,24 @@ def create_staff():
         requested_shop_id = int(requested_shop_id) if requested_shop_id is not None else None
     except (TypeError, ValueError):
         return jsonify(error="shop_id must be a valid shop id"), 400
-    if not requested_shop_id or not Shop.query.get(requested_shop_id):
+    if service:
+        shop_exists = service.get_shop(requested_shop_id) if requested_shop_id else None
+    else:
+        shop_exists = db.session.get(Shop, requested_shop_id) if requested_shop_id else None
+    if not requested_shop_id or not shop_exists:
         return jsonify(error="The selected shop does not exist"), 400
     if g.staff_role != "owner" and requested_shop_id != g.staff_shop_id:
         return jsonify(error="Administrators can only create staff for their own shop"), 403
 
-    staff = Staff(
-        shop_id=requested_shop_id,
-        name=name,
-        email=email,
-        password_hash=generate_password_hash(password),
-        role=role,
-        is_active=True,
-    )
+    if service:
+        staff = service.save_staff(service.allocate_staff_id(), shop_id=requested_shop_id, name=name, email=email, password_hash=generate_password_hash(password), role=role, is_active=True, quick_pin_failed_attempts=0)
+        service.write_audit(f"staff-created-{staff['id']}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="staff_created", entity_type="staff", entity_id=str(staff["id"]), details={"name": name, "email": email, "role": role})
+        return jsonify(serialize_staff(staff)), 201
+    staff = Staff(shop_id=requested_shop_id, name=name, email=email, password_hash=generate_password_hash(password), role=role, is_active=True)
     db.session.add(staff)
     db.session.commit()
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(
         g.staff_id, actor.name if actor else None, g.staff_role,
         "staff_created", "staff", staff.id, {"name": staff.name, "email": staff.email, "role": staff.role},
@@ -131,15 +147,21 @@ def create_admin():
         return jsonify(error="Name, email, and password are required"), 400
     if len(password) < 6:
         return jsonify(error="Password must be at least 6 characters"), 400
-    if Staff.query.filter_by(email=email).first():
+    from app.firestore import get_firestore_sync_service
+    service = get_firestore_sync_service() if current_app.config.get("GLR_MODE") == "central" else None
+    if (service and service.staff_email_exists(email)) or (not service and Staff.query.filter_by(email=email).first()):
         return jsonify(error=f"An account with email '{email}' already exists"), 409
+    if service:
+        admin = service.save_staff(service.allocate_staff_id(), shop_id=g.staff_shop_id, name=name, email=email, password_hash=generate_password_hash(password), role="admin", is_active=True, quick_pin_failed_attempts=0)
+        service.write_audit(f"admin-created-{admin['id']}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="admin_account_created", entity_type="staff", entity_id=str(admin["id"]), details={"name": name, "email": email})
+        return jsonify(serialize_staff(admin)), 201
     admin = Staff(
         shop_id=g.staff_shop_id, name=name, email=email,
         password_hash=generate_password_hash(password), role="admin", is_active=True
     )
     db.session.add(admin)
     db.session.commit()
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(g.staff_id, actor.name if actor else None, g.staff_role,
                 "admin_account_created", "staff", admin.id,
                 {"name": admin.name, "email": admin.email})
@@ -153,6 +175,30 @@ def update_staff(staff_id):
     if blocked:
         return blocked
 
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        staff = service.get_staff(staff_id)
+        if not staff:
+            return jsonify(error="Staff member not found"), 404
+        if staff.get("role") in ("owner", "admin"):
+            return jsonify(error="Owner/admin accounts can't be managed through this endpoint"), 403
+        data = request.get_json(silent=True) or {}
+        updates = {}
+        if "name" in data:
+            name = (data["name"] or "").strip()
+            if not name:
+                return jsonify(error="name cannot be empty"), 400
+            updates["name"] = name
+        if "role" in data:
+            if data["role"] not in ASSIGNABLE_ROLES:
+                return jsonify(error=f"role must be one of {ASSIGNABLE_ROLES}"), 400
+            updates["role"] = data["role"]
+        if "is_active" in data:
+            updates["is_active"] = bool(data["is_active"])
+        updated = service.save_staff(staff_id, **updates)
+        service.write_audit(f"staff-updated-{staff_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="staff_updated", entity_type="staff", entity_id=str(staff_id), details={**data, "target_staff_id": staff_id, "target_name": updated.get("name")})
+        return jsonify(serialize_staff(updated))
     staff = Staff.query.get_or_404(staff_id)
 
     # Never let this endpoint touch an owner/admin account -- same
@@ -177,7 +223,7 @@ def update_staff(staff_id):
 
     db.session.commit()
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(
         g.staff_id, actor.name if actor else None, g.staff_role,
         "staff_updated", "staff", staff.id, {**data, "target_staff_id": staff.id, "target_name": staff.name},
@@ -193,6 +239,21 @@ def reset_password(staff_id):
     if blocked:
         return blocked
 
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        staff = service.get_staff(staff_id)
+        if not staff:
+            return jsonify(error="Staff member not found"), 404
+        if staff.get("role") in ("owner", "admin"):
+            return jsonify(error="Owner/admin accounts can't be managed through this endpoint"), 403
+        data = request.get_json(silent=True) or {}
+        new_password = data.get("new_password") or ""
+        if len(new_password) < 6:
+            return jsonify(error="password must be at least 6 characters"), 400
+        updated = service.save_staff(staff_id, password_hash=generate_password_hash(new_password))
+        service.write_audit(f"staff-password-reset-{staff_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="staff_password_reset", entity_type="staff", entity_id=str(staff_id), details={"target_email": staff.get("email")})
+        return jsonify(serialize_staff(updated))
     staff = Staff.query.get_or_404(staff_id)
     if staff.role in ("owner", "admin"):
         return jsonify(error="Owner/admin accounts can't be managed through this endpoint"), 403
@@ -205,7 +266,7 @@ def reset_password(staff_id):
     staff.password_hash = generate_password_hash(new_password)
     db.session.commit()
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     log_action(
         g.staff_id, actor.name if actor else None, g.staff_role,
         "staff_password_reset", "staff", staff.id, {"target_email": staff.email},

@@ -42,7 +42,7 @@ def _parse_datetime(value):
 
 
 def _set_state(key, value):
-    row = SyncState.query.get(key)
+    row = db.session.get(SyncState, key)
     if not row:
         row = SyncState(key=key)
         db.session.add(row)
@@ -92,7 +92,7 @@ def push_pending_once(app) -> dict:
             result = by_id.get(item.id) or {}
             if result.get("status") == "ok":
                 if item.table_name == "sales" and result.get("invoice_number"):
-                    sale = Sale.query.get(item.record_id)
+                    sale = db.session.get(Sale, item.record_id)
                     if sale and sale.invoice_number is None:
                         # Local SQLite can already contain another sale with the
                         # same invoice number from an earlier sync/replay. In that
@@ -131,7 +131,7 @@ def _upsert_transactions(data):
     # central invoice/status/timestamp changes are applied without creating
     # duplicate rows. Relationships are loaded explicitly for speed.
     for raw in data.get("sales", []):
-        sale = Sale.query.get(raw["id"])
+        sale = db.session.get(Sale, raw["id"])
         if not sale:
             sale = Sale(id=raw["id"])
             db.session.add(sale)
@@ -150,10 +150,10 @@ def _upsert_transactions(data):
         sale.void_reason = raw.get("void_reason")
 
     for raw in data.get("sale_items", []):
-        if not Product.query.get(raw.get("product_id")):
+        if not db.session.get(Product, raw.get("product_id")):
             # Parent product must arrive in the same pull before child rows.
             continue
-        item = SaleItem.query.get(raw["id"])
+        item = db.session.get(SaleItem, raw["id"])
         if not item:
             item = SaleItem(id=raw["id"])
             db.session.add(item)
@@ -165,7 +165,7 @@ def _upsert_transactions(data):
         item.unit_cost = raw.get("unit_cost", 0)
 
     for raw in data.get("payments", []):
-        payment = SalePayment.query.get(raw["id"])
+        payment = db.session.get(SalePayment, raw["id"])
         if not payment:
             payment = SalePayment(id=raw["id"])
             db.session.add(payment)
@@ -178,9 +178,9 @@ def _upsert_transactions(data):
         payment.server_received_at = _parse_datetime(raw.get("server_received_at"))
 
     for raw in data.get("stock_movements", []):
-        if not Product.query.get(raw.get("product_id")):
+        if not db.session.get(Product, raw.get("product_id")):
             continue
-        movement = StockMovement.query.get(raw["id"])
+        movement = db.session.get(StockMovement, raw["id"])
         if not movement:
             movement = StockMovement(id=raw["id"])
             db.session.add(movement)
@@ -201,7 +201,7 @@ def pull_reference_data_once(app) -> dict:
             _set_state("last_pull_error", "Cloud synchronization is not configured on this device.")
             db.session.commit()
             return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
-        state = SyncState.query.get(LAST_PULL_KEY)
+        state = db.session.get(SyncState, LAST_PULL_KEY)
         since = state.value if state else None
         url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/pull"
         headers = {
@@ -219,7 +219,7 @@ def pull_reference_data_once(app) -> dict:
             return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
 
         for raw in data.get("shops", []):
-            shop = Shop.query.get(raw["id"])
+            shop = db.session.get(Shop, raw["id"])
             if not shop:
                 shop = Shop(id=raw["id"])
                 db.session.add(shop)
@@ -227,12 +227,14 @@ def pull_reference_data_once(app) -> dict:
             shop.location = raw.get("location")
             shop.logo_data = raw.get("logo_data")
 
+        skipped_staff = 0
         for raw in data.get("staff", []):
-            staff = Staff.query.get(raw["id"])
+            staff = db.session.get(Staff, raw["id"])
             if not staff:
                 # Authentication secrets are intentionally absent from sync
                 # payloads. A new account must be provisioned through the
                 # authenticated account flow before it can be used offline.
+                skipped_staff += 1
                 continue
 
             # Keep local staff rows stable when the central payload is unchanged.
@@ -272,7 +274,7 @@ def pull_reference_data_once(app) -> dict:
             setting.value = raw.get("value")
 
         for raw in data.get("products", []):
-            product = Product.query.get(raw["id"])
+            product = db.session.get(Product, raw["id"])
             if not product:
                 product = Product(id=raw["id"])
                 db.session.add(product)
@@ -294,6 +296,7 @@ def pull_reference_data_once(app) -> dict:
         state.value = next_cursor
         _set_state("last_pull_success", next_cursor)
         _set_state("last_pull_error", "")
+        _set_state("last_pull_skipped_staff", str(skipped_staff))
         db.session.commit()
         return {
             "shops": len(data.get("shops", [])),
@@ -303,6 +306,7 @@ def pull_reference_data_once(app) -> dict:
             "sales": len(data.get("sales", [])),
             "payments": len(data.get("payments", [])),
             "stock_movements": len(data.get("stock_movements", [])),
+            "staff_needing_provisioning": skipped_staff,
         }
 
 

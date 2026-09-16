@@ -18,9 +18,11 @@ credentials instead of one shared key later, that's a small change to
 _check_sync_key() plus a devices table lookup, not a redesign.
 """
 from datetime import datetime, timezone
+import requests
 
 from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy import func
+from werkzeug.security import generate_password_hash
 
 from app.auth import login_required, roles_required
 from app.extensions import db
@@ -32,6 +34,7 @@ from app.sync.device import get_current_device_id
 sync_bp = Blueprint("sync", __name__, url_prefix="/api/sync")
 
 _PULL_MODELS = (Shop, Staff, Product, Sale, SalePayment, StockMovement, SystemSetting)
+PROVISIONING_STATE_KEY = "provisioning_state"
 
 
 def _check_sync_key() -> bool:
@@ -43,7 +46,15 @@ def _check_sync_key() -> bool:
 def _get_bound_device(device_id: str):
     if not device_id:
         return None
-    device = Device.query.get(device_id)
+    if _uses_firestore():
+        from app.firestore import get_firestore_sync_service
+        device = get_firestore_sync_service().get_device(device_id)
+        if not device or device.get("shop_id") is None or device.get("authorized", True) is False:
+            return None
+        return get_firestore_sync_service().save_device(
+            device_id, last_seen_at=datetime.now(timezone.utc)
+        )
+    device = db.session.get(Device, device_id)
     if not device or device.shop_id is None:
         return None
     device.last_seen_at = datetime.now(timezone.utc)
@@ -55,8 +66,57 @@ def _device_error():
     return jsonify(error="This device is not registered to an authorized shop"), 403
 
 
+def _device_value(device, key, default=None):
+    if isinstance(device, dict):
+        return device.get(key, default)
+    return getattr(device, key, default)
+
+
+def _provisioning_state():
+    if _uses_firestore():
+        return "READY"
+    row = db.session.get(SyncState, PROVISIONING_STATE_KEY)
+    return row.value if row else "NOT_ENROLLED"
+
+
+def _set_provisioning_state(value):
+    if _uses_firestore():
+        return
+    row = db.session.get(SyncState, PROVISIONING_STATE_KEY)
+    if not row:
+        row = SyncState(key=PROVISIONING_STATE_KEY)
+        db.session.add(row)
+    row.value = value
+
+
+def _effective_provisioning_state(device=None):
+    if _uses_firestore():
+        return "READY"
+    state = _provisioning_state()
+    if state in {"READY", "SYNC_ERROR"}:
+        return state
+    if device is None:
+        device = db.session.get(Device, get_current_device_id())
+    return "ENROLLED / PROVISIONING" if device and device.shop_id is not None else "NOT_ENROLLED"
+
+
+def _sync_error_kind(message):
+    if not message:
+        return None
+    lowered = message.lower()
+    if "not configured on this device" in lowered:
+        return "SYNC_API_KEY_MISSING"
+    if "401" in lowered or "invalid or missing sync key" in lowered:
+        return "SYNC_AUTH_FAILED"
+    if "403" in lowered or "not registered to an authorized shop" in lowered:
+        return "DEVICE_NOT_AUTHORIZED"
+    if "timed out" in lowered or "connection" in lowered or "name or service" in lowered:
+        return "RENDER_UNREACHABLE"
+    return "SYNC_FAILED"
+
+
 def _uses_firestore():
-    return current_app.config.get("CENTRAL_DATA_PROVIDER", "postgres") == "firestore"
+    return current_app.config.get("GLR_MODE") == "central"
 
 
 def _parse_cursor(value: str):
@@ -117,37 +177,37 @@ def push():
             result_extra = {}
             if firestore_service is not None:
                 if table_name == "sales":
-                    if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                    if payload.get("device_id") not in (None, _device_value(device, "id")) or payload.get("shop_id") != _device_value(device, "shop_id"):
                         raise ValueError("Sale shop does not match the registered device shop")
-                    payload["device_id"] = device.id
+                    payload["device_id"] = _device_value(device, "id")
                 elif table_name == "stock_movements":
-                    if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                    if payload.get("device_id") not in (None, _device_value(device, "id")) or payload.get("shop_id") != _device_value(device, "shop_id"):
                         raise ValueError("Stock movement shop does not match the registered device shop")
-                    payload["device_id"] = device.id
+                    payload["device_id"] = _device_value(device, "id")
                 result_extra = firestore_service.push_item(device, table_name, payload)
                 results.append({"outbox_id": outbox_id, "status": "ok", **result_extra})
                 continue
             if table_name == "sales":
-                if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                if payload.get("device_id") not in (None, _device_value(device, "id")) or payload.get("shop_id") != _device_value(device, "shop_id"):
                     raise ValueError("Sale shop does not match the registered device shop")
-                payload["device_id"] = device.id
+                payload["device_id"] = _device_value(device, "id")
                 payload["assign_invoice"] = True
                 payload["validate_stock"] = False
                 sale, _, _ = apply_sale(payload)
                 result_extra = {"invoice_number": sale.invoice_number}
             elif table_name == "sale_payments":
-                sale = Sale.query.get(payload.get("sale_id"))
-                if not sale or sale.shop_id != device.shop_id:
+                sale = db.session.get(Sale, payload.get("sale_id"))
+                if not sale or sale.shop_id != _device_value(device, "shop_id"):
                     raise ValueError("Payment sale does not match the registered device shop")
-                if payload.get("device_id") not in (None, device.id):
+                if payload.get("device_id") not in (None, _device_value(device, "id")):
                     raise ValueError("Payment device does not match the registered device")
-                payload["device_id"] = device.id
+                payload["device_id"] = _device_value(device, "id")
                 sale, _, _ = apply_payment(payload)
                 result_extra = {}
             elif table_name == "stock_movements":
-                if payload.get("device_id") not in (None, device.id) or payload.get("shop_id") != device.shop_id:
+                if payload.get("device_id") not in (None, _device_value(device, "id")) or payload.get("shop_id") != _device_value(device, "shop_id"):
                     raise ValueError("Stock movement shop does not match the registered device shop")
-                payload["device_id"] = device.id
+                payload["device_id"] = _device_value(device, "id")
                 apply_stock_movement(payload)
             else:
                 results.append(
@@ -158,10 +218,12 @@ def push():
             results.append({"outbox_id": outbox_id, "status": "ok", **result_extra})
 
         except ValueError as e:
-            db.session.rollback()
+            if not firestore_service:
+                db.session.rollback()
             results.append({"outbox_id": outbox_id, "status": "error", "error": str(e)})
         except Exception as e:
-            db.session.rollback()
+            if not firestore_service:
+                db.session.rollback()
             results.append({"outbox_id": outbox_id, "status": "error", "error": f"Unexpected error: {e}"})
 
     return jsonify(results=results)
@@ -175,7 +237,7 @@ def pull():
     device = _get_bound_device(request.headers.get("X-Device-ID", ""))
     if not device:
         return _device_error()
-    shop_id = device.shop_id
+    shop_id = _device_value(device, "shop_id")
 
     since_raw = request.args.get("since")
     since = None
@@ -309,10 +371,26 @@ def register_device():
         return jsonify(error="shop_id must be a valid shop id"), 400
     if g.staff_role != "owner" and requested_shop_id != g.staff_shop_id:
         return jsonify(error="Administrators can only register devices for their own shop"), 403
-    if not Shop.query.get(requested_shop_id):
-        return jsonify(error="The selected shop does not exist"), 400
+    if _uses_firestore():
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        if not service.get_shop(requested_shop_id):
+            return jsonify(error="The selected shop does not exist"), 400
+        device = service.save_device(
+            device_id,
+            shop_id=requested_shop_id,
+            name=data.get("name"),
+            platform=data.get("platform"),
+            authorized=True,
+            registered_at=datetime.now(timezone.utc),
+            last_seen_at=datetime.now(timezone.utc),
+        )
+        return jsonify(
+            id=device.get("id", device_id), shop_id=device.get("shop_id"),
+            name=device.get("name"), platform=device.get("platform")
+        ), 201
 
-    device = Device.query.get(device_id)
+    device = db.session.get(Device, device_id)
     if not device:
         device = Device(id=device_id)
         db.session.add(device)
@@ -322,6 +400,127 @@ def register_device():
     device.last_seen_at = datetime.now(timezone.utc)
     db.session.commit()
     return jsonify(id=device.id, shop_id=device.shop_id, name=device.name, platform=device.platform), 201
+
+
+@sync_bp.get("/provisioning/status")
+def provisioning_status():
+    """Expose non-secret local enrollment state before local login."""
+    if current_app.config["GLR_MODE"] != "local":
+        return jsonify(state="READY", device_id=None, shop_id=None)
+
+    device_id = get_current_device_id()
+    device = db.session.get(Device, device_id)
+    state = _effective_provisioning_state(device)
+    return jsonify(
+        state=state,
+        device_id=device_id,
+        shop_id=device.shop_id if device else None,
+        last_pull_error=db.session.get(SyncState, "last_pull_error").value if db.session.get(SyncState, "last_pull_error") else None,
+        staff_needing_provisioning=int((db.session.get(SyncState, "last_pull_skipped_staff").value if db.session.get(SyncState, "last_pull_skipped_staff") else "0") or "0"),
+    )
+
+
+@sync_bp.post("/provisioning/enroll")
+def enroll_local_device():
+    """Authorize this device centrally, then create its local offline identity."""
+    if current_app.config["GLR_MODE"] != "local":
+        return jsonify(error="Desktop enrollment is only available on local devices"), 400
+    if not current_app.config.get("SYNC_API_KEY"):
+        return jsonify(error="Cloud synchronization is not configured on this device"), 503
+
+    data = request.get_json(silent=True) or {}
+    central_email = str(data.get("central_email") or "").strip().lower()
+    central_password = str(data.get("central_password") or "")
+    local_password = str(data.get("local_password") or "")
+    if not central_email or not central_password or len(local_password) < 8:
+        return jsonify(error="Central authorization and a local password of at least 8 characters are required"), 400
+
+    device_id = get_current_device_id()
+    central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
+    try:
+        login_response = requests.post(
+            central_url + "/api/auth/login",
+            json={
+                "email": central_email,
+                "password": central_password,
+                "role_group": "owner",
+            },
+            timeout=8,
+        )
+        if login_response.status_code in (401, 403):
+            return jsonify(error="Central owner/admin authentication failed"), 401
+        login_response.raise_for_status()
+        login_data = login_response.json()
+        identity = login_data.get("staff") or {}
+        central_token = login_data.get("token")
+        if not central_token:
+            return jsonify(error="Central authentication did not return an authorization token"), 502
+        if identity.get("role") not in ("owner", "admin") or not identity.get("shop_id"):
+            return jsonify(error="Central enrollment requires an active owner or administrator"), 403
+
+        registration_response = requests.post(
+            central_url + "/api/sync/devices",
+            headers={"Authorization": "Bearer " + central_token},
+            json={
+                "device_id": device_id,
+                "shop_id": int(identity["shop_id"]),
+                "name": data.get("name") or "Good Luck Rahman Main Device",
+                "platform": data.get("platform") or "Unknown",
+            },
+            timeout=8,
+        )
+        registration_response.raise_for_status()
+    except requests.RequestException as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status in (401, 403):
+            return jsonify(error="Central owner/admin authorization was rejected"), 403
+        current_app.logger.warning("Central desktop enrollment failed: %s", type(exc).__name__)
+        return jsonify(error="Central enrollment service is unavailable"), 503
+
+    staff_id = int(identity["id"])
+    email = str(identity["email"]).strip().lower()
+    shop_id = int(identity["shop_id"])
+    local_staff = db.session.get(Staff, staff_id)
+    email_staff = Staff.query.filter_by(email=email).first()
+    if email_staff and email_staff.id != staff_id:
+        return jsonify(error="The central identity conflicts with a local account"), 409
+    if local_staff and (local_staff.email != email or local_staff.role not in ("owner", "admin")):
+        return jsonify(error="The central identity conflicts with a local account"), 409
+    if not local_staff:
+        local_staff = Staff(id=staff_id, email=email)
+        db.session.add(local_staff)
+
+    local_staff.shop_id = shop_id
+    local_staff.name = identity.get("name") or email
+    local_staff.role = identity["role"]
+    local_staff.is_active = bool(identity.get("is_active", True))
+    local_staff.password_hash = generate_password_hash(local_password)
+
+    device = db.session.get(Device, device_id)
+    if not device:
+        device = Device(id=device_id)
+        db.session.add(device)
+    device.shop_id = shop_id
+    device.name = data.get("name") or "Good Luck Rahman Main Device"
+    device.platform = data.get("platform") or "Unknown"
+    device.last_seen_at = datetime.now(timezone.utc)
+    _set_provisioning_state("ENROLLED / PROVISIONING")
+    db.session.commit()
+
+    from app.sync.worker import pull_reference_data_once
+    pull_reference_data_once(current_app._get_current_object())
+    pull_error = db.session.get(SyncState, "last_pull_error")
+    if pull_error and pull_error.value:
+        _set_provisioning_state("SYNC_ERROR")
+        db.session.commit()
+        return jsonify(error="Initial provisioning could not complete", state="SYNC_ERROR"), 503
+
+    _set_provisioning_state("READY")
+    db.session.commit()
+    return jsonify(
+        state="READY",
+        staff={"id": staff_id, "email": email, "role": identity["role"], "shop_id": shop_id},
+    )
 
 
 @sync_bp.post("/trigger")
@@ -350,12 +549,16 @@ def status():
     device_id = get_current_device_id() if current_app.config["GLR_MODE"] == "local" else None
 
     states = {s.key: s.value for s in SyncState.query.all()} if current_app.config["GLR_MODE"] == "local" else {}
+    last_error = states.get("last_sync_error") or states.get("last_pull_error")
     return jsonify(
         mode=current_app.config["GLR_MODE"],
+        provisioning_state=_effective_provisioning_state() if current_app.config["GLR_MODE"] == "local" else "READY",
         pending_count=pending,
         needs_review_count=needs_review,
         device_id=device_id,
         last_sync_at=states.get("last_sync_at"),
-        last_sync_error=states.get("last_sync_error") or states.get("last_pull_error"),
+        last_sync_error=last_error,
+        sync_error_kind=_sync_error_kind(last_error),
         last_pull_at=states.get("last_pull_success"),
+        staff_needing_provisioning=int((states.get("last_pull_skipped_staff") or "0") or "0"),
     )

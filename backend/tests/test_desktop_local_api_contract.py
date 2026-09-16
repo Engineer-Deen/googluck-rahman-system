@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_APP_JS = ROOT / "frontend" / "app.js"
+FRONTEND_INDEX = ROOT / "frontend" / "index.html"
 TAURI_LIB = ROOT / "src-tauri" / "src" / "lib.rs"
 CAPABILITIES = ROOT / "src-tauri" / "capabilities" / "default.json"
 
@@ -16,6 +17,7 @@ class DesktopLocalApiContractTests(unittest.TestCase):
     def test_frontend_api_base_uses_ipv4_loopback_not_localhost(self):
         text = FRONTEND_APP_JS.read_text(encoding="utf-8")
         self.assertIn('const API_BASE = "http://127.0.0.1:5000/api";', text)
+        self.assertNotIn("goodluck-rahman-api.onrender.com", text)
         self.assertNotIn("http://localhost:5000/api", text)
 
     def test_frontend_waits_for_local_backend_before_boot_work(self):
@@ -56,6 +58,18 @@ class DesktopLocalApiContractTests(unittest.TestCase):
         )
         self.assertNotIn("FIREBASE_SERVICE_ACCOUNT_JSON", text)
         self.assertNotIn("SYNC_API_KEY", text)
+
+    def test_official_logo_is_static_login_and_header_branding(self):
+        html = FRONTEND_INDEX.read_text(encoding="utf-8")
+        self.assertGreaterEqual(html.count("assets/goodluck-rahman-enterprise.png"), 2)
+        self.assertNotIn("brand-icon-lg", html)
+        self.assertNotIn("brand-icon\"", html)
+        self.assertNotIn("shop-logo-input", html)
+
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        self.assertNotIn("saveShopSettings", script)
+        self.assertNotIn("shop-logo-input", script)
+        self.assertNotIn("logo_data", script)
 
 
 if __name__ == "__main__":

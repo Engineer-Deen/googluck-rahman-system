@@ -1,9 +1,8 @@
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, current_app, jsonify, request, g
 from datetime import datetime, timedelta, timezone
 from werkzeug.security import check_password_hash
 
 from app.auth import issue_token, login_required
-from app.models import Staff
 from app.extensions import db
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -25,7 +24,7 @@ def _rate_key(email):
     return f"{email}|{request.remote_addr or 'unknown'}"
 
 def _login_rate_limited(key):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     row = _LOGIN_FAILURES.get(key)
     if not row or now - row["started"] > _LOGIN_WINDOW:
         _LOGIN_FAILURES[key] = {"started": now, "count": 0}
@@ -33,7 +32,7 @@ def _login_rate_limited(key):
     return row["count"] >= _LOGIN_LIMIT
 
 def _record_login_failure(key):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     row = _LOGIN_FAILURES.get(key)
     if not row or now - row["started"] > _LOGIN_WINDOW:
         _LOGIN_FAILURES[key] = {"started": now, "count": 1}
@@ -42,6 +41,22 @@ def _record_login_failure(key):
 
 def _clear_login_failures(key):
     _LOGIN_FAILURES.pop(key, None)
+
+
+def _central_mode():
+    return current_app.config.get("GLR_MODE") == "central"
+
+
+def _staff_value(staff, key, default=None):
+    if isinstance(staff, dict):
+        return staff.get(key, default)
+    return getattr(staff, key, default)
+
+
+def _get_central_service():
+    from app.firestore import get_firestore_sync_service
+
+    return get_firestore_sync_service()
 
 
 @auth_bp.post("/login")
@@ -58,12 +73,16 @@ def login():
     if _login_rate_limited(key):
         return jsonify(error="Too many login attempts. Please wait 5 minutes and try again."), 429
 
-    staff = Staff.query.filter_by(email=email, is_active=True).first()
-    if not staff or not check_password_hash(staff.password_hash, password):
+    if _central_mode():
+        staff = _get_central_service().get_staff_by_email(email)
+    else:
+        from app.models import Staff
+        staff = Staff.query.filter_by(email=email, is_active=True).first()
+    if not staff or not _staff_value(staff, "is_active") or not check_password_hash(_staff_value(staff, "password_hash", ""), password):
         _record_login_failure(key)
         return jsonify(error="Invalid email or password"), 401
 
-    if role_group in ROLE_GROUPS and staff.role not in ROLE_GROUPS[role_group]:
+    if role_group in ROLE_GROUPS and _staff_value(staff, "role") not in ROLE_GROUPS[role_group]:
         _record_login_failure(key)
         other = "owner" if role_group == "seller" else "seller"
         label = "Seller" if role_group == "seller" else "Shop Owner / Admin"
@@ -73,18 +92,26 @@ def login():
         ), 401
 
     _clear_login_failures(key)
-    staff.quick_pin_failed_attempts = 0
-    staff.quick_pin_locked_until = None
-    db.session.commit()
+    if _central_mode():
+        _get_central_service().update_staff_auth_state(
+            _staff_value(staff, "id"),
+            quick_pin_failed_attempts=0,
+            quick_pin_locked_until=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+    else:
+        staff.quick_pin_failed_attempts = 0
+        staff.quick_pin_locked_until = None
+        db.session.commit()
     token = issue_token(staff)
     return jsonify(
         token=token,
         staff={
-            "id": staff.id,
-            "name": staff.name,
-            "email": staff.email,
-            "role": staff.role,
-            "shop_id": staff.shop_id,
+            "id": _staff_value(staff, "id"),
+            "name": _staff_value(staff, "name"),
+            "email": _staff_value(staff, "email"),
+            "role": _staff_value(staff, "role"),
+            "shop_id": _staff_value(staff, "shop_id"),
         },
     )
 
@@ -93,10 +120,35 @@ def login():
 @login_required
 def logout():
     """Invalidate the current token by advancing the staff update timestamp."""
-    staff = Staff.query.get(g.staff_id)
-    staff.updated_at = datetime.now(timezone.utc)
-    db.session.commit()
+    if _central_mode():
+        _get_central_service().update_staff_auth_state(
+            g.staff_id, updated_at=datetime.now(timezone.utc)
+        )
+    else:
+        from app.models import Staff
+        staff = db.session.get(Staff, g.staff_id)
+        staff.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
     return jsonify(ok=True)
+
+
+@auth_bp.get("/me")
+@login_required
+def current_identity():
+    """Return safe central identity metadata for one-time desktop enrollment."""
+    if _central_mode():
+        staff = _get_central_service().get_staff(g.staff_id)
+    else:
+        from app.models import Staff
+        staff = db.session.get(Staff, g.staff_id)
+    return jsonify(
+        id=_staff_value(staff, "id", g.staff_id),
+        name=_staff_value(staff, "name"),
+        email=_staff_value(staff, "email"),
+        role=_staff_value(staff, "role"),
+        shop_id=_staff_value(staff, "shop_id"),
+        is_active=_staff_value(staff, "is_active"),
+    )
 
 @auth_bp.post("/verify-pin")
 @login_required
@@ -108,12 +160,16 @@ def verify_pin():
     if g.staff_role not in ("owner", "admin"):
         return jsonify(error="PIN unlock is only available to administrators."), 403
 
-    staff = Staff.query.get(g.staff_id)
-    if not staff or not staff.quick_pin_hash:
+    if _central_mode():
+        staff = _get_central_service().get_staff(g.staff_id)
+    else:
+        from app.models import Staff
+        staff = db.session.get(Staff, g.staff_id)
+    if not staff or not _staff_value(staff, "quick_pin_hash"):
         return jsonify(error="No quick unlock PIN is configured.", force_login=True), 409
 
     now = datetime.now(timezone.utc)
-    locked_until = staff.quick_pin_locked_until
+    locked_until = _staff_value(staff, "quick_pin_locked_until")
     if locked_until and locked_until.tzinfo is None:
         locked_until = locked_until.replace(tzinfo=timezone.utc)
     if locked_until and locked_until > now:
@@ -123,18 +179,42 @@ def verify_pin():
     if not pin.isdigit() or len(pin) != 4:
         return jsonify(error="Enter your 4-digit PIN."), 400
 
-    if not check_password_hash(staff.quick_pin_hash, pin):
-        staff.quick_pin_failed_attempts = (staff.quick_pin_failed_attempts or 0) + 1
-        if staff.quick_pin_failed_attempts >= 3:
-            staff.quick_pin_failed_attempts = 0
-            staff.quick_pin_locked_until = now + timedelta(minutes=15)
-            db.session.commit()
+    if not check_password_hash(_staff_value(staff, "quick_pin_hash"), pin):
+        failed_attempts = (_staff_value(staff, "quick_pin_failed_attempts") or 0) + 1
+        if failed_attempts >= 3:
+            failed_attempts = 0
+            locked_until = now + timedelta(minutes=15)
+            if _central_mode():
+                _get_central_service().update_staff_auth_state(
+                    g.staff_id,
+                    quick_pin_failed_attempts=failed_attempts,
+                    quick_pin_locked_until=locked_until,
+                    updated_at=now,
+                )
+            else:
+                staff.quick_pin_failed_attempts = failed_attempts
+                staff.quick_pin_locked_until = locked_until
+                db.session.commit()
             return jsonify(error="Three incorrect PIN attempts. Please sign in again.", force_login=True), 423
-        db.session.commit()
-        remaining = 3 - staff.quick_pin_failed_attempts
+        if _central_mode():
+            _get_central_service().update_staff_auth_state(
+                g.staff_id, quick_pin_failed_attempts=failed_attempts, updated_at=now
+            )
+        else:
+            staff.quick_pin_failed_attempts = failed_attempts
+            db.session.commit()
+        remaining = 3 - failed_attempts
         return jsonify(error=f"Incorrect PIN. {remaining} attempt(s) remaining."), 401
 
-    staff.quick_pin_failed_attempts = 0
-    staff.quick_pin_locked_until = None
-    db.session.commit()
+    if _central_mode():
+        _get_central_service().update_staff_auth_state(
+            g.staff_id,
+            quick_pin_failed_attempts=0,
+            quick_pin_locked_until=None,
+            updated_at=now,
+        )
+    else:
+        staff.quick_pin_failed_attempts = 0
+        staff.quick_pin_locked_until = None
+        db.session.commit()
     return jsonify(ok=True)

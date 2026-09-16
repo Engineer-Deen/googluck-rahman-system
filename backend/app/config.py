@@ -6,9 +6,10 @@ environment variable:
 
   GLR_MODE=local    -> runs on each shop's PC (via Tauri), uses SQLite.
                         This is the offline-first local database.
-  GLR_MODE=central  -> runs on the cloud server, uses PostgreSQL.
-                        This is the single source of truth for the
-                        whole business, fed by every device's sync push.
+    GLR_MODE=central  -> runs in the cloud server, uses Firestore through
+                                                the Firebase Admin SDK.
+                                                This is the single source of truth for the whole
+                                                business, fed by every device's sync push.
 
 Nothing else in the app needs to know which mode it's in -- routes and
 models are written against SQLAlchemy, which works the same either way.
@@ -65,9 +66,14 @@ class BaseConfig:
     # server's /api/sync/push endpoint. Must match on both sides.
     SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
 
-    # Central cloud data provider. PostgreSQL remains the default fallback;
-    # Firestore is opt-in until its credentials and deployment are configured.
-    CENTRAL_DATA_PROVIDER = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
+    # Optional comma-separated exact origins for browser clients. Leave blank
+    # for local desktop/browser development, which keeps the existing permissive
+    # CORS behavior. Central deployments should set this explicitly.
+    CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+
+    # Central persistence is Firestore. SQLAlchemy remains available only for
+    # the local SQLite application.
+    CENTRAL_DATA_PROVIDER = "firestore"
     FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
     FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get(
         "FIREBASE_SERVICE_ACCOUNT_FILE",
@@ -75,28 +81,14 @@ class BaseConfig:
     )
     FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
     FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
-    FIRESTORE_MIRROR_REFRESH_SECONDS = int(os.environ.get("FIRESTORE_MIRROR_REFRESH_SECONDS", "30"))
-
-    # Firebase SQL Connect preparation. These are intentionally optional:
-    # the Flask/PostgreSQL service remains authoritative until the Firebase
-    # migration is explicitly enabled.
-    FIREBASE_SQL_CONNECT_ENABLED = os.environ.get("FIREBASE_SQL_CONNECT_ENABLED", "false").lower() == "true"
-    FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
-    FIREBASE_SQL_CONNECT_SERVICE_ID = os.environ.get("FIREBASE_SQL_CONNECT_SERVICE_ID", "goodluck-rahman-sql")
 
 
 class LocalConfig(BaseConfig):
     """
     Runs on a shop's PC. SQLite file lives next to the app.
 
-    Deliberately does NOT read the generic DATABASE_URL variable here.
-    DATABASE_URL is meant for CentralConfig (Postgres) only. If both
-    variables shared the same name, any stray DATABASE_URL left over in
-    the environment (from a previous project, a system-wide setting, an
-    IDE auto-loading .env, etc.) could silently make "local" mode try to
-    connect to Postgres -- which is exactly what must never happen on an
-    offline shop PC. LOCAL_DATABASE_URL is a distinct, deliberate override
-    for local mode only, and it is optional.
+    Local mode accepts only the deliberate LOCAL_DATABASE_URL override and
+    otherwise uses the packaged SQLite database path.
     """
     INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
     # Used by create_app() to provision only a brand-new frozen local install.
@@ -107,15 +99,7 @@ class LocalConfig(BaseConfig):
 
 
 class CentralConfig(BaseConfig):
-    """Runs on the cloud server. Postgres via Cloud SQL or self-hosted."""
-    _default_pg = "postgresql+psycopg2://glr_user:glr_pass@localhost:5432/glr_central"
-    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", _default_pg)
-    SQLALCHEMY_ENGINE_OPTIONS = {
-        "pool_pre_ping": True,
-        "pool_size": int(os.environ.get("DB_POOL_SIZE", "20")),
-        "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", "30")),
-        "pool_recycle": int(os.environ.get("DB_POOL_RECYCLE", "1800")),
-    }
+    """Runs on the cloud server with Firestore as its only central store."""
 
 
 def _apply_runtime_config_values():
@@ -127,7 +111,8 @@ def _apply_runtime_config_values():
     BaseConfig.DEVICE_ID_FILE = INSTANCE_DIR / "device_id.txt"
     BaseConfig.CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", "http://localhost:8000")
     BaseConfig.SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
-    BaseConfig.CENTRAL_DATA_PROVIDER = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
+    BaseConfig.CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+    BaseConfig.CENTRAL_DATA_PROVIDER = "firestore"
     BaseConfig.FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
     BaseConfig.FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get(
         "FIREBASE_SERVICE_ACCOUNT_FILE",
@@ -135,9 +120,6 @@ def _apply_runtime_config_values():
     )
     BaseConfig.FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
     BaseConfig.FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
-    BaseConfig.FIRESTORE_MIRROR_REFRESH_SECONDS = int(os.environ.get("FIRESTORE_MIRROR_REFRESH_SECONDS", "30"))
-    BaseConfig.FIREBASE_SQL_CONNECT_ENABLED = os.environ.get("FIREBASE_SQL_CONNECT_ENABLED", "false").lower() == "true"
-    BaseConfig.FIREBASE_SQL_CONNECT_SERVICE_ID = os.environ.get("FIREBASE_SQL_CONNECT_SERVICE_ID", "goodluck-rahman-sql")
 
     LocalConfig.INSTANCE_DIR = INSTANCE_DIR
     LocalConfig.BOOTSTRAP_INITIAL_LOCAL_DATA = IS_FROZEN
@@ -145,31 +127,22 @@ def _apply_runtime_config_values():
         "LOCAL_DATABASE_URL", f"sqlite:///{INSTANCE_DIR / 'glr_local.sqlite'}"
     )
 
-    CentralConfig._default_pg = "postgresql+psycopg2://glr_user:glr_pass@localhost:5432/glr_central"
-    CentralConfig.SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", CentralConfig._default_pg)
-    CentralConfig.SQLALCHEMY_ENGINE_OPTIONS = {
-        "pool_pre_ping": True,
-        "pool_size": int(os.environ.get("DB_POOL_SIZE", "20")),
-        "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", "30")),
-        "pool_recycle": int(os.environ.get("DB_POOL_RECYCLE", "1800")),
-    }
 
 
 def get_config():
     _apply_runtime_config_values()
     mode = os.environ.get("GLR_MODE", "local")
     if mode == "central":
-        provider = os.environ.get("CENTRAL_DATA_PROVIDER", "postgres").lower()
-        if provider not in {"postgres", "firestore"}:
-            raise RuntimeError("CENTRAL_DATA_PROVIDER must be 'postgres' or 'firestore'")
+        provider = os.environ.get("CENTRAL_DATA_PROVIDER", "firestore").lower()
+        if provider != "firestore":
+            raise RuntimeError("Central mode requires CENTRAL_DATA_PROVIDER=firestore")
         insecure_defaults = {
-            "DATABASE_URL": "postgresql+psycopg2://glr_user:glr_pass@localhost:5432/glr_central",
-            "JWT_SECRET_KEY": "dev-jwt-secret-change-me",
-            "SYNC_API_KEY": "dev-sync-key-change-me",
+            "JWT_SECRET_KEY": {"dev-jwt-secret-change-me", "change-me-too"},
+            "SYNC_API_KEY": {"dev-sync-key-change-me", "change-me"},
         }
         invalid = [
-            name for name, default in insecure_defaults.items()
-            if os.environ.get(name, default) == default
+            name for name, defaults in insecure_defaults.items()
+            if os.environ.get(name, next(iter(defaults))).strip() in defaults
         ]
         if invalid:
             raise RuntimeError(

@@ -160,4 +160,4 @@ class OneTimeCredentialBootstrapTests(unittest.TestCase):
             self.assertEqual(product.name, "Keep Product")
             self.assertEqual(sale.invoice_number, "INV-KEEP-1")
             self.assertEqual(sale.customer_name, "Keep Customer")
-            self.assertEqual(Shop.query.get(1).name, "Customer Shop")
+            self.assertEqual(db.session.get(Shop, 1).name, "Customer Shop")

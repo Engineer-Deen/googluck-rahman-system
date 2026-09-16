@@ -4,7 +4,6 @@ import threading
 import unittest
 from datetime import datetime, timezone
 from collections import defaultdict
-
 from flask import Flask
 from werkzeug.security import generate_password_hash
 
@@ -19,9 +18,19 @@ class FakeFirestoreService:
     def __init__(self):
         self.pushed = []
         self.shop_ids = []
+        self.devices = {"device-a": {"id": "device-a", "shop_id": 1, "authorized": True}}
+
+    def get_device(self, device_id):
+        return self.devices.get(device_id)
+
+    def save_device(self, device_id, **fields):
+        self.devices.setdefault(device_id, {"id": device_id}).update(fields)
+        return self.devices[device_id]
 
     def push_item(self, device, table_name, payload):
-        self.pushed.append((device.id, device.shop_id, table_name, payload.copy()))
+        device_id = device.get("id") if isinstance(device, dict) else device.id
+        shop_id = device.get("shop_id") if isinstance(device, dict) else device.shop_id
+        self.pushed.append((device_id, shop_id, table_name, payload.copy()))
         return {"invoice_number": "INV-2026-1001"} if table_name == "sales" else {}
 
     def pull(self, shop_id, since):
@@ -67,6 +76,9 @@ class FakeDocRef:
             bucket[self.doc_id] = existing
         else:
             bucket[self.doc_id] = dict(data)
+
+    def delete(self):
+        self.client.collections.get(self.collection_name, {}).pop(self.doc_id, None)
 
 
 class FakeCollection:
@@ -130,6 +142,7 @@ class FakeTransaction:
         self._lock = client.transaction_lock
         self._lock.acquire()
         self._writes = []
+        self._deletes = []
         self._max_attempts = 1
         self._read_only = False
         self._id = None
@@ -152,8 +165,13 @@ class FakeTransaction:
     def set(self, ref, data, merge=False):
         self._writes.append((ref, data, merge))
 
+    def delete(self, ref):
+        self._deletes.append(ref)
+
     def commit(self):
         try:
+            for ref in self._deletes:
+                ref.delete()
             for ref, data, merge in self._writes:
                 ref.set(data, merge=merge)
         finally:
@@ -581,379 +599,26 @@ class FirestoreProviderTests(unittest.TestCase):
                 else:
                     os.environ[name] = value
 
-
-class FirestoreMirrorTests(unittest.TestCase):
-    def setUp(self):
-        self.app = Flask(__name__)
-        self.app.config.update(
-            SQLALCHEMY_DATABASE_URI="sqlite://",
-            SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        )
-        db.init_app(self.app)
-        self.client = FakeFirestoreClient()
-        self.service = FirestoreSyncService(self.client)
-        with self.app.app_context():
-            db.create_all()
-            db.session.add_all([
-                Shop(id=1, name="Shop A"),
-                Staff(
-                    id=1,
-                    shop_id=1,
-                    name="Admin",
-                    email="admin@test",
-                    password_hash=generate_password_hash("secret"),
-                    quick_pin_hash=generate_password_hash("1234"),
-                    role="admin",
-                ),
-            ])
-            db.session.commit()
-
-    def tearDown(self):
-        with self.app.app_context():
-            db.session.remove()
-            db.engine.dispose()
-
-    def test_refresh_sql_mirror_skips_orphan_stock_movement(self):
-        self.client.collections["stock_movements"]["orphan"] = {
-            "id": "orphan",
-            "product_id": 7,
-            "shop_id": 1,
-            "device_id": "device-a",
-            "quantity_delta": -1,
-            "reason": "sale",
-            "reference_id": "missing-sale",
-            "updated_at": "2026-01-02T06:00:00+00:00",
-        }
-        with self.app.app_context():
-            self.service.refresh_sql_mirror(force=True)
-            self.assertIsNone(db.session.get(StockMovement, "orphan"))
-            conflicts = self.client.collections.get("provider_conflicts", {})
-            self.assertTrue(any(key.startswith("stock_movements:") for key in conflicts))
-
-    def test_refresh_sql_mirror_skips_orphan_sale_item(self):
-        self.client.collections["products"]["11"] = {
-            "id": 11,
-            "sku": "P-11",
-            "name": "Valid Product",
-            "category": "Gaming",
-            "unit_price": "30.00",
-            "cost_price": "12.00",
-            "is_active": True,
-        }
-        self.client.collections["sales"]["sale-valid"] = {
-            "id": "sale-valid",
-            "invoice_number": "INV-2027-3001",
-            "shop_id": 1,
-            "staff_id": 1,
-            "customer_name": "Valid",
-            "payment_method": "cash",
-            "total_amount": "30.00",
-            "created_at": "2027-01-01T00:00:00+00:00",
-            "updated_at": "2027-01-01T00:00:00+00:00",
-        }
-        self.client.collections["sale_items"]["item-valid"] = {
-            "id": "item-valid",
-            "sale_id": "sale-valid",
-            "product_id": 11,
-            "quantity": 1,
-            "unit_price": "30.00",
-            "subtotal": "30.00",
-            "unit_cost": "12.00",
-        }
-        self.client.collections["sale_items"]["item-orphan"] = {
-            "id": "item-orphan",
-            "sale_id": "sale-valid",
-            "product_id": 999,
-            "quantity": 1,
-            "unit_price": "10.00",
-            "subtotal": "10.00",
-            "unit_cost": "5.00",
-        }
-        with self.app.app_context():
-            self.service.refresh_sql_mirror(force=True)
-            self.assertIsNone(db.session.get(SaleItem, "item-orphan"))
-            valid = db.session.get(SaleItem, "item-valid")
-            self.assertIsNotNone(valid)
-            self.assertEqual(valid.product_id, 11)
-            self.assertEqual(str(valid.subtotal), "30.00")
-            conflicts = self.client.collections.get("provider_conflicts", {})
-            self.assertTrue(any(key.startswith("sale_items:") for key in conflicts))
-
-    def test_mirror_preserves_relationships_and_excludes_staff_secrets(self):
-        with self.app.app_context():
-            product = Product(id=10, sku="P-10", name="Phone", category="Gaming", unit_price=20, cost_price=10)
-            sale = Sale(
-                id="sale-mirror",
-                invoice_number="INV-2026-2001",
-                shop_id=1,
-                staff_id=1,
-                customer_name="Alice",
-                total_amount=20,
-            )
-            db.session.add_all([
-                product,
-                sale,
-                SaleItem(id="item-mirror", sale_id=sale.id, product_id=product.id, quantity=1, unit_price=20, subtotal=20, unit_cost=10),
-            ])
-            db.session.commit()
-
-            self.service.mirror_sql_state()
-
-            staff = self.client.collections["staff"]["1"]
-            self.assertNotIn("password_hash", staff)
-            self.assertNotIn("quick_pin_hash", staff)
-            self.assertNotIn("quick_pin_failed_attempts", staff)
-            self.assertNotIn("quick_pin_locked_until", staff)
-            self.assertEqual(self.client.collections["sales"][sale.id]["invoice_number"], "INV-2026-2001")
-            self.assertEqual(self.client.collections["sale_items"]["item-mirror"]["sale_id"], sale.id)
-
-    def test_refresh_hydrates_firestore_sale_graph_and_derived_item_values(self):
-        self.client.collections["products"]["11"] = {
-            "id": 11,
-            "sku": "P-11",
-            "name": "Speaker",
-            "category": "Gaming",
-            "unit_price": "30.00",
-            "cost_price": "12.00",
-            "is_active": True,
-        }
-        self.client.collections["sales"]["sale-firestore"] = {
-            "id": "sale-firestore",
-            "invoice_number": "INV-2027-1001",
-            "shop_id": 1,
-            "staff_id": 1,
-            "customer_name": "Bob",
-            "payment_method": "cash",
-            "total_amount": "30.00",
-            "created_at": "2027-01-01T00:00:00+00:00",
-            "updated_at": "2027-01-01T00:00:00+00:00",
-        }
-        self.client.collections["sale_items"]["item-firestore"] = {
-            "id": "item-firestore",
-            "sale_id": "sale-firestore",
-            "product_id": 11,
-            "quantity": 1,
-            "unit_price": "30.00",
-        }
-
-        with self.app.app_context():
-            self.service.refresh_sql_mirror()
-            sale = db.session.get(Sale, "sale-firestore")
-            item = db.session.get(SaleItem, "item-firestore")
-
-            self.assertEqual(sale.invoice_number, "INV-2027-1001")
-            self.assertEqual(str(item.subtotal), "30.00")
-            self.assertEqual(str(item.unit_cost), "12.00")
-
-    def test_refresh_cache_reuses_snapshot_until_shared_generation_changes(self):
-        self.app.config["FIRESTORE_MIRROR_REFRESH_SECONDS"] = 300
-        with self.app.app_context():
-            self.service.refresh_sql_mirror(force=True)
-            first_stream_count = self.client.stream_calls
-            self.service.refresh_sql_mirror()
-            self.assertEqual(self.client.stream_calls, first_stream_count)
-            self.service.mark_central_state_changed()
-            self.service.refresh_sql_mirror()
-            self.assertGreater(self.client.stream_calls, first_stream_count)
-
-    def test_second_provider_instance_refreshes_after_shared_generation_change(self):
-        self.app.config["FIRESTORE_MIRROR_REFRESH_SECONDS"] = 300
-        second = FirestoreSyncService(self.client)
-        with self.app.app_context():
-            self.service.refresh_sql_mirror(force=True)
-            second.refresh_sql_mirror(force=True)
-            self.service.mark_central_state_changed()
-            self.assertTrue(second.refresh_sql_mirror())
-
-    def test_generation_change_refreshes_product_state_used_for_inventory_checks(self):
-        self.app.config["FIRESTORE_MIRROR_REFRESH_SECONDS"] = 300
-        self.client.collections["products"]["12"] = {
-            "id": 12,
-            "sku": "P-12",
-            "name": "Initial Stock Item",
-            "category": "Gaming",
-            "unit_price": "30.00",
-            "cost_price": "12.00",
-            "is_active": True,
-        }
-        with self.app.app_context():
-            self.service.refresh_sql_mirror(force=True)
-            self.assertEqual(db.session.get(Product, 12).name, "Initial Stock Item")
-            self.client.collections["products"]["12"]["name"] = "Updated Stock Item"
-            self.service.mark_central_state_changed()
-            self.service.refresh_sql_mirror()
-            self.assertEqual(db.session.get(Product, 12).name, "Updated Stock Item")
-
-    def test_mirror_recent_sql_state_normalizes_naive_timestamp_before_comparison(self):
-        with self.app.app_context():
-            product = Product(
-                id=13,
-                sku="P-13",
-                name="Naive Timestamp Item",
-                category="Gaming",
-                unit_price=30,
-                cost_price=12,
-                created_at=datetime(2026, 1, 1, 12, 0, 0),
-                updated_at=datetime(2026, 1, 1, 12, 0, 0),
-            )
-            db.session.add(product)
-            db.session.commit()
-
-            self.service.mirror_recent_sql_state(datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc))
-
-            self.assertEqual(self.client.collections["products"]["13"]["name"], "Naive Timestamp Item")
-
-    def test_invoice_allocation_is_unique_across_concurrent_provider_instances(self):
-        services = [FirestoreSyncService(self.client), FirestoreSyncService(self.client)]
-        results = []
-
-        def allocate(service):
-            with self.app.app_context():
-                results.append(service.allocate_invoice_number({"created_at": "2028-01-01T00:00:00+00:00"}))
-
-        threads = [threading.Thread(target=allocate, args=(service,)) for service in services]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        self.assertEqual(sorted(results), ["INV-2028-1001", "INV-2028-1002"])
-
-    def test_refresh_tolerates_null_or_empty_sale_item_unit_price(self):
-        self.client.collections["products"]["21"] = {
-            "id": 21,
-            "sku": "P-21",
-            "name": "Cable",
-            "category": "Gaming",
-            "unit_price": "10.00",
-            "cost_price": "4.00",
-            "is_active": True,
-        }
-        self.client.collections["sales"]["sale-null-price"] = {
-            "id": "sale-null-price",
-            "invoice_number": "INV-2029-1001",
-            "shop_id": 1,
-            "staff_id": 1,
-            "customer_name": "Pat",
-            "payment_method": "cash",
-            "total_amount": "10.00",
-            "created_at": "2029-01-01T00:00:00+00:00",
-            "updated_at": "2029-01-01T00:00:00+00:00",
-        }
-        self.client.collections["sale_items"]["item-null-price"] = {
-            "id": "item-null-price",
-            "sale_id": "sale-null-price",
-            "product_id": 21,
-            "quantity": 1,
-            "unit_price": None,
-        }
-
-        with self.app.app_context():
-            self.service.refresh_sql_mirror(force=True)
-            item = db.session.get(SaleItem, "item-null-price")
-            self.assertEqual(str(item.unit_price), "0.00")
-            self.assertEqual(str(item.subtotal), "0.00")
-            self.assertEqual(str(item.unit_cost), "4.00")
+    def test_central_config_rejects_documented_sync_key_placeholder(self):
+        saved = {name: os.environ.get(name) for name in ("GLR_MODE", "CENTRAL_DATA_PROVIDER", "JWT_SECRET_KEY", "SYNC_API_KEY", "FIREBASE_SERVICE_ACCOUNT_FILE")}
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as account_file:
+                os.environ.update({
+                    "GLR_MODE": "central",
+                    "CENTRAL_DATA_PROVIDER": "firestore",
+                    "JWT_SECRET_KEY": "configured-jwt",
+                    "SYNC_API_KEY": "change-me",
+                    "FIREBASE_SERVICE_ACCOUNT_FILE": account_file.name,
+                })
+                with self.assertRaisesRegex(RuntimeError, "SYNC_API_KEY"):
+                    get_config()
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
-class FirestoreLoginMirrorIsolationTests(unittest.TestCase):
-    """Login must not become HTTP 500 when the Firestore before_request mirror fails."""
-
-    def setUp(self):
-        from datetime import datetime, timezone
-
-        from app import _FIRESTORE_MIRROR_EXEMPT_PATHS
-        from app.extensions import db as app_db
-        from app.routes.auth import auth_bp
-        from flask import current_app, g, request
-
-        class BoomMirrorService:
-            def refresh_sql_mirror(self, force=False):
-                raise RuntimeError("simulated firestore mirror refresh failure")
-
-            def mirror_recent_sql_state(self, since):
-                raise RuntimeError("simulated firestore mirror write failure")
-
-            def mark_central_state_changed(self):
-                raise RuntimeError("simulated firestore generation write failure")
-
-        self.app = Flask(__name__)
-        self.app.config.update(
-            SQLALCHEMY_DATABASE_URI="sqlite://",
-            SQLALCHEMY_TRACK_MODIFICATIONS=False,
-            GLR_MODE="central",
-            CENTRAL_DATA_PROVIDER="firestore",
-            JWT_SECRET_KEY="test-jwt",
-            FIRESTORE_SYNC_SERVICE=BoomMirrorService(),
-        )
-        app_db.init_app(self.app)
-        self.app.register_blueprint(auth_bp)
-
-        @self.app.before_request
-        def _refresh_firestore_central_state():
-            g.firestore_request_started_at = datetime.now(timezone.utc)
-            if request.path in _FIRESTORE_MIRROR_EXEMPT_PATHS:
-                return None
-            try:
-                self.app.config["FIRESTORE_SYNC_SERVICE"].refresh_sql_mirror()
-            except Exception:
-                current_app.logger.exception("Firestore central mirror refresh failed")
-                app_db.session.rollback()
-
-        @self.app.after_request
-        def _mirror_firestore_central_state(response):
-            if request.path in _FIRESTORE_MIRROR_EXEMPT_PATHS:
-                return response
-            try:
-                if response.status_code < 500 and request.method not in {"GET", "HEAD", "OPTIONS"}:
-                    service = self.app.config["FIRESTORE_SYNC_SERVICE"]
-                    started_at = getattr(g, "firestore_request_started_at", None)
-                    if started_at is not None:
-                        service.mirror_recent_sql_state(started_at)
-                        service.mark_central_state_changed()
-            except Exception:
-                current_app.logger.exception("Firestore central mirror write failed")
-                app_db.session.rollback()
-            return response
-
-        with self.app.app_context():
-            app_db.create_all()
-            app_db.session.add_all([
-                Shop(id=1, name="Main Shop"),
-                Staff(
-                    id=1,
-                    shop_id=1,
-                    name="Admin",
-                    email="admin@glr.test",
-                    password_hash=generate_password_hash("admin123"),
-                    role="admin",
-                    is_active=True,
-                ),
-            ])
-            app_db.session.commit()
-
-    def tearDown(self):
-        from app.extensions import db as app_db
-
-        with self.app.app_context():
-            app_db.session.remove()
-            app_db.engine.dispose()
-
-    def test_login_succeeds_when_firestore_mirror_refresh_would_raise(self):
-        response = self.app.test_client().post(
-            "/api/auth/login",
-            json={"email": "admin@glr.test", "password": "admin123", "role_group": "owner"},
-        )
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertIn("token", payload)
-        self.assertEqual(payload["staff"]["email"], "admin@glr.test")
-
-    def test_non_exempt_request_survives_mirror_refresh_failure(self):
-        @self.app.get("/api/diag/mirror-probe")
-        def probe():
-            return {"ok": True}
-
-        response = self.app.test_client().get("/api/diag/mirror-probe")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {"ok": True})
+if __name__ == "__main__":
+    unittest.main()

@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 import re
+import uuid
 
 from flask import Blueprint, current_app, g, jsonify, request
 
@@ -32,36 +33,15 @@ def assign_invoice_number(sale):
     """Assign a central, human-readable invoice number once only."""
     if sale.invoice_number:
         return sale.invoice_number
-    if current_app.config.get("CENTRAL_DATA_PROVIDER") == "firestore":
+    if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service
 
         service = get_firestore_sync_service()
-        year = (sale.created_at or datetime.now(timezone.utc)).year
-        invoice_floor = 1001
-        invoice_prefix = f"INV-{year}-"
-        for (invoice_number,) in Sale.query.with_entities(Sale.invoice_number).filter(
-            Sale.invoice_number.like(f"{invoice_prefix}%")
-        ).all():
-            match = re.fullmatch(rf"INV-{year}-(\d+)", str(invoice_number))
-            if match:
-                invoice_floor = max(invoice_floor, int(match.group(1)) + 1)
         payload = {
             "created_at": sale.created_at.isoformat() if sale.created_at else None,
-            "minimum_next": invoice_floor,
         }
-        for _ in range(5):
-            invoice_number = service.allocate_invoice_number(payload)
-            conflict = Sale.query.filter(
-                Sale.invoice_number == invoice_number,
-                Sale.id != sale.id,
-            ).first()
-            if not conflict:
-                sale.invoice_number = invoice_number
-                return sale.invoice_number
-            match = re.fullmatch(r"INV-(\d+)-(\d+)", str(invoice_number))
-            if match:
-                payload["minimum_next"] = int(match.group(2)) + 1
-        raise RuntimeError("Could not allocate a unique invoice number")
+        sale.invoice_number = service.allocate_invoice_number(payload)
+        return sale.invoice_number
     year = (sale.created_at or datetime.now(timezone.utc)).year
     seq = InvoiceSequence.query.filter_by(year=year).with_for_update().first()
     if not seq:
@@ -151,6 +131,43 @@ def serialize_sale(sale: Sale, role: str = None, product_map=None):
     return data
 
 
+def serialize_firestore_sale(graph, role=None, service=None):
+    sale = graph["sale"]
+    items = graph.get("items", [])
+    paid = sum((Decimal(str(payment.get("amount", 0))) for payment in graph.get("payments", [])), Decimal("0.00")).quantize(Decimal("0.01"))
+    total = Decimal(str(sale.get("total_amount", 0)))
+    balance = max(Decimal("0.00"), total - paid)
+    data = {
+        "id": sale.get("id"), "invoice_number": sale.get("invoice_number"),
+        "shop_id": sale.get("shop_id"), "device_id": sale.get("device_id"),
+        "staff_id": sale.get("staff_id"), "customer_name": sale.get("customer_name"),
+        "payment_method": sale.get("payment_method"), "total_amount": str(total),
+        "amount_paid": str(paid), "balance": str(balance),
+        "status": "voided" if sale.get("voided_at") else ("completed" if balance <= 0 else "incomplete"),
+        "voided_at": sale.get("voided_at"), "voided_by_staff_id": sale.get("voided_by_staff_id"),
+        "void_reason": sale.get("void_reason"), "created_at": sale.get("created_at"),
+        "server_received_at": sale.get("server_received_at"),
+        "items": [],
+    }
+    for item in items:
+        product = service.get_product(item.get("product_id")) if service else None
+        item_data = {
+            "product_id": item.get("product_id"),
+            "product_name": (product or {}).get("name", f"Product #{item.get('product_id')}"),
+            "quantity": item.get("quantity"), "unit_price": str(item.get("unit_price", 0)),
+            "subtotal": str(item.get("subtotal", 0)),
+        }
+        if role in FINANCE_ROLES:
+            item_data["unit_cost"] = str(item.get("unit_cost", 0))
+            item_data["profit"] = str((Decimal(str(item.get("unit_price", 0))) - Decimal(str(item.get("unit_cost", 0)))) * int(item.get("quantity", 0)))
+        data["items"].append(item_data)
+    if role in FINANCE_ROLES:
+        profit = sum((Decimal(str(item.get("unit_price", 0))) - Decimal(str(item.get("unit_cost", 0)))) * int(item.get("quantity", 0)) for item in items)
+        data["profit"] = "0.00" if sale.get("voided_at") else str(profit)
+        data["realized_profit"] = "0.00"
+    return data
+
+
 def apply_sale(payload: dict):
     """
     payload shape:
@@ -181,7 +198,13 @@ def apply_sale(payload: dict):
     if not sale_id:
         raise ValueError("payload.id is required")
 
-    existing = Sale.query.get(sale_id)
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        graph, created = service.create_sale(payload)
+        return graph, [], created
+
+    existing = db.session.get(Sale, sale_id)
     if existing:
         return existing, [], False
 
@@ -332,11 +355,16 @@ def apply_payment(payload: dict):
     if not payment_id:
         raise ValueError("payload.id is required")
 
-    existing = SalePayment.query.get(payment_id)
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        graph, payment, created = get_firestore_sync_service().create_payment(payload)
+        return graph, payment, created
+
+    existing = db.session.get(SalePayment, payment_id)
     if existing:
         return existing.sale, existing, False
 
-    sale = Sale.query.get(payload.get("sale_id"))
+    sale = db.session.get(Sale, payload.get("sale_id"))
     if not sale:
         raise ValueError("Unknown sale_id")
 
@@ -392,7 +420,7 @@ def apply_void(payload: dict):
     Returns (sale, created) where created is False if this sale was
     already voided.
     """
-    sale = Sale.query.get(payload.get("sale_id"))
+    sale = db.session.get(Sale, payload.get("sale_id"))
     if not sale:
         raise ValueError("Unknown sale_id")
 
@@ -426,15 +454,21 @@ def apply_void(payload: dict):
 @login_required
 def list_sales():
     from datetime import timedelta
+    try:
+        limit = min(max(int(request.args.get("limit", 100) or 100), 1), 200)
+    except (TypeError, ValueError):
+        limit = 100
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+        graphs = service.list_sale_graphs(shop_id=shop_id, limit=limit)
+        return jsonify([serialize_firestore_sale(graph, role=g.staff_role, service=service) for graph in graphs])
     q = Sale.query
     if g.staff_role != "owner":
         q = q.filter(Sale.shop_id == g.staff_shop_id)
     period = (request.args.get("period") or "all").lower()
     search = (request.args.get("search") or "").strip()
-    try:
-        limit = min(max(int(request.args.get("limit", 100) or 100), 1), 200)
-    except (TypeError, ValueError):
-        limit = 100
     now = datetime.now(timezone.utc)
     if period == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -479,6 +513,30 @@ def update_sale(sale_id):
     reason = (data.get("reason") or "").strip()
     if not reason:
         return jsonify(error="A reason is required to update a sale"), 400
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        graph = service.get_sale_graph(sale_id)
+        if not graph or (g.staff_role != "owner" and graph["sale"].get("shop_id") != g.staff_shop_id):
+            return jsonify(error="Sale not found"), 404
+        sale = graph["sale"]
+        if sale.get("voided_at"):
+            return jsonify(error="A voided sale cannot be edited"), 400
+        now = datetime.now(timezone.utc)
+        created_at = sale.get("created_at")
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if g.staff_role not in FINANCE_ROLES:
+            if sale.get("staff_id") != g.staff_id:
+                return jsonify(error="You can only edit sales you created yourself"), 403
+            if created_at and created_at.date() != now.date():
+                return jsonify(error="Sellers can only edit sales recorded today"), 403
+        try:
+            corrected = service.correct_sale(sale_id, data, g.staff_id)
+        except (ValueError, TypeError) as error:
+            return jsonify(error=str(error)), 400
+        service.write_audit(f"sale-updated-{sale_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="sale_updated", entity_type="sale", entity_id=sale_id, details={"reason": reason})
+        return jsonify(serialize_firestore_sale(corrected, role=g.staff_role, service=service))
     sale = Sale.query.get_or_404(sale_id)
     if g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
         return jsonify(error="Sale not found"), 404
@@ -542,7 +600,7 @@ def update_sale(sale_id):
             new_qty = new_by_product.get(pid, 0)
             delta = old_qty - new_qty
             if delta < 0 and current_stock(pid, sale.shop_id) < -delta:
-                product = products.get(pid) or Product.query.get(pid)
+                product = products.get(pid) or db.session.get(Product, pid)
                 return jsonify(error=f"Not enough stock for {product.name if product else pid}: {current_stock(pid, sale.shop_id)} available"), 400
             if delta:
                 db.session.add(StockMovement(product_id=pid, shop_id=sale.shop_id, device_id=None, quantity_delta=delta, reason="sale_correction", reference_id=sale.id))
@@ -553,7 +611,7 @@ def update_sale(sale_id):
             db.session.add(SaleItem(id=gen_uuid(), sale_id=sale.id, product_id=product.id, quantity=qty, unit_price=price, subtotal=subtotal, unit_cost=product.cost_price))
         sale.total_amount = new_total
 
-    actor = Staff.query.get(g.staff_id)
+    actor = db.session.get(Staff, g.staff_id)
     db.session.commit()
     after = serialize_sale(sale, role="owner")
     log_action(g.staff_id, actor.name if actor else None, g.staff_role, "sale_updated", "sale", sale.id, {"reason": reason, "before": before, "after": after})
@@ -562,6 +620,13 @@ def update_sale(sale_id):
 @sales_bp.get("/<sale_id>")
 @login_required
 def get_sale(sale_id):
+    if current_app.config.get("GLR_MODE") == "central":
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        graph = service.get_sale_graph(sale_id)
+        if not graph or (g.staff_role != "owner" and graph["sale"].get("shop_id") != g.staff_shop_id):
+            return jsonify(error="Sale not found"), 404
+        return jsonify(serialize_firestore_sale(graph, role=g.staff_role, service=service))
     sale = (Sale.query.options(selectinload(Sale.items), selectinload(Sale.payments)).get_or_404(sale_id))
     if g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
         return jsonify(error="Sale not found"), 404
@@ -583,13 +648,8 @@ def create_sale():
     if not device_id and current_app.config["GLR_MODE"] == "local":
         # Auto-generating a device_id only makes sense on a local
         # install -- it's this device's own persistent identity. In
-        # central mode there's no "device" to invent one for, and
-        # inventing one anyway would insert a device_id that was never
-        # registered in the devices table (registration only happens
-        # via the sync push endpoint), which Postgres correctly rejects
-        # as a foreign key violation. SQLite never enforces that FK by
-        # default, so this stayed invisible in local-only testing until
-        # tested directly against a real Postgres central server.
+        # central mode has no local device identity to invent; devices are
+        # registered through the sync endpoint.
         from app.sync.device import get_current_device_id
         device_id = get_current_device_id()
 
@@ -615,6 +675,18 @@ def create_sale():
     }
     payload["assign_invoice"] = current_app.config["GLR_MODE"] == "central"
     payload["validate_stock"] = True
+
+    if current_app.config["GLR_MODE"] == "central":
+        try:
+            sale_graph, stock_warnings, created = apply_sale(payload)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        response = serialize_firestore_sale(sale_graph, role=g.staff_role, service=service)
+        if stock_warnings:
+            response["stock_warning"] = stock_warnings
+        return jsonify(response), 201 if created else 200
 
     # Leaving amount_paid out entirely now means "nothing paid yet" (a
     # part payment of 0), NOT "assume paid in full" -- apply_sale()'s
@@ -653,7 +725,7 @@ def create_sale():
     for item in payload["items"]:
         available = current_stock(item["product_id"], stock_shop_id)
         if item["quantity"] > available:
-            product = Product.query.get(item["product_id"])
+            product = db.session.get(Product, item["product_id"])
             name = product.name if product else f"product #{item['product_id']}"
             return jsonify(
                 error=f"Not enough stock for {name}: only {available} available, {item['quantity']} requested"
@@ -706,7 +778,10 @@ def add_payment(sale_id):
     from flask import current_app
 
     data = request.get_json(silent=True) or {}
-    sale = Sale.query.get(sale_id)
+    if current_app.config["GLR_MODE"] == "central":
+        sale = None
+    else:
+        sale = db.session.get(Sale, sale_id)
     if sale and g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
         return jsonify(error="Sale not found"), 404
     try:
@@ -727,7 +802,8 @@ def add_payment(sale_id):
             sale, payment, created = apply_payment(payload)
         except ValueError as e:
             return jsonify(error=str(e)), 400
-        return jsonify(serialize_sale(sale, role=g.staff_role)), 201 if created else 200
+        from app.firestore import get_firestore_sync_service
+        return jsonify(serialize_firestore_sale(sale, role=g.staff_role, service=get_firestore_sync_service())), 201 if created else 200
 
     # Local mode is offline-first: accept the payment against this device's
     # latest synchronized balance, persist it locally, and queue it.
@@ -763,18 +839,24 @@ def void_sale(sale_id):
         return jsonify(error="Please select a valid reason for voiding this sale"), 400
 
     if current_app.config["GLR_MODE"] == "central":
-        sale = Sale.query.get(sale_id)
-        if not sale:
+        from app.firestore import get_firestore_sync_service
+        service = get_firestore_sync_service()
+        graph = service.get_sale_graph(sale_id)
+        if not graph:
             return jsonify(error="Sale not found"), 404
-        if g.staff_role != "owner" and sale.shop_id != g.staff_shop_id:
+        sale = graph["sale"]
+        if g.staff_role != "owner" and sale.get("shop_id") != g.staff_shop_id:
             return jsonify(error="Sale not found"), 404
-        if sale.voided_at:
-            return jsonify(serialize_sale(sale, role=g.staff_role)), 200
+        if sale.get("voided_at"):
+            return jsonify(serialize_firestore_sale(graph, role=g.staff_role, service=service)), 200
 
         if g.staff_role not in FINANCE_ROLES:
-            if sale.staff_id != g.staff_id:
+            if sale.get("staff_id") != g.staff_id:
                 return jsonify(error="You can only void sales you created yourself"), 403
-            if sale.created_at.date() != datetime.now(timezone.utc).date():
+            created_at = sale.get("created_at")
+            if isinstance(created_at, str):
+                created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created_at and created_at.date() != datetime.now(timezone.utc).date():
                 return jsonify(
                     error=(
                         "Sales can only be voided the same day they were made. "
@@ -787,25 +869,20 @@ def void_sale(sale_id):
             "reason": reason,
             "voided_by_staff_id": g.staff_id,
             "device_id": data.get("device_id"),
-            "reversal_movement_ids": {item.id: gen_uuid() for item in sale.items},
+            "reversal_movement_ids": {item["id"]: gen_uuid() for item in graph.get("items", [])},
         }
-        sale, created = apply_void(payload)
+        graph, created = service.void_sale(sale_id, reason, g.staff_id, data.get("device_id"), payload["reversal_movement_ids"])
 
         if created:
-            actor = Staff.query.get(g.staff_id)
-            log_action(
-                g.staff_id, actor.name if actor else None, g.staff_role,
-                "sale_voided", "sale", sale.id,
-                {"reason": reason, "total_amount": str(sale.total_amount), "customer_name": sale.customer_name, "invoice_number": sale.invoice_number},
-            )
+            service.write_audit(f"sale-voided-{sale_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="sale_voided", entity_type="sale", entity_id=sale_id, details={"reason": reason})
 
-        return jsonify(serialize_sale(sale, role=g.staff_role)), 200 if created else 200
+        return jsonify(serialize_firestore_sale(graph, role=g.staff_role, service=service)), 200
 
     # local mode: proxy live to central for the authoritative decision,
     # same reasoning as payments.
     import requests
 
-    local_sale = Sale.query.get(sale_id)
+    local_sale = db.session.get(Sale, sale_id)
     if local_sale and g.staff_role != "owner" and local_sale.shop_id != g.staff_shop_id:
         return jsonify(error="Sale not found"), 404
     reversal_ids = {item.id: gen_uuid() for item in local_sale.items} if local_sale else {}

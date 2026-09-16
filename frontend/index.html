@@ -16,12 +16,7 @@
 <!-- LOGIN -->
 <div id="login-overlay">
   <div class="login-box">
-    <img id="login-shop-logo" class="brand-logo-img login-logo-img" alt="Shop logo" style="display:none;" />
-    <svg class="brand-icon-lg" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg">
-      <polygon points="40,4 56,14 66,32 64,52 50,64 30,64 16,52 14,32 24,14" fill="none" stroke="var(--accent)" stroke-width="2"/>
-      <circle cx="40" cy="38" r="22" fill="#0f2035"/>
-      <ellipse cx="40" cy="50" rx="17" ry="4.5" fill="var(--accent)"/>
-    </svg>
+    <img class="official-logo login-logo-img" src="assets/goodluck-rahman-enterprise.png" alt="Good Luck Rahman Enterprise" />
     <div class="login-title" id="login-shop-title">GOOD LUCK RAHMAN ENTERPRISE</div>
     <div class="login-tagline">Shop Management</div>
 
@@ -39,6 +34,20 @@
     </div>
     <button class="btn-login" id="login-submit-btn" onclick="doLogin()">LOG IN</button>
     <div class="login-error" id="login-error"></div>
+
+    <div class="provisioning-panel" id="provisioning-panel" style="display:none;">
+      <div class="provisioning-title">DESKTOP SETUP</div>
+      <div class="provisioning-state" id="provisioning-state">Checking enrollment...</div>
+      <div class="provisioning-device" id="provisioning-device"></div>
+      <p class="provisioning-copy">A central owner or administrator must authorize this desktop. Then create a local password for offline access to this authorized device.</p>
+      <div class="auth-grid">
+        <input type="email" id="central-enrollment-email" class="auth-input" placeholder="Central owner/admin email" autocomplete="username">
+        <input type="password" id="central-enrollment-password" class="auth-input" placeholder="Central owner/admin password" autocomplete="current-password">
+        <input type="password" id="local-enrollment-password" class="auth-input" placeholder="New offline desktop password" autocomplete="new-password">
+      </div>
+      <button class="btn-login" id="provision-submit-btn" onclick="provisionDesktop()">AUTHORIZE DESKTOP</button>
+      <div class="login-error" id="provisioning-error"></div>
+    </div>
   </div>
 </div>
 
@@ -46,12 +55,7 @@
 <div id="app">
   <header>
     <div class="brand">
-      <img id="header-shop-logo" class="brand-logo-img" alt="Shop logo" style="display:none;" />
-      <svg class="brand-icon" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg">
-        <polygon points="40,4 56,14 66,32 64,52 50,64 30,64 16,52 14,32 24,14" fill="none" stroke="var(--accent)" stroke-width="2"/>
-        <circle cx="40" cy="38" r="22" fill="#0f2035"/>
-        <ellipse cx="40" cy="50" rx="17" ry="4.5" fill="var(--accent)"/>
-      </svg>
+      <img class="official-logo header-logo-img" src="assets/goodluck-rahman-enterprise.png" alt="Good Luck Rahman Enterprise" />
       <div>
         <div class="brand-name">GOOD LUCK RAHMAN ENTERPRISE</div>
         <div class="brand-tagline" id="header-shop-name">Management System</div>
@@ -436,15 +440,6 @@
         </div>
         <div class="settings-note">The quick PIN is stored as a secure hash in the backend database. Three wrong PIN attempts disable quick unlock and require a fresh admin login.</div>
         <button class="btn btn-primary admin-only" id="save-settings-btn" onclick="saveSystemSettings()" style="display:none;">SAVE SETTINGS</button>
-      </div>
-      <div class="card admin-only" id="shop-settings-card" style="display:none;">
-        <div class="card-title">SHOP BRANDING</div>
-        <div class="form-grid">
-          <div class="form-group"><label>Shop Name</label><input id="shop-name-input" type="text" placeholder="Business name"></div>
-          <div class="form-group"><label>Shop Logo</label><input id="shop-logo-input" type="file" accept="image/*"></div>
-        </div>
-        <div class="settings-note">Branding is saved online and then synchronized to connected shop computers. Update the shop name and logo here so customers and staff see the correct business identity on the login screen and header.</div>
-        <button class="btn btn-primary" onclick="saveShopSettings()">SAVE BRANDING</button>
       </div>
       <div class="card">
         <div class="card-title">What works offline vs online</div>

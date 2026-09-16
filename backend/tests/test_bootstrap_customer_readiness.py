@@ -109,6 +109,47 @@ class BootstrapCredentialTests(unittest.TestCase):
             self.assertIsNotNone(Staff.query.filter_by(email="cashier@glr.test").first())
 
     def test_central_bootstrap_creates_owner_from_env(self):
+        class BootstrapFirestore:
+            def __init__(self):
+                self.shop = None
+                self.staff = {}
+                self.products = []
+                self.settings = {}
+
+            def get_first_shop(self):
+                return self.shop
+
+            def save_shop(self, shop_id, **fields):
+                self.shop = {"id": shop_id, **fields}
+                return self.shop
+
+            def get_staff_by_email(self, email):
+                return next((row for row in self.staff.values() if row["email"] == email), None)
+
+            def allocate_staff_id(self):
+                return len(self.staff) + 1
+
+            def save_staff(self, staff_id, **fields):
+                self.staff[staff_id] = {"id": staff_id, **fields}
+                return self.staff[staff_id]
+
+            def list_products(self, include_inactive=False):
+                return list(self.products)
+
+            def _allocate_product_id(self):
+                return len(self.products) + 1
+
+            def save_product(self, product_id, **fields):
+                product = {"id": product_id, **fields}
+                self.products.append(product)
+                return product
+
+            def get_setting(self, key, default=None):
+                return self.settings.get(key, default)
+
+            def save_setting(self, key, value):
+                self.settings[key] = value
+
         env = {
             "ALLOW_DEMO_SEED": "false",
             "INITIAL_SHOP_NAME": "Central Customer Shop",
@@ -123,13 +164,14 @@ class BootstrapCredentialTests(unittest.TestCase):
             "INITIAL_PRODUCT_UNIT_PRICE": "25",
             "INITIAL_PRODUCT_COST_PRICE": "10",
         }
-        with self.app.app_context():
+        service = BootstrapFirestore()
+        with self.app.app_context(), patch("app.firestore.get_firestore_sync_service", return_value=service):
             with patch.dict(os.environ, env, clear=False):
                 ensure_initial_central_data()
-            owner = Staff.query.filter_by(email="owner@customer.shop").one()
-            self.assertEqual(owner.role, "owner")
-            self.assertTrue(check_password_hash(owner.password_hash, "OwnerPass!42"))
-            self.assertIsNotNone(Product.query.filter_by(sku="CUST-001").first())
+            owner = service.get_staff_by_email("owner@customer.shop")
+            self.assertEqual(owner["role"], "owner")
+            self.assertTrue(check_password_hash(owner["password_hash"], "OwnerPass!42"))
+            self.assertEqual(service.products[0]["sku"], "CUST-001")
 
 
 class CustomerFacingMessageTests(unittest.TestCase):
@@ -169,7 +211,7 @@ class CustomerFacingMessageTests(unittest.TestCase):
         from app.auth import issue_token
 
         with self.app.app_context():
-            token = issue_token(Staff.query.get(1))
+            token = issue_token(db.session.get(Staff, 1))
         response = self.app.test_client().post(
             "/api/staff",
             headers={"Authorization": f"Bearer {token}"},
