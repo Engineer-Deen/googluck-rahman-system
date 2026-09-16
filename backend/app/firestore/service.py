@@ -55,6 +55,13 @@ def _clean_staff(raw: dict) -> dict:
     }
 
 
+def _transaction_get(transaction, reference):
+    result = transaction.get(reference)
+    if hasattr(result, "to_dict"):
+        return result
+    return next(iter(result), None)
+
+
 class FirestoreSyncService:
     """Translate existing sync payloads to stable Firestore documents."""
 
@@ -174,7 +181,7 @@ class FirestoreSyncService:
 
         @transactional
         def allocate(transaction):
-            snapshot = transaction.get(sequence_ref)
+            snapshot = _transaction_get(transaction, sequence_ref)
             current = (snapshot.to_dict() or {}).get("next_id", 1) if snapshot and snapshot.exists else 1
             transaction.set(sequence_ref, {"next_id": int(current) + 1, "updated_at": _utcnow()}, merge=True)
             return int(current)
@@ -274,7 +281,7 @@ class FirestoreSyncService:
 
         @transactional
         def allocate(transaction):
-            snapshot = transaction.get(sequence_ref)
+            snapshot = _transaction_get(transaction, sequence_ref)
             current = (snapshot.to_dict() or {}).get("next_id", 1) if snapshot and snapshot.exists else 1
             transaction.set(sequence_ref, {"next_id": int(current) + 1, "updated_at": _utcnow()}, merge=True)
             return int(current)
@@ -312,10 +319,10 @@ class FirestoreSyncService:
 
         @transactional
         def create(transaction):
-            existing = transaction.get(movement_ref)
+            existing = _transaction_get(transaction, movement_ref)
             if existing and existing.exists:
                 return existing.to_dict() or {}, False
-            product = transaction.get(product_ref)
+            product = _transaction_get(transaction, product_ref)
             if not product or not product.exists:
                 raise ValueError(f"Unknown product_id {payload['product_id']}")
             movement = {
@@ -458,10 +465,10 @@ class FirestoreSyncService:
 
         @transactional
         def create(transaction):
-            sale_snapshot = transaction.get(sale_ref)
+            sale_snapshot = _transaction_get(transaction, sale_ref)
             if not sale_snapshot or not sale_snapshot.exists:
                 raise ValueError("Unknown sale_id")
-            existing = transaction.get(payment_ref)
+            existing = _transaction_get(transaction, payment_ref)
             if existing and existing.exists:
                 return sale_snapshot.to_dict() or {}, existing.to_dict() or {}, False
             try:
@@ -542,7 +549,7 @@ class FirestoreSyncService:
 
         @transactional
         def update(transaction):
-            current = transaction.get(sale_ref)
+            current = _transaction_get(transaction, sale_ref)
             if not current or not current.exists:
                 raise ValueError("Sale not found")
             for item in old_items:
@@ -573,7 +580,7 @@ class FirestoreSyncService:
 
         @transactional
         def void(transaction):
-            current = transaction.get(sale_ref)
+            current = _transaction_get(transaction, sale_ref)
             if not current or not current.exists:
                 raise ValueError("Sale not found")
             current_sale = current.to_dict() or {}
@@ -617,9 +624,7 @@ class FirestoreSyncService:
         transaction = self.client.transaction()
         @transactional
         def allocate(transaction):
-            snapshot = transaction.get(sequence_ref)
-            if not hasattr(snapshot, "to_dict"):
-                snapshot = next(iter(snapshot), None)
+            snapshot = _transaction_get(transaction, sequence_ref)
             current = (snapshot.to_dict() or {}).get("next_number", initial_next) if snapshot else initial_next
             number = max(int(current), initial_next, requested_next)
             transaction.set(

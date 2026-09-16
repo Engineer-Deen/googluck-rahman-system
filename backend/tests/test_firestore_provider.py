@@ -178,6 +178,12 @@ class FakeTransaction:
             self._lock.release()
 
 
+class GeneratorTransaction(FakeTransaction):
+    def get(self, ref):
+        snapshot = ref.get()
+        return iter((snapshot,))
+
+
 class FakeFirestoreClient:
     def __init__(self):
         self.collections = defaultdict(dict)
@@ -192,6 +198,11 @@ class FakeFirestoreClient:
 
     def transaction(self):
         return FakeTransaction(self)
+
+
+class GeneratorTransactionClient(FakeFirestoreClient):
+    def transaction(self):
+        return GeneratorTransaction(self)
 
 
 def _seed_catalog_product(client, product_id, shop_ids=None):
@@ -214,6 +225,15 @@ class FirestoreAdapterTests(unittest.TestCase):
         self.service = FirestoreSyncService(self.client)
         self.device = type("DeviceLike", (), {"id": "device-a", "shop_id": 1})()
         _seed_catalog_product(self.client, 10)
+
+    def test_sequence_allocators_accept_transaction_generators(self):
+        client = GeneratorTransactionClient()
+        service = FirestoreSyncService(client)
+
+        self.assertEqual(service.allocate_staff_id(), 1)
+        self.assertEqual(service._allocate_product_id(), 1)
+        self.assertEqual(service.allocate_staff_id(), 2)
+        self.assertEqual(service._allocate_product_id(), 2)
 
     def test_firestore_adapter_creates_sales_documents_and_initial_payment(self):
         payload = {
