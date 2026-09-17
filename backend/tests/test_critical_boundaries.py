@@ -15,7 +15,7 @@ from app.routes.stock import stock_bp
 from app.routes.staff import staff_bp
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import os
 import unittest
 from tests.test_firestore_provider import FakeFirestoreClient
@@ -114,8 +114,15 @@ class CriticalBoundaryTests(unittest.TestCase):
             "total_amount": "10.00", "created_at": datetime.now(timezone.utc),
         }
         self.app.config["FIRESTORE_SYNC_SERVICE"] = self.firestore_service
+        self.central_session_patch = patch(
+            "app.auth.requests.get", side_effect=self._central_session_response
+        )
+        self.central_identity_overrides = {}
+        self.revoked_tokens = set()
+        self.central_session_patch.start()
 
     def tearDown(self):
+        self.central_session_patch.stop()
         with self.app.app_context():
             db.session.remove()
             db.engine.dispose()
@@ -123,21 +130,52 @@ class CriticalBoundaryTests(unittest.TestCase):
         if device_path.exists():
             device_path.unlink()
 
+    def _central_session_response(self, _url, headers=None, **_kwargs):
+        token = (headers or {}).get("Authorization", "").removeprefix("Bearer ")
+        if token in self.revoked_tokens:
+            return Mock(status_code=401)
+        staff_id = int(token.removeprefix("central-"))
+        with self.app.app_context():
+            staff = db.session.get(Staff, staff_id)
+            identity = {
+                "id": staff.id, "name": staff.name, "email": staff.email,
+                "role": staff.role, "shop_id": staff.shop_id, "is_active": True,
+            }
+            identity.update(self.central_identity_overrides.get(staff_id, {}))
+        response = Mock(status_code=200)
+        response.json.return_value = identity
+        return response
+
     def _cashier_client(self):
         client = self.app.test_client()
-        response = client.post(
-            "/api/auth/login",
-            json={"email": "one@critical.test", "password": "secret", "role_group": "seller"},
-        )
+        central_response = Mock(status_code=200)
+        central_response.json.return_value = {"token": "central-1", "staff": {
+            "id": 1, "name": "Cashier One", "email": "one@critical.test",
+            "role": "cashier", "shop_id": 1, "is_active": True,
+        }}
+        with patch("app.routes.auth.requests.post", return_value=central_response):
+            response = client.post(
+                "/api/auth/login",
+                json={"email": "one@critical.test", "password": "secret", "role_group": "seller"},
+            )
         self.assertEqual(response.status_code, 200)
         return client, {"Authorization": "Bearer " + response.get_json()["token"]}
 
     def _login(self, email, role_group):
         client = self.app.test_client()
-        response = client.post(
-            "/api/auth/login",
-            json={"email": email, "password": "secret", "role_group": role_group},
-        )
+        with self.app.app_context():
+            staff = Staff.query.filter_by(email=email).first()
+            identity = {
+                "id": staff.id, "name": staff.name, "email": staff.email,
+                "role": staff.role, "shop_id": staff.shop_id, "is_active": True,
+            }
+        central_response = Mock(status_code=200)
+        central_response.json.return_value = {"token": f"central-{staff.id}", "staff": identity}
+        with patch("app.routes.auth.requests.post", return_value=central_response):
+            response = client.post(
+                "/api/auth/login",
+                json={"email": email, "password": "secret", "role_group": role_group},
+            )
         self.assertEqual(response.status_code, 200)
         return client, {"Authorization": "Bearer " + response.get_json()["token"]}
 
@@ -335,39 +373,33 @@ class CriticalBoundaryTests(unittest.TestCase):
 
     def test_existing_tokens_revalidate_employee_state_and_logout(self):
         client, headers = self._cashier_client()
+        self.assertEqual(headers["Authorization"], "Bearer central-1")
+        with patch("app.auth.requests.get", return_value=Mock(status_code=401)):
+            self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
 
-        with self.app.app_context():
-            staff = db.session.get(Staff, 1)
-            staff.is_active = False
-            db.session.commit()
-        self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
-
-        with self.app.app_context():
-            staff = db.session.get(Staff, 1)
-            staff.is_active = True
-            db.session.commit()
         client, headers = self._cashier_client()
 
-        with self.app.app_context():
-            db.session.get(Staff, 1).role = "manager"
-            db.session.commit()
-        self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
+        with patch("app.auth.requests.get", return_value=Mock(status_code=200)) as session_get:
+            session_get.return_value.json.return_value = {
+                "id": 1, "name": "Cashier One", "email": "one@critical.test",
+                "role": "manager", "shop_id": 1, "is_active": True,
+            }
+            self.assertEqual(client.get("/api/products", headers=headers).status_code, 200)
 
-        with self.app.app_context():
-            db.session.get(Staff, 1).role = "cashier"
-            db.session.commit()
         client, headers = self._cashier_client()
-        with self.app.app_context():
-            db.session.get(Staff, 1).shop_id = 2
-            db.session.commit()
-        self.assertEqual(client.get("/api/shop", headers=headers).status_code, 401)
+        with patch("app.auth.requests.get", return_value=Mock(status_code=200)) as session_get:
+            session_get.return_value.json.return_value = {
+                "id": 1, "name": "Cashier One", "email": "one@critical.test",
+                "role": "cashier", "shop_id": 2, "is_active": True,
+            }
+            self.assertEqual(client.get("/api/shop", headers=headers).status_code, 200)
 
-        with self.app.app_context():
-            db.session.get(Staff, 1).shop_id = 1
-            db.session.commit()
         client, headers = self._cashier_client()
-        self.assertEqual(client.post("/api/auth/logout", headers=headers).status_code, 200)
-        self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
+        with patch("app.routes.auth.requests.post", return_value=Mock(status_code=200)):
+            logout = client.post("/api/auth/logout", headers=headers)
+        self.assertEqual(logout.status_code, 200)
+        with patch("app.auth.requests.get", return_value=Mock(status_code=401)):
+            self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
 
     def test_sync_pull_does_not_invalidate_active_tokens_on_noop_staff_updates(self):
         self.app.config["CENTRAL_SYNC_URL"] = "http://central.test"

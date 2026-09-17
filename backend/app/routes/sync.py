@@ -22,7 +22,6 @@ import requests
 
 from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy import func
-from werkzeug.security import generate_password_hash
 
 from app.auth import login_required, roles_required
 from app.extensions import db
@@ -431,9 +430,8 @@ def enroll_local_device():
     data = request.get_json(silent=True) or {}
     central_email = str(data.get("central_email") or "").strip().lower()
     central_password = str(data.get("central_password") or "")
-    local_password = str(data.get("local_password") or "")
-    if not central_email or not central_password or len(local_password) < 8:
-        return jsonify(error="Central authorization and a local password of at least 8 characters are required"), 400
+    if not central_email or not central_password:
+        return jsonify(error="Central owner/admin authorization is required"), 400
 
     device_id = get_current_device_id()
     central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
@@ -494,7 +492,9 @@ def enroll_local_device():
     local_staff.name = identity.get("name") or email
     local_staff.role = identity["role"]
     local_staff.is_active = bool(identity.get("is_active", True))
-    local_staff.password_hash = generate_password_hash(local_password)
+    # Authentication is central-only. Keep the legacy column inert for old
+    # SQLite schemas; /api/auth/login never checks it in local mode.
+    local_staff.password_hash = ""
 
     device = db.session.get(Device, device_id)
     if not device:

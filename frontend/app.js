@@ -14,8 +14,10 @@ const LOCAL_BACKEND_READY_TIMEOUT_MS = 45000;
 const LOCAL_BACKEND_POLL_MS = 250;
 let localBackendReady = false;
 
-let authToken = localStorage.getItem("glr_token") || null;
-let currentStaff = JSON.parse(localStorage.getItem("glr_staff") || "null");
+let authToken = null;
+let currentStaff = null;
+localStorage.removeItem("glr_token");
+localStorage.removeItem("glr_staff");
 let currentMode = "local";
 let productsCache = [];
 let inventoryEditProductId = null;
@@ -159,6 +161,19 @@ async function api(path, options = {}) {
           ? rawMessage
           : rawMessage;
     const error = new Error(message);
+    error.code = data && data.code;
+    if (tokenUsed && (error.code === "central_session_network" || error.code === "central_session_unavailable")) {
+      authToken = null;
+      currentStaff = null;
+      localStorage.removeItem("glr_token");
+      localStorage.removeItem("glr_staff");
+      document.getElementById("app").classList.remove("visible");
+      document.getElementById("login-overlay").style.display = "flex";
+      showLoginConnectivityState(
+        "Central Server Connection Required",
+        "Your session requires a connection to the central server."
+      );
+    }
     error.authExpired = res.status === 401 && !path.endsWith("/auth/login") && !!tokenUsed;
     throw error;
   }
@@ -180,6 +195,7 @@ async function doLogin() {
   const errorEl = document.getElementById("login-error");
   const btn = document.getElementById("login-submit-btn");
   errorEl.textContent = "";
+  hideLoginConnectivityState();
 
   if (!email || !password) {
     errorEl.textContent = "Enter your email and password.";
@@ -195,19 +211,46 @@ async function doLogin() {
     });
     authToken = data.token;
     currentStaff = data.staff;
-    localStorage.setItem("glr_token", authToken);
-    localStorage.setItem("glr_staff", JSON.stringify(currentStaff));
     if (ADMIN_ROLES.includes(currentStaff.role)) {
       localStorage.setItem("glr_admin_session_started", String(Date.now()));
       localStorage.setItem("glr_admin_last_active", String(Date.now()));
     }
     await enterApp();
   } catch (err) {
-    errorEl.textContent = err.message;
+    if (!navigator.onLine || err.code === "central_auth_network") {
+      showLoginConnectivityState(
+        "Connection Required",
+        "An internet connection to the central server is required to log in."
+      );
+    } else if (err.code === "central_auth_unavailable" || err.networkFailure) {
+      showLoginConnectivityState(
+        "Central Server Unavailable",
+        "We couldn't reach the central authentication server. Please try again."
+      );
+    } else {
+      errorEl.textContent = err.message;
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = "LOG IN";
   }
+}
+
+function showLoginConnectivityState(title, message) {
+  const state = document.getElementById("login-connectivity-state");
+  document.getElementById("login-connectivity-title").textContent = title;
+  document.getElementById("login-connectivity-message").textContent = message;
+  state.hidden = false;
+}
+
+function hideLoginConnectivityState() {
+  const state = document.getElementById("login-connectivity-state");
+  if (state) state.hidden = true;
+}
+
+function retryCentralConnection() {
+  hideLoginConnectivityState();
+  doLogin();
 }
 
 async function loadProvisioningStatus() {
@@ -234,12 +277,11 @@ async function loadProvisioningStatus() {
 async function provisionDesktop() {
   const email = document.getElementById("central-enrollment-email").value.trim();
   const password = document.getElementById("central-enrollment-password").value;
-  const localPassword = document.getElementById("local-enrollment-password").value;
   const errorEl = document.getElementById("provisioning-error");
   const button = document.getElementById("provision-submit-btn");
   errorEl.textContent = "";
-  if (!email || !password || localPassword.length < 8) {
-    errorEl.textContent = "Enter central owner/admin credentials and a local password of at least 8 characters.";
+  if (!email || !password) {
+    errorEl.textContent = "Enter central owner/admin credentials.";
     return;
   }
 
@@ -252,7 +294,6 @@ async function provisionDesktop() {
       body: JSON.stringify({
         central_email: email,
         central_password: password,
-        local_password: localPassword,
         name: "Good Luck Rahman Main Device",
         platform: getDesktopPlatformLabel(),
       }),
@@ -261,10 +302,9 @@ async function provisionDesktop() {
     if (!provisioned.ok) throw new Error(provisionedData.error || "Desktop provisioning failed.");
 
     document.getElementById("central-enrollment-password").value = "";
-    document.getElementById("local-enrollment-password").value = "";
     document.getElementById("login-email").value = provisionedData.staff.email;
-    document.getElementById("login-password").value = localPassword;
-    document.getElementById("provisioning-error").textContent = "Desktop is ready. Use the local password to sign in.";
+    document.getElementById("login-password").value = "";
+    document.getElementById("provisioning-error").textContent = "Desktop is ready. Sign in with your central credentials.";
     await loadProvisioningStatus();
   } catch (err) {
     errorEl.textContent = err.message || "Desktop provisioning failed.";
@@ -1778,9 +1818,6 @@ function scheduleAppUpdateCheck() {
       } catch (_) {}
     }
   });
-  if (authToken && currentStaff && localBackendReady) {
-    enterApp().catch(() => {});
-  }
   document.getElementById("login-password").addEventListener("keydown", (e) => {
     if (e.key === "Enter") doLogin();
   });

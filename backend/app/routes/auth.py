@@ -1,6 +1,6 @@
 from flask import Blueprint, current_app, jsonify, request, g
 from datetime import datetime, timedelta, timezone
-from werkzeug.security import check_password_hash
+import requests
 
 from app.auth import issue_token, login_required
 from app.extensions import db
@@ -59,6 +59,77 @@ def _get_central_service():
     return get_firestore_sync_service()
 
 
+def _authenticate_against_central(email, password, role_group):
+    central_url = current_app.config.get(
+        "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
+    ).rstrip("/")
+    try:
+        response = requests.post(
+            central_url + "/api/auth/login",
+            json={"email": email, "password": password, "role_group": role_group},
+            timeout=8,
+        )
+    except requests.ConnectionError:
+        return None, (jsonify(
+            error="An internet connection to the central server is required to log in.",
+            code="central_auth_network",
+        ), 503)
+    except requests.Timeout:
+        return None, (jsonify(
+            error="We couldn't reach the central authentication server. Please try again.",
+            code="central_auth_unavailable",
+        ), 503)
+    except requests.RequestException:
+        return None, (jsonify(
+            error="We couldn't reach the central authentication server. Please try again.",
+            code="central_auth_unavailable",
+        ), 503)
+
+    if response.status_code in (401, 403):
+        return None, (jsonify(error="Invalid email or password.", code="invalid_credentials"), 401)
+    if response.status_code >= 500 or not 200 <= response.status_code < 300:
+        return None, (jsonify(
+            error="We couldn't reach the central authentication server. Please try again.",
+            code="central_auth_unavailable",
+        ), 503)
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, (jsonify(
+            error="The central authentication server returned an invalid response.",
+            code="central_auth_unavailable",
+        ), 503)
+    staff = payload.get("staff")
+    if not payload.get("token") or not isinstance(staff, dict):
+        return None, (jsonify(
+            error="The central authentication server returned an invalid response.",
+            code="central_auth_unavailable",
+        ), 503)
+    return staff, payload["token"]
+
+
+def _cache_central_identity(staff):
+    from app.models import Staff
+
+    staff_id = int(_staff_value(staff, "id"))
+    email = str(_staff_value(staff, "email") or "").strip().lower()
+    local_staff = db.session.get(Staff, staff_id)
+    email_staff = Staff.query.filter_by(email=email).first()
+    if email_staff and email_staff.id != staff_id:
+        return None
+    if not local_staff:
+        local_staff = Staff(id=staff_id, name=email, email=email, password_hash="")
+        db.session.add(local_staff)
+    local_staff.shop_id = _staff_value(staff, "shop_id")
+    local_staff.name = _staff_value(staff, "name") or email
+    local_staff.email = email
+    local_staff.role = _staff_value(staff, "role")
+    local_staff.is_active = bool(_staff_value(staff, "is_active", True))
+    db.session.commit()
+    return local_staff
+
+
 @auth_bp.post("/login")
 def login():
     data = request.get_json(silent=True) or {}
@@ -75,10 +146,13 @@ def login():
 
     if _central_mode():
         staff = _get_central_service().get_staff_by_email(email)
+        central_token = None
     else:
-        from app.models import Staff
-        staff = Staff.query.filter_by(email=email, is_active=True).first()
-    if not staff or not _staff_value(staff, "is_active") or not check_password_hash(_staff_value(staff, "password_hash", ""), password):
+        result = _authenticate_against_central(email, password, role_group)
+        if isinstance(result[1], tuple):
+            return result[1]
+        staff, central_token = result
+    if not staff or not _staff_value(staff, "is_active"):
         _record_login_failure(key)
         return jsonify(error="Invalid email or password"), 401
 
@@ -91,6 +165,9 @@ def login():
             error=f"These credentials aren't valid for a {label} login. Try {other_label} instead."
         ), 401
 
+    if not _central_mode() and not _cache_central_identity(staff):
+        return jsonify(error="The central identity conflicts with a local account"), 409
+
     _clear_login_failures(key)
     if _central_mode():
         _get_central_service().update_staff_auth_state(
@@ -100,10 +177,10 @@ def login():
             updated_at=datetime.now(timezone.utc),
         )
     else:
-        staff.quick_pin_failed_attempts = 0
-        staff.quick_pin_locked_until = None
-        db.session.commit()
-    token = issue_token(staff)
+        # Central authentication has already succeeded. The local database is
+        # only used by the authenticated session/data layer in local mode.
+        pass
+    token = issue_token(staff) if _central_mode() else central_token
     return jsonify(
         token=token,
         staff={
@@ -125,10 +202,22 @@ def logout():
             g.staff_id, updated_at=datetime.now(timezone.utc)
         )
     else:
-        from app.models import Staff
-        staff = db.session.get(Staff, g.staff_id)
-        staff.updated_at = datetime.now(timezone.utc)
-        db.session.commit()
+        central_url = current_app.config.get(
+            "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
+        ).rstrip("/")
+        try:
+            response = requests.post(
+                central_url + "/api/auth/logout",
+                headers={"Authorization": request.headers["Authorization"]},
+                timeout=8,
+            )
+            if response.status_code >= 400:
+                return jsonify(error="Central session logout was rejected"), 401
+        except requests.RequestException:
+            return jsonify(
+                error="Your session requires a connection to the central server.",
+                code="central_session_unavailable",
+            ), 503
     return jsonify(ok=True)
 
 

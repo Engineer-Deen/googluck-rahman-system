@@ -33,6 +33,21 @@ class DesktopLocalApiContractTests(unittest.TestCase):
             boot.index("loadLoginBranding()"),
         )
 
+    def test_frontend_never_restores_cached_authentication_at_startup(self):
+        text = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        startup = text[text.index("let authToken"):text.index("// ----------", text.index("let authToken"))]
+        self.assertIn("let authToken = null", startup)
+        self.assertIn("let currentStaff = null", startup)
+        boot = text[text.index("(async function boot"):]
+        self.assertNotIn("enterApp().catch", boot)
+
+    def test_provisioning_does_not_request_an_offline_password(self):
+        html = FRONTEND_INDEX.read_text(encoding="utf-8")
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        self.assertNotIn("local-enrollment-password", html)
+        self.assertNotIn("local_password", script)
+        self.assertNotIn("offline access", html.lower())
+
     def test_tauri_surfaces_sidecar_spawn_errors(self):
         text = TAURI_LIB.read_text(encoding="utf-8")
         self.assertIn("fn glr_local_backend_status", text)

@@ -1,11 +1,11 @@
-"""First-run desktop enrollment and local credential provisioning tests."""
+"""First-run desktop enrollment and central-only authentication tests."""
 from pathlib import Path
 from unittest.mock import patch
 import tempfile
 import unittest
 
 from flask import Flask
-from werkzeug.security import check_password_hash
+import requests
 
 from app.extensions import db
 from app.models import Device, Shop, Staff, SyncState
@@ -54,7 +54,7 @@ class DesktopProvisioningTests(unittest.TestCase):
             db.session.remove()
         self.temp_dir.cleanup()
 
-    def test_enrollment_registers_centrally_and_creates_local_hash(self):
+    def test_enrollment_registers_centrally_without_local_auth_credential(self):
         identity = {
             "id": 7,
             "name": "Central Owner",
@@ -90,7 +90,6 @@ class DesktopProvisioningTests(unittest.TestCase):
                 json={
                     "central_email": "owner@example.test",
                     "central_password": "central-password",
-                    "local_password": "local-only-password",
                     "name": "Test Desktop",
                     "platform": "Windows",
                 },
@@ -107,7 +106,7 @@ class DesktopProvisioningTests(unittest.TestCase):
             staff = db.session.get(Staff, 7)
             self.assertEqual(device.shop_id, 1)
             self.assertEqual(staff.email, "owner@example.test")
-            self.assertTrue(check_password_hash(staff.password_hash, "local-only-password"))
+            self.assertEqual(staff.password_hash, "")
             self.assertNotEqual(staff.password_hash, "local-only-password")
             self.assertEqual(db.session.get(SyncState, "provisioning_state").value, "READY")
 
@@ -120,7 +119,6 @@ class DesktopProvisioningTests(unittest.TestCase):
                 json={
                     "central_email": "owner@example.test",
                     "central_password": "wrong-password",
-                    "local_password": "local-only-password",
                 },
             )
 
@@ -134,6 +132,103 @@ class DesktopProvisioningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["state"], "NOT_ENROLLED")
         self.assertTrue(response.get_json()["device_id"])
+
+    def test_local_login_uses_central_identity_not_sqlite_password(self):
+        with self.app.app_context():
+            db.session.add(Staff(
+                id=7,
+                shop_id=1,
+                name="Central Owner",
+                email="owner@example.test",
+                password_hash="",
+                role="owner",
+            ))
+            db.session.commit()
+        with patch("app.routes.auth.requests.post", return_value=_Response({
+            "token": "central-token",
+            "staff": {
+                "id": 7,
+                "name": "Central Owner",
+                "email": "owner@example.test",
+                "role": "owner",
+                "shop_id": 1,
+                "is_active": True,
+            },
+        })) as central_login:
+            response = self.app.test_client().post(
+                "/api/auth/login",
+                json={"email": "owner@example.test", "password": "central-password", "role_group": "owner"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["token"], "central-token")
+        self.assertEqual(central_login.call_args.kwargs["json"]["password"], "central-password")
+
+    def test_local_password_cannot_authenticate(self):
+        with self.app.app_context():
+            db.session.add(Staff(
+                id=8,
+                shop_id=1,
+                name="Local Only",
+                email="local@example.test",
+                password_hash="legacy-local-hash",
+                role="owner",
+            ))
+            db.session.commit()
+        with patch("app.routes.auth.requests.post", return_value=_Response({"error": "invalid"}, 401)):
+            response = self.app.test_client().post(
+                "/api/auth/login",
+                json={"email": "local@example.test", "password": "legacy-password", "role_group": "owner"},
+            )
+        self.assertEqual(response.status_code, 401)
+
+    def test_central_auth_timeout_is_distinct(self):
+        with patch("app.routes.auth.requests.post", side_effect=requests.Timeout):
+            response = self.app.test_client().post(
+                "/api/auth/login",
+                json={"email": "owner@example.test", "password": "central-password"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "central_auth_unavailable")
+
+    def test_central_auth_network_failure_is_distinct(self):
+        with patch("app.routes.auth.requests.post", side_effect=requests.ConnectionError):
+            response = self.app.test_client().post(
+                "/api/auth/login",
+                json={"email": "owner@example.test", "password": "central-password"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "central_auth_network")
+
+    def test_authenticated_session_requires_central_validation(self):
+        with patch("app.auth.requests.get", return_value=_Response({
+            "id": 7,
+            "name": "Central Owner",
+            "email": "owner@example.test",
+            "role": "owner",
+            "shop_id": 1,
+            "is_active": True,
+        })):
+            response = self.app.test_client().get(
+                "/api/auth/me",
+                headers={"Authorization": "Bearer central-token"},
+            )
+        self.assertEqual(response.status_code, 200)
+
+        with patch("app.auth.requests.get", side_effect=requests.Timeout):
+            response = self.app.test_client().get(
+                "/api/auth/me",
+                headers={"Authorization": "Bearer central-token"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "central_session_unavailable")
+
+        with patch("app.auth.requests.get", side_effect=requests.ConnectionError):
+            response = self.app.test_client().get(
+                "/api/auth/me",
+                headers={"Authorization": "Bearer central-token"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "central_session_network")
 
 
 if __name__ == "__main__":

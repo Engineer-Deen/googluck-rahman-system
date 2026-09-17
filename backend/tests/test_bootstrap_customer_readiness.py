@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from flask import Flask
 from werkzeug.security import check_password_hash
@@ -208,20 +208,26 @@ class CustomerFacingMessageTests(unittest.TestCase):
             db.engine.dispose()
 
     def test_staff_create_offline_message_is_customer_friendly(self):
-        from app.auth import issue_token
-
-        with self.app.app_context():
-            token = issue_token(db.session.get(Staff, 1))
-        response = self.app.test_client().post(
-            "/api/staff",
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "name": "New Seller",
-                "email": "new@customer.shop",
-                "password": "secret12",
-                "role": "cashier",
-            },
-        )
+        session_response = Mock(status_code=200)
+        session_response.json.return_value = {
+            "id": 1,
+            "name": "Admin",
+            "email": "admin@customer.shop",
+            "role": "admin",
+            "shop_id": 1,
+            "is_active": True,
+        }
+        with patch("app.auth.requests.get", return_value=session_response):
+            response = self.app.test_client().post(
+                "/api/staff",
+                headers={"Authorization": "Bearer central-token"},
+                json={
+                    "name": "New Seller",
+                    "email": "new@customer.shop",
+                    "password": "secret12",
+                    "role": "cashier",
+                },
+            )
         self.assertEqual(response.status_code, 403)
         message = response.get_json()["error"]
         self.assertNotIn("UNAUTHORIZED", message)

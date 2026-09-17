@@ -8,11 +8,11 @@ never contend with each other.
 """
 import datetime
 from functools import wraps
+import requests
 
 import jwt
 from flask import current_app, g, jsonify, request
 
-from app.extensions import db
 
 ALGORITHM = "HS256"
 
@@ -27,6 +27,50 @@ def _central_staff(staff_id):
     from app.firestore import get_firestore_sync_service
 
     return get_firestore_sync_service().get_staff(staff_id)
+
+
+def _central_session_staff(token):
+    central_url = current_app.config.get(
+        "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
+    ).rstrip("/")
+    try:
+        response = requests.get(
+            central_url + "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+    except requests.ConnectionError:
+        return None, jsonify(
+            error="Your session requires a connection to the central server.",
+            code="central_session_network",
+        ), 503
+    except requests.Timeout:
+        return None, jsonify(
+            error="Your session requires a connection to the central server.",
+            code="central_session_unavailable",
+        ), 503
+    except requests.RequestException:
+        return None, jsonify(
+            error="Your session requires a connection to the central server.",
+            code="central_session_unavailable",
+        ), 503
+    if response.status_code in (401, 403):
+        return None, jsonify(error="Session expired, please log in again"), 401
+    if response.status_code >= 500 or not 200 <= response.status_code < 300:
+        return None, jsonify(
+            error="Your session requires a connection to the central server.",
+            code="central_session_unavailable",
+        ), 503
+    try:
+        staff = response.json()
+    except ValueError:
+        return None, jsonify(
+            error="Your session requires a connection to the central server.",
+            code="central_session_unavailable",
+        ), 503
+    if not isinstance(staff, dict) or not staff.get("id"):
+        return None, jsonify(error="Invalid central session"), 401
+    return staff, None, None
 
 
 def issue_token(staff) -> str:
@@ -66,26 +110,28 @@ def login_required(fn):
         if not auth_header.startswith("Bearer "):
             return jsonify(error="Missing or invalid Authorization header"), 401
         token = auth_header.split(" ", 1)[1]
-        try:
-            payload = decode_token(token)
-        except jwt.ExpiredSignatureError:
-            return jsonify(error="Session expired, please log in again"), 401
-        except jwt.InvalidTokenError:
-            return jsonify(error="Invalid token"), 401
-
         if current_app.config.get("GLR_MODE") == "central":
+            try:
+                payload = decode_token(token)
+            except jwt.ExpiredSignatureError:
+                return jsonify(error="Session expired, please log in again"), 401
+            except jwt.InvalidTokenError:
+                return jsonify(error="Invalid token"), 401
             staff = _central_staff(payload.get("staff_id"))
+            if not staff or not _staff_value(staff, "is_active"):
+                return jsonify(error="Account is inactive, please log in again"), 401
+            if not _token_issued_after_staff_update(payload, staff):
+                return jsonify(error="Session is no longer valid, please log in again"), 401
+            if payload.get("role") != _staff_value(staff, "role") or payload.get("shop_id") != _staff_value(staff, "shop_id"):
+                return jsonify(error="Authorization changed, please log in again"), 401
         else:
-            from app.models import Staff
-            staff = db.session.get(Staff, payload.get("staff_id"))
-        if not staff or not _staff_value(staff, "is_active"):
-            return jsonify(error="Account is inactive, please log in again"), 401
-        if not _token_issued_after_staff_update(payload, staff):
-            return jsonify(error="Session is no longer valid, please log in again"), 401
-        if payload.get("role") != _staff_value(staff, "role") or payload.get("shop_id") != _staff_value(staff, "shop_id"):
-            return jsonify(error="Authorization changed, please log in again"), 401
+            staff, error_response, error_status = _central_session_staff(token)
+            if error_response:
+                return error_response, error_status
+            if not _staff_value(staff, "is_active"):
+                return jsonify(error="Account is inactive, please log in again"), 401
 
-        g.staff_id = _staff_value(staff, "id", payload.get("staff_id"))
+        g.staff_id = _staff_value(staff, "id")
         g.staff_role = _staff_value(staff, "role")
         g.staff_shop_id = _staff_value(staff, "shop_id")
         return fn(*args, **kwargs)

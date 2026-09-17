@@ -5,7 +5,7 @@ import json
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 from flask import Flask
@@ -53,8 +53,13 @@ class OfflineReconnectTests(unittest.TestCase):
                 StockMovement(id="stock-seed", product_id=1, shop_id=1, quantity_delta=5, reason="restock"),
             ])
             db.session.commit()
+        self.central_session_patch = patch(
+            "app.auth.requests.get", return_value=self._central_session_response()
+        )
+        self.central_session_patch.start()
 
     def tearDown(self):
+        self.central_session_patch.stop()
         with self.app.app_context():
             db.session.remove()
             db.engine.dispose()
@@ -62,12 +67,26 @@ class OfflineReconnectTests(unittest.TestCase):
         if device_path.exists():
             device_path.unlink()
 
+    def _central_session_response(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "id": 1, "name": "Cashier", "email": "cashier@offline.test",
+            "role": "cashier", "shop_id": 1, "is_active": True,
+        }
+        return response
+
     def _login(self):
         client = self.app.test_client()
-        response = client.post(
-            "/api/auth/login",
-            json={"email": "cashier@offline.test", "password": "secret", "role_group": "seller"},
-        )
+        central_response = Mock(status_code=200)
+        central_response.json.return_value = {"token": "central-1", "staff": {
+            "id": 1, "name": "Cashier", "email": "cashier@offline.test",
+            "role": "cashier", "shop_id": 1, "is_active": True,
+        }}
+        with patch("app.routes.auth.requests.post", return_value=central_response):
+            response = client.post(
+                "/api/auth/login",
+                json={"email": "cashier@offline.test", "password": "secret", "role_group": "seller"},
+            )
         self.assertEqual(response.status_code, 200)
         return client, {"Authorization": "Bearer " + response.get_json()["token"]}
 
