@@ -411,7 +411,10 @@ class FirestoreSyncService:
                 raise ValueError("Item quantity must be a whole number")
             if quantity <= 0:
                 raise ValueError("Item quantity must be greater than zero")
-            unit_price = Decimal(str(item.get("unit_price", product.get("unit_price", 0))))
+            raw_unit_price = item.get("unit_price")
+            if raw_unit_price is None:
+                raw_unit_price = product.get("unit_price", 0)
+            unit_price = Decimal(str(raw_unit_price))
             if unit_price <= 0:
                 raise ValueError("Item selling price must be greater than zero")
             subtotal = (unit_price * quantity).quantize(Decimal("0.01"))
@@ -525,7 +528,10 @@ class FirestoreSyncService:
                 quantity = int(item["quantity"])
                 if quantity <= 0:
                     raise ValueError("Item quantity must be greater than zero")
-                price = Decimal(str(item.get("unit_price", product.get("unit_price", 0))))
+                raw_unit_price = item.get("unit_price")
+                if raw_unit_price is None:
+                    raw_unit_price = product.get("unit_price", 0)
+                price = Decimal(str(raw_unit_price))
                 if price <= 0:
                     raise ValueError("Item selling price must be greater than zero")
                 subtotal = (price * quantity).quantize(Decimal("0.01"))

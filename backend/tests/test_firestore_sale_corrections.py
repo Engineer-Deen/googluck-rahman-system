@@ -38,6 +38,15 @@ class FirestoreSaleCorrectionTests(unittest.TestCase):
         self.assertEqual(self.service.stock_map([10], 1)[10], 3)
         self.assertEqual(len(self.client.collections["sale_items"]), 1)
 
+    def test_central_correction_uses_catalog_price_when_item_price_is_omitted(self):
+        with self._patches()[0], self._patches()[1]:
+            response = self.app.test_client().put("/api/sales/sale-1", headers={"Authorization": f"Bearer {self.token}"}, json={"reason": "Wrong quantity entered", "items": [{"product_id": 10, "quantity": 2}]})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["total_amount"], "20.00")
+        self.assertEqual(len(self.client.collections["sale_items"]), 1)
+        self.assertEqual(next(iter(self.client.collections["sale_items"].values()))["unit_price"], "10.00")
+
     def test_central_void_reverses_stock_writes_audit_and_is_idempotent(self):
         headers = {"Authorization": f"Bearer {self.token}"}
         with self._patches()[0], self._patches()[1]:
