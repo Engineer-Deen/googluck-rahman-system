@@ -90,7 +90,6 @@ class LocalConfig(BaseConfig):
     Local mode accepts only the deliberate LOCAL_DATABASE_URL override and
     otherwise uses the packaged SQLite database path.
     """
-    INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
     # Used by create_app() to provision only a brand-new frozen local install.
     BOOTSTRAP_INITIAL_LOCAL_DATA = IS_FROZEN
     SQLALCHEMY_DATABASE_URI = os.environ.get(
@@ -164,4 +163,5 @@ def get_config():
                 "GOOGLE_APPLICATION_CREDENTIALS"
             )
         return CentralConfig
+    INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
     return LocalConfig
