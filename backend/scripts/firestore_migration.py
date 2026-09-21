@@ -1,11 +1,3 @@
-"""Historical one-time SQL-to-Firestore migration utility.
-
-This script is not part of the Flask runtime and has no application startup
-caller. Keep it available for legacy data migrations; run it only against an
-explicitly prepared local SQL source and a configured Firestore destination.
-It must not be used as a central runtime provider or deployment dependency.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -241,9 +233,7 @@ def _run_migration(dry_run: bool = True) -> dict[str, Any]:
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(
-        description="Historical helper for migrating legacy SQL data into Firestore safely."
-    )
+    parser = argparse.ArgumentParser(description="Copy PostgreSQL business data to Firestore safely.")
     parser.add_argument("--dry-run", action="store_true", help="Do not write anything to Firestore, just compare and report.")
     parser.add_argument("--execute", action="store_true", help="Perform the actual Firestore backfill.")
     parser.add_argument("--json-output", action="store_true", help="Print formatted JSON summary.")
