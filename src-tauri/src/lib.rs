@@ -340,7 +340,7 @@ pub fn run() {
                 .expect("failed to create backend sidecar command")
                 .env("GLR_MODE", "local")
                 .env("PORT", "5000")
-                .env("CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com");
+                .env("CENTRAL_SYNC_URL", "https://goodluck-rahman-api.vercel.app");
 
             match sidecar_command.spawn() {
                 Ok((_rx, child)) => {
