@@ -70,6 +70,46 @@ class FirestoreSalesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("sale-over", self.client.collections["sales"])
 
+    def test_central_sales_listing_applies_period_search_and_incomplete_filters(self):
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        self.client.collections["sales"].update({
+            "sale-today": {
+                "id": "sale-today", "shop_id": 1, "customer_name": "Alice",
+                "invoice_number": "INV-TODAY", "total_amount": "20.00",
+                "created_at": now - timedelta(hours=1),
+            },
+            "sale-yesterday": {
+                "id": "sale-yesterday", "shop_id": 1, "customer_name": "Bob",
+                "invoice_number": "INV-YESTERDAY", "total_amount": "15.00",
+                "created_at": now - timedelta(days=1, hours=1),
+            },
+            "sale-old": {
+                "id": "sale-old", "shop_id": 1, "customer_name": "Carol",
+                "invoice_number": "INV-OLD", "total_amount": "30.00",
+                "created_at": now - timedelta(days=40),
+            },
+        })
+        self.client.collections["sale_payments"]["payment-today"] = {
+            "id": "payment-today", "sale_id": "sale-today", "amount": "20.00"
+        }
+        self.client.collections["sale_payments"]["payment-old"] = {
+            "id": "payment-old", "sale_id": "sale-old", "amount": "10.00"
+        }
+
+        today = self.service.list_sale_graphs(shop_id=1, period="today")
+        self.assertEqual([graph["sale"]["id"] for graph in today], ["sale-today"])
+
+        searched = self.service.list_sale_graphs(shop_id=1, search="bob")
+        self.assertEqual([graph["sale"]["id"] for graph in searched], ["sale-yesterday"])
+
+        incomplete = self.service.list_sale_graphs(shop_id=1, status="incomplete")
+        self.assertEqual(
+            {graph["sale"]["id"] for graph in incomplete},
+            {"sale-yesterday", "sale-old"},
+        )
+
     def test_central_sales_listing_parses_limit_and_preserves_shop_scope(self):
         cashier = {"id": 2, "name": "Cashier", "email": "cashier@test", "role": "cashier", "shop_id": 1, "is_active": True, "updated_at": datetime(2020, 1, 1, tzinfo=timezone.utc), "password_hash": generate_password_hash("secret")}
         self.client.collections["staff"]["2"] = cashier

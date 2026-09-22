@@ -228,7 +228,16 @@ class CustomerFacingMessageTests(unittest.TestCase):
                     "role": "cashier",
                 },
             )
-        self.assertEqual(response.status_code, 403)
+        # This request is authenticated (the session check above is mocked to
+        # succeed) but the actual staff-creation call to central is not mocked,
+        # so it genuinely cannot reach central here -- 503, not 403, is the
+        # correct status for "this shop computer has no route to the internet
+        # right now". A flat 403 regardless of real connectivity was the
+        # original bug: it showed even when the shop PC was online. The
+        # frontend shows this same friendly message for both 403 and 503 and
+        # does not log the user out for it, so the status code change here is
+        # not user-visible.
+        self.assertEqual(response.status_code, 503)
         message = response.get_json()["error"]
         self.assertNotIn("UNAUTHORIZED", message)
         self.assertNotIn("central server", message.lower())

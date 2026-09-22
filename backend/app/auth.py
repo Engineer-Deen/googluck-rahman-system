@@ -7,6 +7,8 @@ carries its own proof of identity (the token), so concurrent logins
 never contend with each other.
 """
 import datetime
+import hashlib
+import time
 from functools import wraps
 import requests
 
@@ -29,7 +31,7 @@ def _central_staff(staff_id):
     return get_firestore_sync_service().get_staff(staff_id)
 
 
-def _central_session_staff(token):
+def _fetch_central_session_staff(token):
     central_url = current_app.config.get(
         "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
     ).rstrip("/")
@@ -71,6 +73,36 @@ def _central_session_staff(token):
     if not isinstance(staff, dict) or not staff.get("id"):
         return None, jsonify(error="Invalid central session"), 401
     return staff, None, None
+
+
+def _central_session_staff(token):
+    """
+    Validate a local-mode session against central.
+
+    Central stays the authority: every request is still checked, and a 401/403
+    from central always ends the session. Only when central is unreachable or
+    failing (503) can an operator opt in, with LOCAL_SESSION_OFFLINE_GRACE_HOURS,
+    to let a session that central validated earlier keep working for that many
+    hours -- so a shop's internet blip doesn't log the cashier out mid-sale.
+    The default is 0 (strict: no central, no session). Cached identities live
+    in memory only, per process, so a restart requires a fresh online login.
+    """
+    staff, error_response, error_status = _fetch_central_session_staff(token)
+    cache = current_app.extensions.setdefault("glr_session_cache", {})
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if staff is not None:
+        if len(cache) > 200:
+            cache.pop(next(iter(cache)), None)
+        cache[key] = (dict(staff), time.monotonic())
+        return staff, None, None
+    if error_status == 401:
+        cache.pop(key, None)  # central says the session is dead: never fall back
+    elif error_status == 503:
+        grace = float(current_app.config.get("LOCAL_SESSION_OFFLINE_GRACE_SECONDS", 0) or 0)
+        cached = cache.get(key)
+        if grace > 0 and cached and time.monotonic() - cached[1] <= grace:
+            return dict(cached[0]), None, None
+    return None, error_response, error_status
 
 
 def issue_token(staff) -> str:

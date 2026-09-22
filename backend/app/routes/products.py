@@ -21,6 +21,7 @@ CATEGORY_CODES = {
 
 from app.audit import log_action
 from app.auth import login_required, roles_required
+from app.central_proxy import forward_to_central
 from app.extensions import db
 from app.models import Product, StockMovement, Staff
 
@@ -76,22 +77,42 @@ def serialize_product(p, include_stock=True, role=None, stock_value=None):
     return data
 
 
-def _require_central_mode():
+PRODUCT_OFFLINE_MESSAGE = (
+    "Products can only be added or edited while this shop computer is online. "
+    "Connect to the internet and try again; the change will then appear here "
+    "automatically."
+)
+
+
+def _mirror_product_locally(body):
     """
-    Products are reference data, pulled down (read-only) to local
-    devices via app/sync/worker.py rather than created there -- see the
-    explanation in models/core.py for why. Returns an error response if
-    this call is running in local mode, else None.
+    Put the product central just saved into this PC's own database right away,
+    so it shows up in Inventory and can be stocked and sold without waiting for
+    the next sync. Central's reply only carries cost_price for finance roles;
+    the sync pull fills in anything missing and remains the source of truth.
     """
-    if current_app.config["GLR_MODE"] != "central":
-        return jsonify(
-            error=(
-                "Products can only be added or edited while online. Connect to "
-                "the internet, update the catalogue, and the change will sync "
-                "to this shop computer automatically."
-            )
-        ), 403
-    return None
+    try:
+        product_id = int(body["id"])
+        product = db.session.get(Product, product_id)
+        if product is None:
+            product = Product(id=product_id, sku=body["sku"], name=body["name"])
+            db.session.add(product)
+        product.sku = body.get("sku", product.sku)
+        product.name = body.get("name", product.name)
+        product.category = body.get("category", product.category)
+        if body.get("unit_price") is not None:
+            product.unit_price = body["unit_price"]
+        if body.get("cost_price") is not None:
+            product.cost_price = body["cost_price"]
+        product.is_active = bool(body.get("is_active", True))
+        db.session.commit()
+    except Exception:  # local cache only -- central already succeeded
+        db.session.rollback()
+    try:
+        from app.sync.worker import trigger_sync_soon
+        trigger_sync_soon(current_app._get_current_object())
+    except Exception:
+        pass
 
 
 @products_bp.get("")
@@ -136,9 +157,11 @@ def get_product(product_id):
 @products_bp.post("")
 @roles_required("owner", "admin", "manager")
 def create_product():
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if current_app.config["GLR_MODE"] != "central":
+        body, response = forward_to_central("POST", "/api/products", PRODUCT_OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_product_locally(body)
+        return response
 
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
@@ -159,7 +182,7 @@ def create_product():
         from app.firestore import get_firestore_sync_service
         service = get_firestore_sync_service()
         product_id = service._allocate_product_id()
-        product = service.save_product(product_id, sku=f"GLR-{CATEGORY_CODES[category]}-{product_id:06d}", name=name, category=category, unit_price=str(unit_price), cost_price=str(cost_price), is_active=True, shop_ids=[])
+        product = service.save_product(product_id, sku=f"GLR-{CATEGORY_CODES[category]}-{product_id:06d}", name=name, category=category, unit_price=str(unit_price), cost_price=str(cost_price), is_active=True, shop_ids=[g.staff_shop_id] if g.staff_shop_id else [])
         service.write_audit(f"product-created-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_created", entity_type="product", entity_id=str(product_id), details={"sku": product["sku"], "name": name, "category": category})
         return jsonify(serialize_product(product, role=g.staff_role, stock_value=0)), 201
     product = Product(
@@ -184,9 +207,11 @@ def create_product():
 @products_bp.put("/<int:product_id>")
 @roles_required("owner", "admin", "manager")
 def update_product(product_id):
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if current_app.config["GLR_MODE"] != "central":
+        body, response = forward_to_central("PUT", f"/api/products/{product_id}", PRODUCT_OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_product_locally(body)
+        return response
 
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service
@@ -262,9 +287,11 @@ def delete_product(product_id):
     stops appearing for new sales but its full history stays intact,
     and it can be reactivated later via PUT with is_active:true.
     """
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if current_app.config["GLR_MODE"] != "central":
+        body, response = forward_to_central("DELETE", f"/api/products/{product_id}", PRODUCT_OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_product_locally(body)
+        return response
 
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service

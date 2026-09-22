@@ -4,6 +4,7 @@ import json
 
 from app.auth import login_required, roles_required
 from app.audit import log_action
+from app.central_proxy import forward_to_central
 from app.extensions import db
 from app.models import Shop, Staff, SystemSetting
 
@@ -13,6 +14,9 @@ DEFAULT_SETTINGS = {
     "timeout_minutes": 15,
     "full_login_hours": 8,
 }
+
+SHOP_OFFLINE_MESSAGE = "Shop name and logo can only be saved while online. Connect to the internet and try again."
+SETTINGS_OFFLINE_MESSAGE = "These system settings can only be saved while online. Connect to the internet and try again."
 
 
 def _get_setting(key, default=None):
@@ -45,6 +49,40 @@ def _set_setting(key, value):
         db.session.add(row)
     row.value = json.dumps(value)
 
+
+
+def _mirror_shop_locally(body):
+    """Reflect the shop details central just saved in this PC's own copy."""
+    try:
+        shop = db.session.get(Shop, body.get("id")) if body.get("id") else Shop.query.first()
+        if shop:
+            shop.name = body.get("name", shop.name)
+            shop.location = body.get("location", shop.location)
+            db.session.commit()
+    except Exception:  # local cache only -- central already succeeded
+        db.session.rollback()
+
+
+def _mirror_settings_locally(body, sent):
+    """
+    Settings are not part of the sync pull, and the quick-unlock PIN hash is
+    checked locally by /api/auth/verify-pin, so after central accepts a save
+    this PC records the same values for itself.
+    """
+    try:
+        _set_setting("admin_timeout_minutes", int(body["timeout_minutes"]))
+        _set_setting("admin_full_login_hours", int(body["full_login_hours"]))
+        pin = str(sent.get("pin") or "").strip()
+        if pin:
+            from werkzeug.security import generate_password_hash
+            staff = db.session.get(Staff, g.staff_id)
+            if staff:
+                staff.quick_pin_hash = generate_password_hash(pin)
+                staff.quick_pin_failed_attempts = 0
+                staff.quick_pin_locked_until = None
+        db.session.commit()
+    except Exception:  # local cache only -- central already succeeded
+        db.session.rollback()
 
 
 @shop_bp.get("/public")
@@ -84,7 +122,10 @@ def get_shop():
 @roles_required("owner", "admin")
 def update_shop():
     if current_app.config["GLR_MODE"] != "central":
-        return jsonify(error="Shop name and logo can only be saved while online. Connect to the internet and try again."), 403
+        body, response = forward_to_central("PUT", "/api/shop", SHOP_OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_shop_locally(body)
+        return response
     service = None
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service
@@ -138,7 +179,10 @@ def get_system_settings():
 @roles_required("owner", "admin")
 def save_system_settings():
     if current_app.config["GLR_MODE"] != "central":
-        return jsonify(error="These system settings can only be saved while online. Connect to the internet and try again."), 403
+        body, response = forward_to_central("PUT", "/api/shop/settings", SETTINGS_OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_settings_locally(body, request.get_json(silent=True) or {})
+        return response
 
     data = request.get_json(silent=True) or {}
     try:

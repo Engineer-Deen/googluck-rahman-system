@@ -14,7 +14,9 @@ from app.models import (
 )
 from app.sync.device import get_current_device_id
 
-SYNC_INTERVAL_SECONDS = 5
+SYNC_INTERVAL_SECONDS = 5      # push cadence -- costs nothing while the outbox is empty
+PULL_INTERVAL_SECONDS = 60     # every pull costs central database reads, so keep it slow
+MAX_BACKOFF_SECONDS = 15 * 60  # ceiling when the central server keeps failing
 BATCH_SIZE = 50
 REQUEST_TIMEOUT_SECONDS = 8
 LAST_PULL_KEY = "last_pull_at"
@@ -310,13 +312,41 @@ def pull_reference_data_once(app) -> dict:
         }
 
 
+def backoff_delay(base_seconds, consecutive_failures):
+    """Wait `base` normally; double per consecutive failure, capped."""
+    if consecutive_failures <= 0:
+        return base_seconds
+    return min(MAX_BACKOFF_SECONDS, base_seconds * (2 ** consecutive_failures))
+
+
+def _last_pull_failed(app):
+    with app.app_context():
+        row = db.session.get(SyncState, "last_pull_error")
+        return bool(row and row.value)
+
+
 def start_background_sync(app):
+    """
+    Push pending sales quickly, pull reference data slowly, and back off when
+    central is failing. Previously both ran every 5 seconds forever, even while
+    central was returning errors, which hammered the central database (17,000+
+    pulls a day per PC) and exhausted the Firestore daily quota.
+    """
     def loop():
+        push_failures = pull_failures = 0
+        next_push = next_pull = 0.0
         while True:
             try:
                 if app.config.get("GLR_MODE") == "local":
-                    push_pending_once(app)
-                    pull_reference_data_once(app)
+                    now = time.monotonic()
+                    if now >= next_push:
+                        result = push_pending_once(app)
+                        push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
+                        next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
+                    if now >= next_pull:
+                        pull_reference_data_once(app)
+                        pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
+                        next_pull = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
             except Exception:
                 pass
             time.sleep(SYNC_INTERVAL_SECONDS)

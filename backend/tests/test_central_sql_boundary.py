@@ -71,7 +71,7 @@ class CentralService:
     def update_staff_auth_state(self, staff_id, **fields):
         self.staff.update(fields)
 
-    def list_sale_graphs(self, shop_id=None, limit=100):
+    def list_sale_graphs(self, shop_id=None, limit=100, period="all", search="", status=None):
         if shop_id is not None and self.graph["sale"]["shop_id"] != shop_id:
             return []
         return [self.graph][:limit]

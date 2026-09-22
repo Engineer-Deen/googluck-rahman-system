@@ -1,84 +1,48 @@
-# ==============================
-# Python
-# ==============================
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Environment / secrets
+# ============================================================
+#  SECRETS - must NEVER be committed
+# ============================================================
 .env
 .env.*
 !.env.example
+secrets/
+*firebase-adminsdk*.json
+*service-account*.json
+*.pem
+*.key
 
-# Flask / local instance
+# ============================================================
+#  Per-PC data. Each shop computer creates its own; committing
+#  these would ship your test data and device identity.
+# ============================================================
 instance/
 *.sqlite
 *.sqlite3
 *.db
-*.db-journal
+device_id.txt
 
-# PyInstaller
+# ============================================================
+#  Python
+# ============================================================
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ============================================================
+#  Build output, logs and scratch/diagnostic files
+# ============================================================
 build/
 dist/
-*.spec
-!backend/goodluck-backend.spec
-
-# ==============================
-# Node
-# ==============================
 node_modules/
-npm-debug.log*
-yarn-debug.log*
-pnpm-debug.log*
-
-# ==============================
-# IDE
-# ==============================
-.idea/
-.vscode/
-*.iml
-
-# ==============================
-# Tauri / Rust
-# ==============================
-src-tauri/target/
-
-# Keep Tauri source, but don't commit generated build artifacts
-src-tauri/gen/
-
-# ==============================
-# OS
-# ==============================
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ==============================
-# Logs
-# ==============================
 *.log
+glr-postgres-sync-*/
+glr-sqlite-probe-*/
+e2e_desktop_report.json
 
-# ==============================
-# Temporary files
-# ==============================
-*.tmp
-*.temp
-
-# ==============================
-# Updater signing (NEVER commit private keys)
-# ==============================
-*.key
-*.key.pub
-.glr-updater-keys/
-secrets/
-*.json
-firebase-service-account.json
-firebase-adminsdk*.json
-!backend/vercel.json
+# ============================================================
+#  Tooling
+# ============================================================
+.vercel/
+.vscode/
+.idea/

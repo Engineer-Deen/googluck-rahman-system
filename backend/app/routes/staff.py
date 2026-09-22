@@ -24,6 +24,7 @@ import uuid
 
 from app.audit import log_action
 from app.auth import roles_required
+from app.central_proxy import forward_to_central, is_local_mode
 from app.extensions import db
 from app.models import Shop, Staff
 
@@ -33,16 +34,26 @@ ASSIGNABLE_ROLES = ("cashier", "manager")
 ADMIN_ROLES = ("admin",)
 
 
-def _require_central_mode():
-    if current_app.config["GLR_MODE"] != "central":
-        return jsonify(
-            error=(
-                "Staff accounts can only be added or changed while this shop "
-                "computer is online. Connect to the internet, make the change, "
-                "and it will sync to your other devices automatically."
-            )
-        ), 403
-    return None
+OFFLINE_MESSAGE = (
+    "Staff accounts can only be added or changed while this shop computer is "
+    "online. Connect to the internet, make the change, and it will sync to "
+    "your other devices automatically."
+)
+
+
+def _mirror_staff_locally(body):
+    """
+    Keep this PC's own staff list in step with what central just saved.
+
+    The sync pull deliberately carries no credentials and skips staff rows this
+    PC has never seen, so without this a newly created account would not show
+    up in the Staff list here until that person logs in on this PC.
+    """
+    from app.routes.auth import _cache_central_identity
+    try:
+        _cache_central_identity(body)
+    except Exception:  # local cache only -- central already succeeded
+        db.session.rollback()
 
 
 def serialize_staff(s: Staff):
@@ -74,9 +85,11 @@ def list_staff():
 @staff_bp.post("")
 @roles_required("owner", "admin")
 def create_staff():
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if is_local_mode():
+        body, response = forward_to_central("POST", "/api/staff", OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_staff_locally(body)
+        return response
 
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
@@ -136,9 +149,11 @@ def create_staff():
 @roles_required("owner")
 def create_admin():
     """Owner-only creation of an administrator account."""
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if is_local_mode():
+        body, response = forward_to_central("POST", "/api/staff/admins", OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_staff_locally(body)
+        return response
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip().lower()
@@ -171,9 +186,11 @@ def create_admin():
 @staff_bp.put("/<int:staff_id>")
 @roles_required("owner", "admin")
 def update_staff(staff_id):
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if is_local_mode():
+        body, response = forward_to_central("PUT", f"/api/staff/{staff_id}", OFFLINE_MESSAGE)
+        if body is not None:
+            _mirror_staff_locally(body)
+        return response
 
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service
@@ -235,9 +252,12 @@ def update_staff(staff_id):
 @staff_bp.post("/<int:staff_id>/reset-password")
 @roles_required("owner", "admin")
 def reset_password(staff_id):
-    blocked = _require_central_mode()
-    if blocked:
-        return blocked
+    if is_local_mode():
+        # Passwords never live on the shop PC, so there is nothing to mirror.
+        _, response = forward_to_central(
+            "POST", f"/api/staff/{staff_id}/reset-password", OFFLINE_MESSAGE
+        )
+        return response
 
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service

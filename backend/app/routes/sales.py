@@ -462,7 +462,16 @@ def list_sales():
         from app.firestore import get_firestore_sync_service
         service = get_firestore_sync_service()
         shop_id = None if g.staff_role == "owner" else g.staff_shop_id
-        graphs = service.list_sale_graphs(shop_id=shop_id, limit=limit)
+        period = (request.args.get("period") or "all").lower()
+        search = (request.args.get("search") or "").strip()
+        status_filter = (request.args.get("status") or "").lower()
+        graphs = service.list_sale_graphs(
+            shop_id=shop_id,
+            limit=limit,
+            period=period,
+            search=search,
+            status=status_filter,
+        )
         return jsonify([serialize_firestore_sale(graph, role=g.staff_role, service=service) for graph in graphs])
     q = Sale.query
     if g.staff_role != "owner":

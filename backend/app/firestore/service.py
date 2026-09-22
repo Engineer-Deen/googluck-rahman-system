@@ -12,7 +12,7 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -367,13 +367,72 @@ class FirestoreSyncService:
                 payments.append(payment)
         return {"sale": sale, "items": items, "payments": payments}
 
-    def list_sale_graphs(self, shop_id=None, limit=100) -> list[dict]:
-        sales = []
-        for snapshot in self._collection("sales").stream():
-            sale = snapshot.to_dict() or {}
+    def list_sale_graphs(self, shop_id=None, limit=100, period="all", search="", status=None) -> list[dict]:
+        """
+        Mirrors the SQL branch of GET /api/sales in app/routes/sales.py:
+        the same period windows, the same two search fields, and "incomplete"
+        meaning not voided and not yet fully paid. Kept in one place so the
+        desktop (SQLite) and cloud (Firestore) listings can never drift apart.
+        """
+        period = (period or "all").lower()
+        search = (search or "").strip().lower()
+        status = (status or "").lower()
+        now = _utcnow()
+        window_start = {
+            "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
+            "7days": now - timedelta(days=7),
+            "7_days": now - timedelta(days=7),
+            "30days": now - timedelta(days=30),
+            "30_days": now - timedelta(days=30),
+            "month": now - timedelta(days=30),
+            "year": now - timedelta(days=365),
+        }.get(period)
+        yesterday_start = yesterday_end = None
+        if period == "yesterday":
+            yesterday_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday_start = yesterday_end - timedelta(days=1)
+
+        def created_at_of(sale):
+            value = sale.get("created_at")
+            if isinstance(value, str):
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if isinstance(value, datetime) and value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value
+
+        def matches(sale):
             if shop_id is not None and sale.get("shop_id") != shop_id:
-                continue
-            sales.append(sale)
+                return False
+            created_at = created_at_of(sale)
+            if window_start is not None and (created_at is None or created_at < window_start):
+                return False
+            if yesterday_start is not None:
+                if created_at is None or not (yesterday_start <= created_at < yesterday_end):
+                    return False
+            if search:
+                haystack = f'{sale.get("customer_name") or ""} {sale.get("invoice_number") or ""}'.lower()
+                if search not in haystack:
+                    return False
+            return True
+
+        sales = [sale for sale in (snapshot.to_dict() or {} for snapshot in self._collection("sales").stream()) if matches(sale)]
+
+        if status == "incomplete":
+            paid_by_sale = {}
+            for snapshot in self._collection("sale_payments").stream():
+                payment = snapshot.to_dict() or {}
+                sale_id = str(payment.get("sale_id"))
+                paid_by_sale[sale_id] = paid_by_sale.get(sale_id, Decimal("0")) + Decimal(str(payment.get("amount") or "0"))
+
+            def is_incomplete(sale):
+                if sale.get("voided_at"):
+                    return False
+                paid = paid_by_sale.get(str(sale.get("id")), Decimal("0"))
+                total = Decimal(str(sale.get("total_amount") or "0"))
+                return total > paid
+
+            sales = [sale for sale in sales if is_incomplete(sale)]
+
         sales.sort(key=lambda sale: _iso(sale.get("created_at")) or "", reverse=True)
         result = []
         for sale in sales[:limit]:
@@ -786,8 +845,74 @@ class FirestoreSyncService:
 
         raise ValueError(f"Unknown table_name '{table_name}'")
 
+    def _changed_since(self, name, since):
+        """
+        Documents changed since the cursor, filtered by the database itself.
+        A range filter on the single field `updated_at` uses Firestore's
+        automatic index (no composite index needed) and bills only for the
+        documents returned, so an idle shop costs ~0 reads per pull.
+        """
+        return [doc.to_dict() or {} for doc in self._collection(name).where("updated_at", ">=", since).stream()]
+
+    def _pull_incremental(self, shop_id: int, since: datetime) -> dict:
+        """Same response as a full pull, but only reads documents that changed."""
+        def changed(name, keep):
+            return [value for value in self._changed_since(name, since) if keep(value)]
+
+        rows = {
+            "shops": changed("shops", lambda v: v.get("id") == shop_id),
+            "staff": changed("staff", lambda v: v.get("shop_id") == shop_id),
+            "products": changed("products", lambda v: shop_id in (v.get("shop_ids") or [])),
+            "sales": changed("sales", lambda v: v.get("shop_id") == shop_id),
+            "payments": changed("sale_payments", lambda v: v.get("shop_id") == shop_id),
+            "stock_movements": changed("stock_movements", lambda v: v.get("shop_id") == shop_id),
+            "settings": self._changed_since("system_settings", since),
+        }
+
+        all_values = [value.get("updated_at") for values in rows.values() for value in values if value.get("updated_at")]
+        high_watermark = max((_iso(value) for value in all_values), default=None)
+
+        sale_ids = [sale["id"] for sale in rows["sales"] if sale.get("id") is not None]
+        sale_items = []
+        for start in range(0, len(sale_ids), 30):  # Firestore `in` allows 30 values
+            chunk = sale_ids[start:start + 30]
+            for doc in self._collection("sale_items").where("sale_id", "in", chunk).stream():
+                sale_items.append(doc.to_dict() or {})
+
+        # Child rows that crossed the cursor still need their product parent,
+        # even when the product itself is unchanged. Fetch just those by id.
+        needed_product_ids = {
+            str(value.get("product_id"))
+            for value in (*rows["stock_movements"], *sale_items)
+            if value.get("product_id") is not None
+        }
+        products_by_id = {str(product.get("id")): product for product in rows["products"]}
+        for product_id in needed_product_ids - products_by_id.keys():
+            snapshot = self._collection("products").document(product_id).get()
+            product = snapshot.to_dict() if snapshot.exists else None
+            if product and shop_id in (product.get("shop_ids") or []):
+                products_by_id[product_id] = product
+        rows["products"] = list(products_by_id.values())
+
+        rows["staff"] = [_clean_staff({**staff, "shop_id": shop_id}) for staff in rows["staff"]]
+
+        return {
+            "next_cursor": high_watermark or _iso(since),
+            "server_time": _iso(_utcnow()),
+            "shops": rows["shops"],
+            "staff": rows["staff"],
+            "settings": rows["settings"],
+            "products": rows["products"],
+            "sales": rows["sales"],
+            "sale_items": sale_items,
+            "payments": rows["payments"],
+            "stock_movements": rows["stock_movements"],
+        }
+
     def pull(self, shop_id: int, since: datetime | None) -> dict:
         """Return the existing pull response shape, filtered to one shop."""
+        if since:
+            return self._pull_incremental(shop_id, since)
         collections = {
             "shops": list(self._collection("shops").where("id", "==", shop_id).stream()),
             "staff": list(self._collection("staff").where("shop_id", "==", shop_id).stream()),

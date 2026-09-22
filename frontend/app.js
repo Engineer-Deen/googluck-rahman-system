@@ -253,6 +253,13 @@ function retryCentralConnection() {
   doLogin();
 }
 
+const PROVISIONING_STATE_LABELS = {
+  NOT_ENROLLED: "Not enrolled",
+  "ENROLLED / PROVISIONING": "Setting up...",
+  READY: "Ready",
+  SYNC_ERROR: "Sync error - check connection",
+};
+
 async function loadProvisioningStatus() {
   const panel = document.getElementById("provisioning-panel");
   const stateEl = document.getElementById("provisioning-state");
@@ -262,14 +269,14 @@ async function loadProvisioningStatus() {
     const res = await fetch(API_BASE + "/sync/provisioning/status");
     const data = await res.json();
     const state = data.state || "NOT_ENROLLED";
-    stateEl.textContent = state;
+    stateEl.textContent = PROVISIONING_STATE_LABELS[state] || state;
     deviceEl.textContent = data.device_id ? `Device: ${data.device_id}` : "";
     panel.style.display = state === "READY" ? "none" : "block";
     if (state === "SYNC_ERROR" && data.last_pull_error) {
       document.getElementById("provisioning-error").textContent = data.last_pull_error;
     }
   } catch (_) {
-    stateEl.textContent = "SYNC ERROR";
+    stateEl.textContent = PROVISIONING_STATE_LABELS.SYNC_ERROR;
     panel.style.display = "block";
   }
 }
@@ -1595,8 +1602,10 @@ async function pollSyncStatus() {
       : data.sync_error_kind === "DEVICE_NOT_AUTHORIZED"
         ? "Device not authorized"
         : data.sync_error_kind === "RENDER_UNREACHABLE"
-          ? "Render unreachable - retrying"
-          : null;
+          ? "Central server unreachable - retrying"
+          : data.sync_error_kind === "SYNC_AUTH_FAILED"
+            ? "Sync key rejected - owner review needed"
+            : null;
 
     if (specificErrorLabel) {
       label.textContent = specificErrorLabel;
@@ -1608,7 +1617,7 @@ async function pollSyncStatus() {
       label.textContent = "Sync failed - owner review needed";
       dot.classList.remove("online");
     } else if (key === "pending") {
-      label.textContent = "Syncing";
+      label.textContent = "Syncing...";
       dot.classList.add("online");
     } else {
       label.textContent = "Synced";

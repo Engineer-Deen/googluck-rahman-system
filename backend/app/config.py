@@ -24,8 +24,6 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 
-load_dotenv(BASE_DIR / ".env", override=False)
-
 
 def _local_instance_dir() -> Path:
     """Return the writable directory for local SQLite and device state."""
@@ -42,6 +40,23 @@ def _local_instance_dir() -> Path:
 
 
 INSTANCE_DIR = _local_instance_dir()
+
+# Configuration sources, highest priority first (override=False means the first
+# value found wins, and real environment variables always beat both files):
+#   1. real environment variables
+#   2. <app-data folder>\.env  -- per-PC settings (on Windows installs this is
+#      %LOCALAPPDATA%\Good Luck Rahman Enterprise\.env, next to the local
+#      database and device id). This is where an installed shop PC is configured.
+#   3. .env beside the code     -- convenient for development
+load_dotenv(INSTANCE_DIR / ".env", override=False)
+load_dotenv(BASE_DIR / ".env", override=False)
+
+# An installed (frozen) build should never quietly fall back to "localhost" for
+# the central server; that is what produces "server can't be reached" on a
+# customer PC that has no config file. Override with CENTRAL_SYNC_URL if needed.
+DEFAULT_CENTRAL_SYNC_URL = (
+    "https://goodluck-rahman-api.vercel.app" if IS_FROZEN else "http://localhost:8000"
+)
 
 
 def server_host(mode):
@@ -60,11 +75,15 @@ class BaseConfig:
 
     # Where the central server lives, so local devices know where to push
     # their outbox. Can be a cloud URL or a LAN address for a shop server.
-    CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", "http://localhost:8000")
+    CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", DEFAULT_CENTRAL_SYNC_URL)
 
     # Shared secret local devices send when pushing to the central
     # server's /api/sync/push endpoint. Must match on both sides.
     SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
+
+    # 0 = strict (a session needs central on every request). Set e.g. 12 to let
+    # an already-validated session survive that many hours of central outage.
+    LOCAL_SESSION_OFFLINE_GRACE_SECONDS = int(float(os.environ.get("LOCAL_SESSION_OFFLINE_GRACE_HOURS", "0") or 0) * 3600)
 
     # Optional comma-separated exact origins for browser clients. Leave blank
     # for local desktop/browser development, which keeps the existing permissive
@@ -108,8 +127,9 @@ def _apply_runtime_config_values():
     BaseConfig.JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-jwt-secret-change-me")
     BaseConfig.SQLALCHEMY_TRACK_MODIFICATIONS = False
     BaseConfig.DEVICE_ID_FILE = INSTANCE_DIR / "device_id.txt"
-    BaseConfig.CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", "http://localhost:8000")
+    BaseConfig.CENTRAL_SYNC_URL = os.environ.get("CENTRAL_SYNC_URL", DEFAULT_CENTRAL_SYNC_URL)
     BaseConfig.SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
+    BaseConfig.LOCAL_SESSION_OFFLINE_GRACE_SECONDS = int(float(os.environ.get("LOCAL_SESSION_OFFLINE_GRACE_HOURS", "0") or 0) * 3600)
     BaseConfig.CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "")
     BaseConfig.CENTRAL_DATA_PROVIDER = "firestore"
     BaseConfig.FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")

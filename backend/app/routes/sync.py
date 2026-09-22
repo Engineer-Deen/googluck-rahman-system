@@ -42,17 +42,37 @@ def _check_sync_key() -> bool:
     return bool(expected) and key == expected
 
 
+DEVICE_LAST_SEEN_REFRESH_SECONDS = 300
+
+
+def _seen_recently(value, now):
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return 0 <= (now - value).total_seconds() < DEVICE_LAST_SEEN_REFRESH_SECONDS
+
+
 def _get_bound_device(device_id: str):
     if not device_id:
         return None
     if _uses_firestore():
         from app.firestore import get_firestore_sync_service
-        device = get_firestore_sync_service().get_device(device_id)
+        service = get_firestore_sync_service()
+        device = service.get_device(device_id)
         if not device or device.get("shop_id") is None or device.get("authorized", True) is False:
             return None
-        return get_firestore_sync_service().save_device(
-            device_id, last_seen_at=datetime.now(timezone.utc)
-        )
+        # Only refresh last_seen_at every few minutes. Writing it on every
+        # request cost a Firestore write plus a re-read per sync call.
+        now = datetime.now(timezone.utc)
+        if _seen_recently(device.get("last_seen_at"), now):
+            return device
+        return service.save_device(device_id, last_seen_at=now)
     device = db.session.get(Device, device_id)
     if not device or device.shop_id is None:
         return None

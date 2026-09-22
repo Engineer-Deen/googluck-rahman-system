@@ -81,6 +81,18 @@ class FakeDocRef:
         self.client.collections.get(self.collection_name, {}).pop(self.doc_id, None)
 
 
+def _fake_gte(field_value, bound):
+    """Firestore range comparison; naive datetimes are treated as UTC."""
+    if field_value is None:
+        return False
+    from datetime import timezone
+    if hasattr(field_value, "tzinfo") and field_value.tzinfo is None:
+        field_value = field_value.replace(tzinfo=timezone.utc)
+    if hasattr(bound, "tzinfo") and bound.tzinfo is None:
+        bound = bound.replace(tzinfo=timezone.utc)
+    return field_value >= bound
+
+
 class FakeCollection:
     def __init__(self, client, name):
         self.client = client
@@ -114,6 +126,10 @@ class FakeCollection:
             elif self._op == "array_contains":
                 field_value = data.get(self._field)
                 matches = isinstance(field_value, (list, tuple)) and self._value in field_value
+            elif self._op == ">=":
+                matches = _fake_gte(data.get(self._field), self._value)
+            elif self._op == "in":
+                matches = data.get(self._field) in self._value
             else:
                 matches = False
             if matches:
@@ -215,7 +231,11 @@ def _seed_catalog_product(client, product_id, shop_ids=None):
         "cost_price": "5.00",
         "is_active": True,
         "shop_ids": shop_ids or [1],
-        "updated_at": "2026-01-01T00:00:00+00:00",
+        # A real datetime, matching what production writes actually store
+        # (service.py always sets this via _utcnow()) -- Firestore's real
+        # range queries compare by type, so a query needs the field to be
+        # a Timestamp/datetime, not a string, to match at all.
+        "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
     }
 
 
@@ -383,7 +403,11 @@ class FirestoreAdapterTests(unittest.TestCase):
             "cost_price": "8.00",
             "is_active": True,
             "shop_ids": [1],
-            "updated_at": "2026-01-01T00:00:00+00:00",
+            # A real datetime, matching what production writes actually store
+            # (service.py always sets this via _utcnow()) -- Firestore's real
+            # range queries compare by type, so a query needs the field to be
+            # a Timestamp/datetime, not a string, to match at all.
+            "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
         }
         self.client.collections["stock_movements"]["mov-7"] = {
             "id": "mov-7",
@@ -393,7 +417,7 @@ class FirestoreAdapterTests(unittest.TestCase):
             "quantity_delta": -1,
             "reason": "sale",
             "reference_id": "sale-7",
-            "updated_at": "2026-01-02T06:00:00+00:00",
+            "updated_at": datetime(2026, 1, 2, 6, 0, 0, tzinfo=timezone.utc),
         }
         since = datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
         payload = self.service.pull(1, since)
