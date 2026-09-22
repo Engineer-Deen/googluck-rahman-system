@@ -2,6 +2,8 @@ from flask import Blueprint, current_app, jsonify, request, g
 from datetime import datetime, timedelta, timezone
 import requests
 
+from werkzeug.security import check_password_hash
+
 from app.auth import issue_token, login_required
 from app.extensions import db
 
@@ -145,8 +147,15 @@ def login():
         return jsonify(error="Too many login attempts. Please wait 5 minutes and try again."), 429
 
     if _central_mode():
+        # This IS the central server, so authentication happens here, against
+        # this account's own stored password hash. There is no further server
+        # to delegate to. (Local-mode desktop PCs take the other branch below,
+        # which calls this same endpoint over HTTP on the real central server.)
         staff = _get_central_service().get_staff_by_email(email)
         central_token = None
+        if not staff or not check_password_hash(_staff_value(staff, "password_hash") or "", password):
+            _record_login_failure(key)
+            return jsonify(error="Invalid email or password"), 401
     else:
         result = _authenticate_against_central(email, password, role_group)
         if isinstance(result[1], tuple):
