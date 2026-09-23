@@ -48,40 +48,6 @@ def has_local_session():
     return bool(_session_cache())
 
 
-def local_session_required(fn):
-    """Require a session established by a successful central login.
-
-    This decorator is intentionally local-only: it checks the in-memory
-    session cache and does not call central /api/auth/me. The cache is
-    populated only after successful online authentication, and it is cleared
-    when the local backend process restarts or the user logs out.
-    """
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify(error="Missing or invalid Authorization header"), 401
-
-        token = auth_header.split(" ", 1)[1].strip()
-        if not token:
-            return jsonify(error="Missing or invalid Authorization header"), 401
-
-        cached = _session_cache().get(_session_key(token))
-        if cached is None:
-            return jsonify(error="Session expired, please log in again"), 401
-
-        if not _staff_value(cached, "is_active", True):
-            clear_local_session(token)
-            return jsonify(error="Account is inactive, please log in again"), 401
-
-        g.staff_id = _staff_value(cached, "id")
-        g.staff_role = _staff_value(cached, "role")
-        g.staff_shop_id = _staff_value(cached, "shop_id")
-        return fn(*args, **kwargs)
-
-    return wrapper
-
-
 def _staff_value(staff, key, default=None):
     if isinstance(staff, dict):
         return staff.get(key, default)
@@ -137,35 +103,24 @@ def _fetch_central_session_staff(token):
 
 
 def _central_session_staff(token):
-    """
-    Validate a local-mode session against central.
+    """Return the identity for an already-established local session.
 
-    Central stays the authority: every request is still checked, and a 401/403
-    from central always ends the session. Only when central is unreachable or
-    failing (503) can an operator opt in, with LOCAL_SESSION_OFFLINE_GRACE_HOURS,
-    to let a session that central validated earlier keep working for that many
-    hours -- so a shop's internet blip doesn't log the cashier out mid-sale.
-    The default is 0 (strict: no central, no session). Cached identities live
-    in memory only, per process, so a restart requires a fresh online login.
-    """
-    # A local desktop session is established only after successful online
-    # central authentication. Do not call central /auth/me for every local
-    # request; that turns harmless local polling into repeated Firestore reads.
-    cache = _session_cache()
-    key = _session_key(token)
-    cached = cache.get(key)
-    if cached is not None:
-        return dict(cached), None, None
+    Local authentication is established only after a successful online
+    central login. Once that login succeeds, the token and staff identity are
+    cached in this local Flask process. A cache miss means the local session
+    no longer exists and the client must log in again.
 
-    # A backend restart clears the in-memory cache. In that case, validate the
-    # still-present token once against central so a stale/restarted desktop
-    # cannot silently become an offline login path. A successful validation
-    # repopulates the cache for the rest of this backend process.
-    staff, error_response, error_status = _fetch_central_session_staff(token)
-    if staff is not None:
-        register_local_session(token, staff)
-        return staff, None, None
-    return None, error_response, error_status
+    This function deliberately does NOT call central /api/auth/me on a cache
+    miss. Doing so would turn ordinary local API requests and UI polling into
+    repeated central authentication requests and unnecessary Firestore reads.
+    """
+    cached = _session_cache().get(_session_key(token))
+    if cached is None:
+        return None, jsonify(
+            error="Session expired, please log in again"
+        ), 401
+
+    return dict(cached), None, None
 
 
 def issue_token(staff) -> str:

@@ -373,8 +373,8 @@ def _last_pull_failed(app):
 def start_background_sync(app):
     """
     Push pending sales promptly (cheap -- costs nothing while the outbox is
-    empty), and pull reference data exactly once at startup to catch the
-    device up. After that, further pulls are event-driven only: they happen
+    empty). A successful online login performs the initial reference-data
+    pull. After that, further pulls are event-driven only: they happen
     when trigger_sync_soon() is called following an actual mutating action
     (a sale, a staff/product/settings change, etc.), not on a recurring
     timer. A fixed-interval pull loop -- even throttled to 60s -- still

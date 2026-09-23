@@ -371,7 +371,6 @@ async function enterApp() {
 
   if (authToken && currentStaff) {
     await ensureDeviceRegistration();
-    await maybeAutoSync();
   }
 }
 
@@ -1494,8 +1493,6 @@ async function loadShopBranding(){
 }
 
 let syncPollTimer = null;
-let lastAutoSyncAt = 0;
-
 function getDesktopPlatformLabel() {
   const ua = navigator.userAgent || "";
   if (/Windows/i.test(ua)) return "Windows";
@@ -1523,19 +1520,6 @@ async function ensureDeviceRegistration() {
   }
 }
 
-async function maybeAutoSync() {
-  if (!authToken || !currentStaff || !navigator.onLine) return;
-  const now = Date.now();
-  if (now - lastAutoSyncAt < 15000) return;
-  lastAutoSyncAt = now;
-  try {
-    await triggerSync({ silent: true });
-  } catch (_) {
-    // Offline or backend availability issues are handled by the server
-    // and the status screen; they should never block the POS.
-  }
-}
-
 function startSyncStatusPolling() {
   pollSyncStatus();
   clearInterval(syncPollTimer);
@@ -1543,18 +1527,7 @@ function startSyncStatusPolling() {
     if (document.visibilityState === "visible") {
       pollSyncStatus();
     }
-  }, 3000);
-}
-
-async function triggerSync(options) {
-  const silent = !!(options && options.silent);
-  try {
-    await api("/sync/trigger", { method: "POST" });
-    if (!silent) syncToast("Synchronization requested. Checking the saved result.", "info");
-    setTimeout(pollSyncStatus, 1000);
-  } catch (e) {
-    if (!e.authExpired && !e.networkFailure && !silent) syncToast(e.message, "error");
-  }
+  }, 10000);
 }
 
 let lastSyncSnapshot = { key: null, pending: 0 };
@@ -1650,15 +1623,6 @@ async function pollSyncStatus() {
     }
     lastSyncSnapshot = { key, pending };
 
-    if (navigator.onLine && pending > 0) {
-      // Only nudge sync for genuinely pending local changes (an actual push
-      // is due). A prior pull *failure* is handled by the backend's own
-      // bounded retry with backoff (see worker.py) -- re-triggering it from
-      // here too, every few seconds indefinitely, is exactly the "keeps
-      // reading Firestore even while idle/logged out" behavior we're
-      // trying to eliminate.
-      await maybeAutoSync();
-    }
   } catch (err) {
     // Can't even reach our OWN local server -- something's actually wrong,
     // not just central being unreachable (the local server handles that
@@ -1829,7 +1793,6 @@ function scheduleAppUpdateCheck() {
     if (authToken && currentStaff) {
       try {
         await ensureDeviceRegistration();
-        await maybeAutoSync();
       } catch (_) {}
     }
   });

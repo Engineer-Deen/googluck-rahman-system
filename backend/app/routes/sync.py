@@ -591,7 +591,7 @@ def provisioning_retry():
 @sync_bp.post("/trigger")
 @local_session_required
 def trigger():
-    from app.sync.worker import trigger_sync_soon, push_pending_once, pull_reference_data_once
+    from app.sync.worker import trigger_sync_soon
     if current_app.config["GLR_MODE"] != "local":
         return jsonify(error="Manual sync is only needed on local devices"), 400
     trigger_sync_soon(current_app._get_current_object())
