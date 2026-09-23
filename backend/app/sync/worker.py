@@ -14,7 +14,6 @@ from app.models import (
     SyncOutboxItem, SyncState,
 )
 from app.sync.device import get_current_device_id
-from app.auth import has_local_session
 
 SYNC_INTERVAL_SECONDS = 5      # push cadence -- costs nothing while the outbox is empty
 PULL_INTERVAL_SECONDS = 60     # every pull costs central database reads, so keep it slow
@@ -399,23 +398,24 @@ def start_background_sync(app):
         next_push = next_pull_retry = 0.0
         while True:
             try:
-                if app.config.get("GLR_MODE") == "local" and has_local_session():
-                    now = time.monotonic()
-                    if now >= next_push:
-                        result = push_pending_once(app)
-                        push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
-                        next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
-                    if pull_failures and now >= next_pull_retry:
-                        pull_reference_data_once(app)
-                        pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
-                        next_pull_retry = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
-                else:
-                    # A desktop sidecar can remain alive while the login screen
-                    # is displayed. Never push or pull merely because the
-                    # process is running; synchronization starts only after a
-                    # central login has succeeded in this process.
-                    push_failures = pull_failures = 0
-                    next_push = next_pull_retry = 0.0
+                if app.config.get("GLR_MODE") == "local":
+                    from app.auth import has_local_session
+                    # The sidecar may stay alive while nobody is logged in.
+                    # Synchronization is therefore completely idle until a
+                    # successful online login establishes a local session.
+                    if not has_local_session():
+                        push_failures = pull_failures = 0
+                        next_push = next_pull_retry = 0.0
+                    else:
+                        now = time.monotonic()
+                        if now >= next_push:
+                            result = push_pending_once(app)
+                            push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
+                            next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
+                        if pull_failures and now >= next_pull_retry:
+                            pull_reference_data_once(app)
+                            pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
+                            next_pull_retry = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
             except Exception:
                 pass
             time.sleep(SYNC_INTERVAL_SECONDS)
@@ -425,5 +425,19 @@ def start_background_sync(app):
 
 
 def trigger_sync_soon(app):
-    thread = threading.Thread(target=lambda: (push_pending_once(app), pull_reference_data_once(app)), daemon=True)
+    """Push queued local changes without forcing a central pull.
+
+    Pulls are performed explicitly after successful login (and retried only
+    after an actual pull failure). This keeps the status/pending-change path
+    from turning into repeated Firestore reads while the POS is otherwise idle.
+    """
+    from app.auth import has_local_session
+    if not has_local_session():
+        return None
+    thread = threading.Thread(
+        target=lambda: push_pending_once(app),
+        daemon=True,
+        name="glr-push-trigger",
+    )
     thread.start()
+    return thread

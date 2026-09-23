@@ -4,7 +4,7 @@ import requests
 
 from werkzeug.security import check_password_hash
 
-from app.auth import issue_token, login_required, register_local_session, revoke_local_session
+from app.auth import issue_token, login_required, register_local_session, clear_local_session
 from app.extensions import db
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -190,6 +190,17 @@ def login():
     token = issue_token(staff) if _central_mode() else central_token
     if not _central_mode():
         register_local_session(token, staff)
+        # Synchronization is event-driven: successful login is the explicit
+        # reason to perform a central pull. The background worker does not pull
+        # merely because the local Flask process started.
+        import threading
+        from app.sync.worker import pull_reference_data_once
+        app_obj = current_app._get_current_object()
+        threading.Thread(
+            target=lambda: pull_reference_data_once(app_obj),
+            daemon=True,
+            name="glr-login-pull",
+        ).start()
     return jsonify(
         token=token,
         staff={
@@ -215,7 +226,6 @@ def logout():
             g.staff_id, updated_at=datetime.now(timezone.utc)
         )
     else:
-        revoke_local_session(request.headers["Authorization"].split(" ", 1)[1])
         central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
         try:
             response = requests.post(
@@ -230,6 +240,8 @@ def logout():
                 error="Your session requires a connection to the central server.",
                 code="central_session_unavailable",
             ), 503
+    if not _central_mode():
+        clear_local_session(request.headers["Authorization"].split(" ", 1)[1])
     return jsonify(ok=True)
 
 

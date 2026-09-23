@@ -19,6 +19,35 @@ from flask import current_app, g, jsonify, request
 ALGORITHM = "HS256"
 
 
+def _session_cache():
+    return current_app.extensions.setdefault("glr_session_cache", {})
+
+
+def _session_key(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def register_local_session(token, staff):
+    """Remember a successfully central-authenticated local desktop session.
+
+    The desktop must authenticate online first. After that, local API requests
+    use this in-memory session instead of calling central /auth/me on every
+    request. The cache disappears when the local backend restarts.
+    """
+    cache = _session_cache()
+    if len(cache) >= 200:
+        cache.pop(next(iter(cache)), None)
+    cache[_session_key(token)] = dict(staff)
+
+
+def clear_local_session(token):
+    _session_cache().pop(_session_key(token), None)
+
+
+def has_local_session():
+    return bool(_session_cache())
+
+
 def _staff_value(staff, key, default=None):
     if isinstance(staff, dict):
         return staff.get(key, default)
@@ -85,93 +114,25 @@ def _central_session_staff(token):
     The default is 0 (strict: no central, no session). Cached identities live
     in memory only, per process, so a restart requires a fresh online login.
     """
+    # A local desktop session is established only after successful online
+    # central authentication. Do not call central /auth/me for every local
+    # request; that turns harmless local polling into repeated Firestore reads.
+    cache = _session_cache()
+    key = _session_key(token)
+    cached = cache.get(key)
+    if cached is not None:
+        return dict(cached), None, None
+
+    # A backend restart clears the in-memory cache. In that case, validate the
+    # still-present token once against central so a stale/restarted desktop
+    # cannot silently become an offline login path. A successful validation
+    # repopulates the cache for the rest of this backend process.
     staff, error_response, error_status = _fetch_central_session_staff(token)
-    cache = current_app.extensions.setdefault("glr_session_cache", {})
-    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
     if staff is not None:
-        if len(cache) > 200:
-            cache.pop(next(iter(cache)), None)
-        cache[key] = (dict(staff), time.monotonic(), None)
+        register_local_session(token, staff)
         return staff, None, None
-    if error_status == 401:
-        cache.pop(key, None)  # central says the session is dead: never fall back
-    elif error_status == 503:
-        grace = float(current_app.config.get("LOCAL_SESSION_OFFLINE_GRACE_SECONDS", 0) or 0)
-        cached = cache.get(key)
-        if grace > 0 and cached and time.monotonic() - cached[1] <= grace:
-            return dict(cached[0]), None, None
     return None, error_response, error_status
 
-
-
-def _local_session_key(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def register_local_session(token: str, staff) -> None:
-    """Remember a centrally authenticated desktop session for local-only endpoints.
-
-    Local status/sync control requests must not call the central /auth/me endpoint
-    on every poll. The login itself remains central; this short-lived in-process
-    identity is only a local proof that this desktop already completed that login.
-    """
-    cache = current_app.extensions.setdefault("glr_session_cache", {})
-    key = _local_session_key(token)
-    expires_at = None
-    try:
-        payload = jwt.decode(token, options={"verify_signature": False})
-        expires_at = float(payload.get("exp")) if payload.get("exp") is not None else None
-    except Exception:
-        expires_at = None
-    cache[key] = (dict(staff), time.monotonic(), expires_at)
-
-
-def revoke_local_session(token: str) -> None:
-    cache = current_app.extensions.setdefault("glr_session_cache", {})
-    cache.pop(_local_session_key(token), None)
-
-
-def has_local_session() -> bool:
-    cache = current_app.extensions.setdefault("glr_session_cache", {})
-    now_mono = time.monotonic()
-    now_epoch = time.time()
-    for key, value in list(cache.items()):
-        if len(value) >= 3 and value[2] is not None and now_epoch >= value[2]:
-            cache.pop(key, None)
-    return bool(cache)
-
-
-def local_session_required(fn):
-    """Require a session that was authenticated centrally during this process.
-
-    This is intentionally for local-only control/status endpoints. It never
-    performs a network request or Firestore read. The actual login remains
-    central, and the full login_required decorator is retained for protected
-    business endpoints.
-    """
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify(error="Missing or invalid Authorization header"), 401
-        token = auth_header.split(" ", 1)[1]
-        key = _local_session_key(token)
-        cache = current_app.extensions.setdefault("glr_session_cache", {})
-        cached = cache.get(key)
-        if not cached:
-            return jsonify(error="Session expired, please log in again"), 401
-        staff, _, expires_at = cached
-        if expires_at is not None and time.time() >= expires_at:
-            cache.pop(key, None)
-            return jsonify(error="Session expired, please log in again"), 401
-        if not _staff_value(staff, "is_active", True):
-            cache.pop(key, None)
-            return jsonify(error="Account is inactive, please log in again"), 401
-        g.staff_id = _staff_value(staff, "id")
-        g.staff_role = _staff_value(staff, "role")
-        g.staff_shop_id = _staff_value(staff, "shop_id")
-        return fn(*args, **kwargs)
-    return wrapper
 
 def issue_token(staff) -> str:
     payload = {
