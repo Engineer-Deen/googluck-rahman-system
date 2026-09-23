@@ -4,7 +4,7 @@ import requests
 
 from werkzeug.security import check_password_hash
 
-from app.auth import issue_token, login_required
+from app.auth import issue_token, login_required, register_local_session, revoke_local_session
 from app.extensions import db
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
@@ -188,6 +188,8 @@ def login():
         # only used by the authenticated session/data layer in local mode.
         pass
     token = issue_token(staff) if _central_mode() else central_token
+    if not _central_mode():
+        register_local_session(token, staff)
     return jsonify(
         token=token,
         staff={
@@ -213,6 +215,7 @@ def logout():
             g.staff_id, updated_at=datetime.now(timezone.utc)
         )
     else:
+        revoke_local_session(request.headers["Authorization"].split(" ", 1)[1])
         central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
         try:
             response = requests.post(

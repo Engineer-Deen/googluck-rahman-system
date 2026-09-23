@@ -14,6 +14,7 @@ from app.models import (
     SyncOutboxItem, SyncState,
 )
 from app.sync.device import get_current_device_id
+from app.auth import has_local_session
 
 SYNC_INTERVAL_SECONDS = 5      # push cadence -- costs nothing while the outbox is empty
 PULL_INTERVAL_SECONDS = 60     # every pull costs central database reads, so keep it slow
@@ -396,11 +397,9 @@ def start_background_sync(app):
     def loop():
         push_failures = pull_failures = 0
         next_push = next_pull_retry = 0.0
-        pull_reference_data_once(app)  # one catch-up pull as the app comes up
-        pull_failures = 1 if _last_pull_failed(app) else 0
         while True:
             try:
-                if app.config.get("GLR_MODE") == "local":
+                if app.config.get("GLR_MODE") == "local" and has_local_session():
                     now = time.monotonic()
                     if now >= next_push:
                         result = push_pending_once(app)
@@ -410,6 +409,13 @@ def start_background_sync(app):
                         pull_reference_data_once(app)
                         pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
                         next_pull_retry = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
+                else:
+                    # A desktop sidecar can remain alive while the login screen
+                    # is displayed. Never push or pull merely because the
+                    # process is running; synchronization starts only after a
+                    # central login has succeeded in this process.
+                    push_failures = pull_failures = 0
+                    next_push = next_pull_retry = 0.0
             except Exception:
                 pass
             time.sleep(SYNC_INTERVAL_SECONDS)
