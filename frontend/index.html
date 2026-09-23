@@ -50,6 +50,7 @@
         <input type="password" id="central-enrollment-password" class="auth-input" placeholder="Central owner/admin password" autocomplete="current-password">
       </div>
       <button class="btn-login" id="provision-submit-btn" onclick="provisionDesktop()">AUTHORIZE DESKTOP</button>
+      <button class="btn-login" id="provision-retry-btn" style="display:none;margin-top:.6rem;" onclick="retryProvisioning()">RETRY CENTRAL SYNC</button>
       <div class="login-error" id="provisioning-error"></div>
     </div>
   </div>
@@ -145,6 +146,16 @@
               <input type="checkbox" id="s-paid-in-full" onchange="onPaidInFullToggle()"> Paid in full
             </label>
           </div>
+        </div>
+        <div style="display:flex;gap:1rem;align-items:end;flex-wrap:wrap;margin-top:1rem;">
+          <button class="btn btn-secondary" type="button" onclick="addSaleItem()">ADD ITEM TO CART</button>
+        </div>
+        <div class="table-wrap" style="margin-top:1rem;">
+          <table>
+            <thead><tr><th>Product</th><th>Price</th><th>Qty</th><th>Subtotal</th><th></th></tr></thead>
+            <tbody id="sale-cart-table"></tbody>
+          </table>
+          <div id="sale-cart-empty" class="muted" style="padding:.8rem 0;">No items in cart.</div>
         </div>
         <div style="display:flex;gap:2rem;align-items:center;margin:1rem 0;flex-wrap:wrap;">
           <div>

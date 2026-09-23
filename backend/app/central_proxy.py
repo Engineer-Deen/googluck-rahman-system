@@ -15,7 +15,7 @@ online, because nothing ever forwarded the request.
 import requests
 from flask import current_app, jsonify, request
 
-CENTRAL_TIMEOUT_SECONDS = 10
+CENTRAL_TIMEOUT_SECONDS = 30
 
 
 def is_local_mode():
@@ -41,7 +41,7 @@ def forward_to_central(method, path, offline_message):
     # .get(...) with a fallback, not config[...]: a misconfigured or minimal
     # app (missing this key entirely) must still fail as "offline", never as
     # an unhandled 500 that hides the real, customer-facing error message.
-    central_url = current_app.config.get("CENTRAL_SYNC_URL") or "http://localhost:8000"
+    central_url = current_app.config["CENTRAL_SYNC_URL"]
     url = central_url.rstrip("/") + path
     try:
         resp = requests.request(

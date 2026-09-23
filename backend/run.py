@@ -25,18 +25,8 @@ def _should_start_worker():
 
 
 if _should_start_worker():
-    # Previously this started an infinite background thread that hit the
-    # central server every 5-60 seconds for as long as the desktop app was
-    # open, even if nobody touched it for hours. That alone burned through
-    # the Firestore daily quota. Sync now happens only:
-    #   1. Once here, when the app starts up (so a freshly opened app is
-    #      current with central right away), and
-    #   2. Whenever the user actually sends data -- sales/products/stock
-    #      routes already call trigger_sync_soon() after a write, and the
-    #      frontend can call POST /api/sync/trigger for a manual "sync now".
-    # No timer keeps running in between.
-    from app.sync.worker import trigger_sync_soon
-    trigger_sync_soon(app)
+    from app.sync.worker import start_background_sync
+    start_background_sync(app)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000 if os.environ.get("GLR_MODE", "local") == "local" else 8000))

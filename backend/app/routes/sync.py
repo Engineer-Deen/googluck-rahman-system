@@ -112,10 +112,19 @@ def _effective_provisioning_state(device=None):
     if _uses_firestore():
         return "READY"
     state = _provisioning_state()
-    if state in {"READY", "SYNC_ERROR"}:
-        return state
     if device is None:
         device = db.session.get(Device, get_current_device_id())
+
+    # Recover the visible state from durable sync evidence. Older builds could
+    # leave provisioning_state at ENROLLED / PROVISIONING when the first pull
+    # timed out. If the last pull failed, surface SYNC_ERROR immediately rather
+    # than making the device look as if it is still actively provisioning.
+    pull_error = db.session.get(SyncState, "last_pull_error")
+    if state not in {"READY", "SYNC_ERROR"} and pull_error and pull_error.value:
+        return "SYNC_ERROR"
+
+    if state in {"READY", "SYNC_ERROR"}:
+        return state
     return "ENROLLED / PROVISIONING" if device and device.shop_id is not None else "NOT_ENROLLED"
 
 
@@ -130,7 +139,7 @@ def _sync_error_kind(message):
     if "403" in lowered or "not registered to an authorized shop" in lowered:
         return "DEVICE_NOT_AUTHORIZED"
     if "timed out" in lowered or "connection" in lowered or "name or service" in lowered:
-        return "RENDER_UNREACHABLE"
+        return "CENTRAL_UNREACHABLE"
     return "SYNC_FAILED"
 
 
@@ -541,6 +550,42 @@ def enroll_local_device():
         state="READY",
         staff={"id": staff_id, "email": email, "role": identity["role"], "shop_id": shop_id},
     )
+
+
+@sync_bp.post("/provisioning/retry")
+def provisioning_retry():
+    """Retry initial reference-data pull for an already-authorized device.
+
+    This endpoint is intentionally available before staff login: the desktop
+    cannot log in until central authentication is reachable, but a device that
+    was already authorized must be able to recover from a transient provisioning
+    failure without forcing a reinstall or asking the owner to re-register it.
+    No business data is returned here; the local worker performs the protected
+    X-Sync-Key pull itself.
+    """
+    if current_app.config["GLR_MODE"] != "local":
+        return jsonify(error="Provisioning retry is only available on local devices"), 400
+
+    device_id = get_current_device_id()
+    device = db.session.get(Device, device_id)
+    if not device or device.shop_id is None:
+        return jsonify(error="This device is not registered to an authorized shop"), 403
+
+    from app.sync.worker import pull_reference_data_once
+    result = pull_reference_data_once(current_app._get_current_object())
+    pull_error = db.session.get(SyncState, "last_pull_error")
+    if pull_error and pull_error.value:
+        _set_provisioning_state("SYNC_ERROR")
+        db.session.commit()
+        return jsonify(
+            state="SYNC_ERROR",
+            error="Central synchronization could not complete.",
+            last_pull_error=pull_error.value,
+        ), 503
+
+    _set_provisioning_state("READY")
+    db.session.commit()
+    return jsonify(state="READY", result=result)
 
 
 @sync_bp.post("/trigger")

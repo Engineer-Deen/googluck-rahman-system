@@ -62,14 +62,12 @@ def _get_central_service():
 
 
 def _authenticate_against_central(email, password, role_group):
-    central_url = current_app.config.get(
-        "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
-    ).rstrip("/")
+    central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
     try:
         response = requests.post(
             central_url + "/api/auth/login",
             json={"email": email, "password": password, "role_group": role_group},
-            timeout=8,
+            timeout=30,
         )
     except requests.ConnectionError:
         return None, (jsonify(
@@ -211,14 +209,12 @@ def logout():
             g.staff_id, updated_at=datetime.now(timezone.utc)
         )
     else:
-        central_url = current_app.config.get(
-            "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
-        ).rstrip("/")
+        central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
         try:
             response = requests.post(
                 central_url + "/api/auth/logout",
                 headers={"Authorization": request.headers["Authorization"]},
-                timeout=8,
+                timeout=30,
             )
             if response.status_code >= 400:
                 return jsonify(error="Central session logout was rejected"), 401

@@ -21,7 +21,7 @@ os.environ.setdefault("CENTRAL_DATA_PROVIDER", "firestore")
 
 from app import create_app
 from app.extensions import db
-from app.firestore.service import FirestoreSyncService, _clean_staff
+from app.firestore.service import FirestoreSyncService
 from app.models import (
     AuditLogEntry,
     Device,
@@ -110,9 +110,14 @@ def _table_rows(table_name: str):
 
 
 def _row_to_payload(table_name: str, row: Any) -> dict[str, Any]:
+    # NOTE: staff rows are intentionally migrated with their credential
+    # fields intact (password_hash, quick_pin_hash, etc). _clean_staff()
+    # exists to redact those fields on *outward-facing* reads (sync pull,
+    # API responses) -- applying it here as well silently strips
+    # password_hash before it ever reaches Firestore, so every migrated
+    # account permanently loses its password and can never log in again,
+    # no matter how many times the correct password is entered.
     raw = {column.name: getattr(row, column.name) for column in row.__table__.columns}
-    if table_name == "staff":
-        raw = _clean_staff(raw)
     for key, value in list(raw.items()):
         raw[key] = _iso(value)
     return raw
@@ -179,8 +184,6 @@ def _run_migration(dry_run: bool = True) -> dict[str, Any]:
 
             for row in rows:
                 payload = _row_to_payload(table_name, row)
-                if table_name == "staff":
-                    payload = _clean_staff(payload)
                 doc_id = str(payload["id"])
                 ref = service._collection(doc_collection).document(doc_id)
                 existing_doc = ref.get()

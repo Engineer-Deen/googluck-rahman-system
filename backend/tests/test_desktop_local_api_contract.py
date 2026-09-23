@@ -63,12 +63,12 @@ class DesktopLocalApiContractTests(unittest.TestCase):
             ),
         )
 
-    def test_tauri_sidecar_uses_render_for_cloud_sync_and_keeps_local_pos(self):
+    def test_tauri_sidecar_uses_configured_central_cloud_sync_and_keeps_local_pos(self):
         text = TAURI_LIB.read_text(encoding="utf-8")
         self.assertIn('.env("GLR_MODE", "local")', text)
         self.assertIn('.env("PORT", "5000")', text)
         self.assertIn(
-            '.env("CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com")',
+            '.env("CENTRAL_SYNC_URL", "https://goodluck-rahman-api.vercel.app")',
             text,
         )
         self.assertNotIn("FIREBASE_SERVICE_ACCOUNT_JSON", text)

@@ -32,14 +32,12 @@ def _central_staff(staff_id):
 
 
 def _fetch_central_session_staff(token):
-    central_url = current_app.config.get(
-        "CENTRAL_SYNC_URL", "https://goodluck-rahman-api.onrender.com"
-    ).rstrip("/")
+    central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
     try:
         response = requests.get(
             central_url + "/api/auth/me",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=8,
+            timeout=30,
         )
     except requests.ConnectionError:
         return None, jsonify(

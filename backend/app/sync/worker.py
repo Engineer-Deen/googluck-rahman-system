@@ -1,6 +1,7 @@
 """Durable background synchronization for local/offline devices."""
 import json
 import threading
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -13,8 +14,11 @@ from app.models import (
 )
 from app.sync.device import get_current_device_id
 
+SYNC_INTERVAL_SECONDS = 5      # push cadence -- costs nothing while the outbox is empty
+PULL_INTERVAL_SECONDS = 60     # every pull costs central database reads, so keep it slow
+MAX_BACKOFF_SECONDS = 15 * 60  # ceiling when the central server keeps failing
 BATCH_SIZE = 50
-REQUEST_TIMEOUT_SECONDS = 8
+REQUEST_TIMEOUT_SECONDS = 30
 LAST_PULL_KEY = "last_pull_at"
 
 
@@ -295,6 +299,15 @@ def pull_reference_data_once(app) -> dict:
         _set_state("last_pull_success", next_cursor)
         _set_state("last_pull_error", "")
         _set_state("last_pull_skipped_staff", str(skipped_staff))
+
+        # A device may have been enrolled successfully but failed its initial
+        # pull because the central service was temporarily unavailable. Once a
+        # later pull succeeds, recover the provisioning state automatically so
+        # the device does not remain stuck in SYNC_ERROR forever.
+        provisioning = db.session.get(SyncState, "provisioning_state")
+        if provisioning and provisioning.value in {"ENROLLED / PROVISIONING", "SYNC_ERROR"}:
+            provisioning.value = "READY"
+
         db.session.commit()
         return {
             "shops": len(data.get("shops", [])),
@@ -306,6 +319,49 @@ def pull_reference_data_once(app) -> dict:
             "stock_movements": len(data.get("stock_movements", [])),
             "staff_needing_provisioning": skipped_staff,
         }
+
+
+def backoff_delay(base_seconds, consecutive_failures):
+    """Wait `base` normally; double per consecutive failure, capped."""
+    if consecutive_failures <= 0:
+        return base_seconds
+    return min(MAX_BACKOFF_SECONDS, base_seconds * (2 ** consecutive_failures))
+
+
+def _last_pull_failed(app):
+    with app.app_context():
+        row = db.session.get(SyncState, "last_pull_error")
+        return bool(row and row.value)
+
+
+def start_background_sync(app):
+    """
+    Push pending sales quickly, pull reference data slowly, and back off when
+    central is failing. Previously both ran every 5 seconds forever, even while
+    central was returning errors, which hammered the central database (17,000+
+    pulls a day per PC) and exhausted the Firestore daily quota.
+    """
+    def loop():
+        push_failures = pull_failures = 0
+        next_push = next_pull = 0.0
+        while True:
+            try:
+                if app.config.get("GLR_MODE") == "local":
+                    now = time.monotonic()
+                    if now >= next_push:
+                        result = push_pending_once(app)
+                        push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
+                        next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
+                    if now >= next_pull:
+                        pull_reference_data_once(app)
+                        pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
+                        next_pull = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
+            except Exception:
+                pass
+            time.sleep(SYNC_INTERVAL_SECONDS)
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
 
 
 def trigger_sync_soon(app):
