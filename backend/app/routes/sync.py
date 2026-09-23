@@ -23,7 +23,7 @@ import requests
 from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy import func
 
-from app.auth import login_required, roles_required
+from app.auth import login_required, local_session_required, roles_required
 from app.extensions import db
 from app.models import Device, Product, Sale, SaleItem, SalePayment, Shop, Staff, SystemSetting, StockMovement, SyncOutboxItem, SyncState
 from app.routes.sales import apply_payment, apply_sale
