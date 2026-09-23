@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 from flask import current_app
@@ -23,23 +24,38 @@ LAST_PULL_KEY = "last_pull_at"
 
 
 def _parse_datetime(value):
-    """Deserialize central ISO-8601 timestamps for SQLAlchemy DateTime fields.
+    """Deserialize central timestamps for SQLAlchemy DateTime fields.
 
-    The central API emits ``datetime.isoformat()`` values. The existing models
-    use timezone-naive ``DateTime`` columns but create timestamps in UTC, so
-    normalize aware input to UTC before binding it. This preserves the instant
-    even on SQLite, whose DateTime storage does not retain an offset. Naive
-    legacy values remain naive. ``Z`` is normalized for Python versions where
-    ``fromisoformat`` does not accept it.
+    The central API is supposed to emit ``datetime.isoformat()`` values, but
+    some write paths store a raw ``datetime`` in Firestore that later gets
+    JSON-serialized by Flask's default encoder instead of being normalized
+    through an explicit ``.isoformat()`` call first. Flask's default encoder
+    formats ``datetime`` objects as an RFC 1123 / HTTP-date string (e.g.
+    ``"Thu, 17 Sep 2026 08:46:04 GMT"``), not ISO-8601. Left unhandled, that
+    crashes this parser on every pull that includes such a record, which
+    prevents the pull from ever committing -- so the sync cursor never
+    advances, and every subsequent pull re-fetches the same expensive
+    "everything since the cursor" range instead of just new changes.
+
+    The existing models use timezone-naive ``DateTime`` columns but create
+    timestamps in UTC, so normalize aware input to UTC before binding it.
+    This preserves the instant even on SQLite, whose DateTime storage does
+    not retain an offset. Naive legacy values remain naive. ``Z`` is
+    normalized for Python versions where ``fromisoformat`` does not accept
+    it.
     """
     if value is None or isinstance(value, datetime):
         return value
     if not isinstance(value, str):
         raise ValueError("Expected an ISO-8601 timestamp string or null")
 
-    if value.endswith(("Z", "z")):
-        value = value[:-1] + "+00:00"
-    parsed = datetime.fromisoformat(value)
+    normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        # Fall back to RFC 1123 / HTTP-date (what Flask's default JSON
+        # encoder produces for a raw datetime it wasn't told to isoformat).
+        parsed = parsedate_to_datetime(value)
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed
 
 
@@ -220,74 +236,88 @@ def pull_reference_data_once(app) -> dict:
             db.session.commit()
             return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
 
-        for raw in data.get("shops", []):
-            shop = db.session.get(Shop, raw["id"])
-            if not shop:
-                shop = Shop(id=raw["id"])
-                db.session.add(shop)
-            shop.name = raw["name"]
-            shop.location = raw.get("location")
-            shop.logo_data = raw.get("logo_data")
+        try:
+            for raw in data.get("shops", []):
+                shop = db.session.get(Shop, raw["id"])
+                if not shop:
+                    shop = Shop(id=raw["id"])
+                    db.session.add(shop)
+                shop.name = raw["name"]
+                shop.location = raw.get("location")
+                shop.logo_data = raw.get("logo_data")
 
-        skipped_staff = 0
-        for raw in data.get("staff", []):
-            staff = db.session.get(Staff, raw["id"])
-            if not staff:
-                # Authentication secrets are intentionally absent from sync
-                # payloads. A new account must be provisioned through the
-                # authenticated account flow before it can be used offline.
-                skipped_staff += 1
-                continue
+            skipped_staff = 0
+            for raw in data.get("staff", []):
+                staff = db.session.get(Staff, raw["id"])
+                if not staff:
+                    # Authentication secrets are intentionally absent from sync
+                    # payloads. A new account must be provisioned through the
+                    # authenticated account flow before it can be used offline.
+                    skipped_staff += 1
+                    continue
 
-            # Keep local staff rows stable when the central payload is unchanged.
-            # Re-writing the same values would advance updated_at, which would
-            # invalidate any already-issued JWTs because login_required rechecks
-            # the token against the current staff row timestamp.
-            desired = {
-                "shop_id": raw.get("shop_id"),
-                "name": raw["name"],
-                "email": raw["email"],
-                "role": raw["role"],
-                "is_active": raw["is_active"],
-            }
-            if (
-                staff.shop_id == desired["shop_id"] and
-                staff.name == desired["name"] and
-                staff.email == desired["email"] and
-                staff.role == desired["role"] and
-                staff.is_active == desired["is_active"]
-            ):
-                continue
+                # Keep local staff rows stable when the central payload is unchanged.
+                # Re-writing the same values would advance updated_at, which would
+                # invalidate any already-issued JWTs because login_required rechecks
+                # the token against the current staff row timestamp.
+                desired = {
+                    "shop_id": raw.get("shop_id"),
+                    "name": raw["name"],
+                    "email": raw["email"],
+                    "role": raw["role"],
+                    "is_active": raw["is_active"],
+                }
+                if (
+                    staff.shop_id == desired["shop_id"] and
+                    staff.name == desired["name"] and
+                    staff.email == desired["email"] and
+                    staff.role == desired["role"] and
+                    staff.is_active == desired["is_active"]
+                ):
+                    continue
 
-            staff.shop_id = desired["shop_id"]
-            staff.name = desired["name"]
-            staff.email = desired["email"]
-            # Authentication secrets are never synchronized. Existing local
-            # credentials remain intact; central account changes require the
-            # normal authenticated login/update flow.
-            staff.role = desired["role"]
-            staff.is_active = desired["is_active"]
+                staff.shop_id = desired["shop_id"]
+                staff.name = desired["name"]
+                staff.email = desired["email"]
+                # Authentication secrets are never synchronized. Existing local
+                # credentials remain intact; central account changes require the
+                # normal authenticated login/update flow.
+                staff.role = desired["role"]
+                staff.is_active = desired["is_active"]
 
-        for raw in data.get("settings", []):
-            setting = SystemSetting.query.filter_by(key=raw["key"]).first()
-            if not setting:
-                setting = SystemSetting(key=raw["key"])
-                db.session.add(setting)
-            setting.value = raw.get("value")
+            for raw in data.get("settings", []):
+                setting = SystemSetting.query.filter_by(key=raw["key"]).first()
+                if not setting:
+                    setting = SystemSetting(key=raw["key"])
+                    db.session.add(setting)
+                setting.value = raw.get("value")
 
-        for raw in data.get("products", []):
-            product = db.session.get(Product, raw["id"])
-            if not product:
-                product = Product(id=raw["id"])
-                db.session.add(product)
-            product.sku = raw["sku"]
-            product.name = raw["name"]
-            product.category = raw.get("category")
-            product.unit_price = raw["unit_price"]
-            product.cost_price = raw.get("cost_price", 0)
-            product.is_active = raw.get("is_active", True)
+            for raw in data.get("products", []):
+                product = db.session.get(Product, raw["id"])
+                if not product:
+                    product = Product(id=raw["id"])
+                    db.session.add(product)
+                product.sku = raw["sku"]
+                product.name = raw["name"]
+                product.category = raw.get("category")
+                product.unit_price = raw["unit_price"]
+                product.cost_price = raw.get("cost_price", 0)
+                product.is_active = raw.get("is_active", True)
 
-        _upsert_transactions(data)
+            _upsert_transactions(data)
+        except Exception as exc:
+            # A single malformed record (e.g. an unparseable timestamp) must
+            # never be allowed to crash the thread mid-transaction and leave
+            # partially-applied staff/product/sale changes pending. That both
+            # (a) stops the sync cursor from ever advancing -- so every future
+            # pull re-fetches the same expensive "everything since the old
+            # cursor" range forever -- and (b) risks flushing a dirty,
+            # invalidating staff.updated_at write on a later unrelated commit.
+            db.session.rollback()
+            _set_state("last_pull_error", f"{type(exc).__name__}: {exc}")
+            db.session.commit()
+            return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
+
         if not state:
             state = SyncState(key=LAST_PULL_KEY)
             db.session.add(state)
