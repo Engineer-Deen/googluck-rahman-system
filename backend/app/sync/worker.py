@@ -379,7 +379,11 @@ def start_background_sync(app):
     def loop():
         push_failures = 0
         next_push = 0.0
-        pull_reference_data_once(app)  # one catch-up pull as the app comes up
+        # Do not pull at backend startup. A local sidecar can remain alive while
+        # nobody is logged in, and an unconditional startup pull would spend
+        # Firestore reads before the user has even entered the POS. Provisioning
+        # performs its own required initial pull, while normal synchronization is
+        # explicitly triggered after authenticated activity.
         while True:
             try:
                 if app.config.get("GLR_MODE") == "local":

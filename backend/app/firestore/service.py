@@ -138,6 +138,38 @@ class FirestoreSyncService:
     def _collection(self, name):
         return self.client.collection(name)
 
+    def _sync_marker(self, shop_id):
+        return self._collection("sync_metadata").document(f"pull_{int(shop_id)}")
+
+    def _touch_sync_marker(self, shop_id):
+        """Mark that this shop has data that may need to be pulled.
+
+        The marker is a single cheap read used by incremental pulls. It prevents
+        an idle device from querying every business collection just to discover
+        that nothing changed. It is deliberately separate from the data cursor:
+        the marker is advanced after the corresponding write, so a later pull
+        can safely use the marker timestamp as its upper bound.
+        """
+        if shop_id in (None, ""):
+            return
+        self._sync_marker(shop_id).set({"updated_at": _utcnow()}, merge=True)
+
+    def _touch_all_shop_markers(self):
+        """Settings are global, so mark every shop as changed."""
+        shops = self._collection("shops").stream()
+        batch = self.client.batch()
+        timestamp = _utcnow()
+        count = 0
+        for snapshot in shops:
+            shop = snapshot.to_dict() or {}
+            shop_id = shop.get("id")
+            if shop_id is None:
+                continue
+            batch.set(self._sync_marker(shop_id), {"updated_at": timestamp}, merge=True)
+            count += 1
+        if count:
+            batch.commit()
+
     @staticmethod
     def _device_value(device, key):
         return device.get(key) if isinstance(device, dict) else getattr(device, key)
@@ -191,6 +223,7 @@ class FirestoreSyncService:
     def save_staff(self, staff_id, **fields) -> dict:
         data = {"id": int(staff_id), "updated_at": _utcnow(), **fields}
         self._collection("staff").document(str(staff_id)).set(data, merge=True)
+        self._touch_sync_marker(data.get("shop_id"))
         return self.get_staff(staff_id) or data
 
     def staff_email_exists(self, email: str, excluding_id=None) -> bool:
@@ -217,6 +250,7 @@ class FirestoreSyncService:
     def save_shop(self, shop_id, **fields) -> dict:
         fields = {"id": int(shop_id), **fields, "updated_at": _utcnow()}
         self._collection("shops").document(str(shop_id)).set(fields, merge=True)
+        self._touch_sync_marker(shop_id)
         return self.get_shop(shop_id) or fields
 
     def get_setting(self, key: str, default=None):
@@ -231,6 +265,7 @@ class FirestoreSyncService:
     def save_setting(self, key: str, value) -> dict:
         data = {"id": key, "key": key, "value": value, "updated_at": _utcnow()}
         self._collection("system_settings").document(key).set(data, merge=True)
+        self._touch_all_shop_markers()
         return data
 
     def write_audit(self, audit_id: str, **fields):
@@ -291,6 +326,8 @@ class FirestoreSyncService:
     def save_product(self, product_id, **fields) -> dict:
         data = {"id": int(product_id), "updated_at": _utcnow(), **fields}
         self._collection("products").document(str(product_id)).set(data, merge=True)
+        for shop_id in data.get("shop_ids") or []:
+            self._touch_sync_marker(shop_id)
         return self.get_product(product_id) or data
 
     def stock_map(self, product_ids=None, shop_id=None) -> dict[int, int]:
@@ -336,7 +373,10 @@ class FirestoreSyncService:
             transaction.set(movement_ref, movement, merge=True)
             return movement, True
 
-        return create(transaction)
+        result, created = create(transaction)
+        if created:
+            self._touch_sync_marker(payload.get("shop_id"))
+        return result, created
 
     def list_stock_movements(self, product_id: int, shop_id=None, limit=100) -> list[dict]:
         movements = []
@@ -557,6 +597,8 @@ class FirestoreSyncService:
             return sale_snapshot.to_dict() or {}, payment, True
 
         sale, payment, created = create(transaction)
+        if created:
+            self._touch_sync_marker((sale or {}).get("shop_id"))
         graph = self.get_sale_graph(sale_id) or {"sale": sale, "items": [], "payments": []}
         return graph, payment, created
 
@@ -630,6 +672,7 @@ class FirestoreSyncService:
                 if delta:
                     movement_id = f"{sale_id}:correction:{product_id}:{uuid.uuid4().hex}"
                     self._write("stock_movements", movement_id, {"id": movement_id, "product_id": product_id, "shop_id": sale.get("shop_id"), "quantity_delta": delta, "reason": "sale_correction", "reference_id": sale_id, "created_at": _utcnow(), "updated_at": _utcnow()})
+        self._touch_sync_marker(sale.get("shop_id"))
         return self.get_sale_graph(sale_id)
 
     def void_sale(self, sale_id: str, reason: str, staff_id: int, device_id=None, reversal_ids=None) -> tuple[dict, bool]:
@@ -657,6 +700,7 @@ class FirestoreSyncService:
             transaction.set(sale_ref, {"voided_at": _utcnow(), "voided_by_staff_id": staff_id, "void_reason": reason, "updated_at": _utcnow()}, merge=True)
 
         void(transaction)
+        self._touch_sync_marker(sale.get("shop_id"))
         return self.get_sale_graph(sale_id), True
 
     def _write(self, collection: str, record_id: str, data: dict):
@@ -814,6 +858,7 @@ class FirestoreSyncService:
             batch.commit()
             for item in items:
                 self._mark_product_shop(item["product_id"], self._device_value(device, "shop_id"))
+            self._touch_sync_marker(self._device_value(device, "shop_id"))
             return {"invoice_number": invoice}
 
         if table_name == "sale_payments":
@@ -828,6 +873,7 @@ class FirestoreSyncService:
                 "device_id": self._device_value(device, "id"),
                 "updated_at": _utcnow(),
             })
+            self._touch_sync_marker(self._device_value(device, "shop_id"))
             return {}
 
         if table_name == "stock_movements":
@@ -841,6 +887,7 @@ class FirestoreSyncService:
                 "updated_at": _utcnow(),
             })
             self._mark_product_shop(payload["product_id"], self._device_value(device, "shop_id"))
+            self._touch_sync_marker(self._device_value(device, "shop_id"))
             return {}
 
         raise ValueError(f"Unknown table_name '{table_name}'")
@@ -855,7 +902,25 @@ class FirestoreSyncService:
         return [doc.to_dict() or {} for doc in self._collection(name).where("updated_at", ">=", since).stream()]
 
     def _pull_incremental(self, shop_id: int, since: datetime) -> dict:
-        """Same response as a full pull, but only reads documents that changed."""
+        """Pull only when the shop-level sync marker says something changed.
+
+        An idle pull therefore costs exactly one Firestore document read instead
+        of issuing one query against every synchronized collection. When the
+        marker is newer than the local cursor, the normal incremental queries
+        fetch only the changed records.
+        """
+        marker_snapshot = self._sync_marker(shop_id).get()
+        marker_data = marker_snapshot.to_dict() if marker_snapshot.exists else {}
+        marker_updated = _iso(marker_data.get("updated_at"))
+        since_iso = _iso(since)
+        if marker_updated and since_iso and marker_updated <= since_iso:
+            return {
+                "next_cursor": since_iso,
+                "server_time": _iso(_utcnow()),
+                "shops": [], "staff": [], "settings": [], "products": [],
+                "sales": [], "sale_items": [], "payments": [], "stock_movements": [],
+            }
+
         def changed(name, keep):
             return [value for value in self._changed_since(name, since) if keep(value)]
 
@@ -879,25 +944,16 @@ class FirestoreSyncService:
             for doc in self._collection("sale_items").where("sale_id", "in", chunk).stream():
                 sale_items.append(doc.to_dict() or {})
 
-        # Child rows that crossed the cursor still need their product parent,
-        # even when the product itself is unchanged. Fetch just those by id.
-        needed_product_ids = {
-            str(value.get("product_id"))
-            for value in (*rows["stock_movements"], *sale_items)
-            if value.get("product_id") is not None
-        }
-        products_by_id = {str(product.get("id")): product for product in rows["products"]}
-        for product_id in needed_product_ids - products_by_id.keys():
-            snapshot = self._collection("products").document(product_id).get()
-            product = snapshot.to_dict() if snapshot.exists else None
-            if product and shop_id in (product.get("shop_ids") or []):
-                products_by_id[product_id] = product
-        rows["products"] = list(products_by_id.values())
+        # Product catalog rows are synchronized independently. Sale/stock child
+        # rows do not require an extra product document read here because the
+        # local device already has the product catalog needed to render them.
+        # A genuinely new/changed product is included by the products query above.
 
         rows["staff"] = [_clean_staff({**staff, "shop_id": shop_id}) for staff in rows["staff"]]
 
+        next_cursor = marker_updated or high_watermark or _iso(since)
         return {
-            "next_cursor": high_watermark or _iso(since),
+            "next_cursor": next_cursor,
             "server_time": _iso(_utcnow()),
             "shops": rows["shops"],
             "staff": rows["staff"],
@@ -913,6 +969,9 @@ class FirestoreSyncService:
         """Return the existing pull response shape, filtered to one shop."""
         if since:
             return self._pull_incremental(shop_id, since)
+        marker_snapshot = self._sync_marker(shop_id).get()
+        marker_data = marker_snapshot.to_dict() if marker_snapshot.exists else {}
+        marker_updated = _iso(marker_data.get("updated_at"))
         collections = {
             "shops": list(self._collection("shops").where("id", "==", shop_id).stream()),
             "staff": list(self._collection("staff").where("shop_id", "==", shop_id).stream()),
@@ -957,7 +1016,7 @@ class FirestoreSyncService:
         ]
 
         return {
-            "next_cursor": high_watermark or _iso(since),
+            "next_cursor": marker_updated or high_watermark or _iso(since),
             "server_time": _iso(_utcnow()),
             "shops": rows["shops"],
             "staff": rows["staff"],
