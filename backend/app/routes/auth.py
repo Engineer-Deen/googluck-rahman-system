@@ -196,6 +196,10 @@ def login():
             "email": _staff_value(staff, "email"),
             "role": _staff_value(staff, "role"),
             "shop_id": _staff_value(staff, "shop_id"),
+            # Local-mode desktops re-run this same is_active check against
+            # this exact payload after proxying here, so it must be included
+            # or every local login is rejected even with a correct password.
+            "is_active": bool(_staff_value(staff, "is_active", True)),
         },
     )
 
