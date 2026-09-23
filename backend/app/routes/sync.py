@@ -248,10 +248,32 @@ def push():
         except ValueError as e:
             if not firestore_service:
                 db.session.rollback()
+            # This is the actual reason a queued sale/payment/stock change
+            # gets rejected -- but the client only ever sees an HTTP 200
+            # with this text buried inside the JSON body (see the push()
+            # docstring: results, not the HTTP status, carry per-item
+            # pass/fail). A request-log / access-log view on Vercel (or
+            # any host) never shows response bodies, so without a server
+            # side log line like this, a permanently-rejected item is
+            # completely invisible to whoever is checking the deployment's
+            # logs -- everything "looks like" a healthy 200 the whole time.
+            current_app.logger.warning(
+                "sync push rejected outbox_id=%s table=%s record_id=%s "
+                "device_id=%s payload_shop_id=%s payload_device_id=%s "
+                "registered_shop_id=%s registered_device_id=%s reason=%s",
+                outbox_id, table_name, payload.get("id") or payload.get("sale_id"),
+                device_id, payload.get("shop_id"), payload.get("device_id"),
+                _device_value(device, "shop_id"), _device_value(device, "id"),
+                str(e),
+            )
             results.append({"outbox_id": outbox_id, "status": "error", "error": str(e)})
         except Exception as e:
             if not firestore_service:
                 db.session.rollback()
+            current_app.logger.exception(
+                "sync push crashed outbox_id=%s table=%s record_id=%s device_id=%s",
+                outbox_id, table_name, payload.get("id") or payload.get("sale_id"), device_id,
+            )
             results.append({"outbox_id": outbox_id, "status": "error", "error": f"Unexpected error: {e}"})
 
     return jsonify(results=results)
