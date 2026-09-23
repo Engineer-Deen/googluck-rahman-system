@@ -22,6 +22,7 @@ let currentMode = "local";
 let productsCache = [];
 let inventoryEditProductId = null;
 let sessionSales = [];
+let saleCart = [];
 let productsLoadedAt = 0;
 let productsLoadPromise = null;
 const PRODUCT_CACHE_MS = 2500;
@@ -264,6 +265,9 @@ async function loadProvisioningStatus() {
   const panel = document.getElementById("provisioning-panel");
   const stateEl = document.getElementById("provisioning-state");
   const deviceEl = document.getElementById("provisioning-device");
+  const enrollButton = document.getElementById("provision-submit-btn");
+  const retryButton = document.getElementById("provision-retry-btn");
+  const errorEl = document.getElementById("provisioning-error");
   if (!panel || !stateEl || !deviceEl || !localBackendReady) return;
   try {
     const res = await fetch(API_BASE + "/sync/provisioning/status");
@@ -272,12 +276,23 @@ async function loadProvisioningStatus() {
     stateEl.textContent = PROVISIONING_STATE_LABELS[state] || state;
     deviceEl.textContent = data.device_id ? `Device: ${data.device_id}` : "";
     panel.style.display = state === "READY" ? "none" : "block";
+
+    // Keep the two first-run actions mutually exclusive:
+    // enrollment is only for a device that has never been authorized;
+    // retry is only for an already-enrolled device whose initial pull failed.
+    if (enrollButton) enrollButton.style.display = state === "NOT_ENROLLED" ? "" : "none";
+    if (retryButton) retryButton.style.display = state === "SYNC_ERROR" ? "" : "none";
+
     if (state === "SYNC_ERROR" && data.last_pull_error) {
-      document.getElementById("provisioning-error").textContent = data.last_pull_error;
+      if (errorEl) errorEl.textContent = data.last_pull_error;
+    } else if (state !== "SYNC_ERROR" && errorEl) {
+      errorEl.textContent = "";
     }
   } catch (_) {
     stateEl.textContent = PROVISIONING_STATE_LABELS.SYNC_ERROR;
     panel.style.display = "block";
+    if (enrollButton) enrollButton.style.display = "none";
+    if (retryButton) retryButton.style.display = "";
   }
 }
 
@@ -321,6 +336,35 @@ async function provisionDesktop() {
   }
 }
 
+async function retryProvisioning() {
+  const button = document.getElementById("provision-retry-btn");
+  const errorEl = document.getElementById("provisioning-error");
+  if (!button) return;
+
+  if (errorEl) errorEl.textContent = "";
+  button.disabled = true;
+  button.textContent = "RETRYING...";
+  try {
+    const res = await fetch(API_BASE + "/sync/provisioning/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "Central synchronization could not complete.");
+    }
+
+    if (errorEl) errorEl.textContent = "Central synchronization completed. Desktop is ready.";
+    await loadProvisioningStatus();
+  } catch (err) {
+    if (errorEl) errorEl.textContent = err.message || "Central synchronization could not complete.";
+    await loadProvisioningStatus();
+  } finally {
+    button.disabled = false;
+    button.textContent = "RETRY CENTRAL SYNC";
+  }
+}
+
 async function doLogout() {
   try {
     if (authToken) await api("/auth/logout", { method: "POST" });
@@ -338,6 +382,8 @@ async function doLogout() {
   localStorage.removeItem("glr_staff");
   localStorage.removeItem("glr_admin_session_started");
   localStorage.removeItem("glr_admin_last_active");
+  saleCart = [];
+  renderSaleCart();
   document.getElementById("app").classList.remove("visible");
   document.getElementById("login-overlay").style.display = "flex";
 
@@ -825,12 +871,96 @@ async function loadSalesPanel() {
   renderSessionTable();
 }
 
+function getSaleCartTotal(items = saleCart) {
+  return items.reduce((total, item) => {
+    return total + (Number(item.unit_price) || 0) * (Number(item.quantity) || 0);
+  }, 0);
+}
+
+function getCurrentSaleDraft() {
+  const productId = Number(document.getElementById("s-product").value);
+  const price = Number(document.getElementById("s-price").value);
+  const qty = Number(document.getElementById("s-qty").value);
+  const hasDraftInput = !!document.getElementById("s-product").value ||
+    document.getElementById("s-price").value !== "" ||
+    document.getElementById("s-qty").value !== "1";
+
+  return { productId, price, qty, hasDraftInput };
+}
+
+function renderSaleCart() {
+  const tbody = document.getElementById("sale-cart-table");
+  const empty = document.getElementById("sale-cart-empty");
+  if (!tbody || !empty) return;
+
+  tbody.innerHTML = "";
+  empty.style.display = saleCart.length ? "none" : "block";
+
+  saleCart.forEach((item, index) => {
+    const product = productsCache.find((p) => Number(p.id) === Number(item.product_id));
+    const productName = product ? product.name : `Product #${item.product_id}`;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(productName)}</td>
+      <td>${money(item.unit_price)}</td>
+      <td>${Number(item.quantity)}</td>
+      <td>${money(Number(item.unit_price) * Number(item.quantity))}</td>
+      <td class="action-cell"><button class="btn btn-secondary btn-sm" type="button" onclick="removeSaleItem(${index})">REMOVE</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function addSaleItem() {
+  const { productId, price, qty } = getCurrentSaleDraft();
+  const select = document.getElementById("s-product");
+  const opt = select.selectedOptions[0];
+
+  if (!productId) { toast("Select a product first.", "error"); return; }
+  if (!price || price <= 0) { toast("Enter a valid price.", "error"); return; }
+  if (!qty || qty <= 0 || !Number.isInteger(qty)) {
+    toast("Enter a valid whole-number quantity.", "error");
+    return;
+  }
+
+  const stock = Number(opt && opt.dataset ? opt.dataset.stock : 0);
+  const alreadyInCart = saleCart
+    .filter((item) => Number(item.product_id) === productId)
+    .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+  if (Number.isFinite(stock) && stock >= 0 && alreadyInCart + qty > stock) {
+    toast(`Not enough stock. Only ${Math.max(stock - alreadyInCart, 0)} available for this product.`, "error");
+    return;
+  }
+
+  saleCart.push({
+    id: uuidv4(),
+    product_id: productId,
+    quantity: qty,
+    unit_price: price,
+  });
+  renderSaleCart();
+
+  // The current line has now been added. Clear only the line-entry controls;
+  // customer/payment information belongs to the whole sale and stays intact.
+  select.value = "";
+  document.getElementById("s-price").value = "";
+  document.getElementById("s-qty").value = "1";
+  document.getElementById("s-stock-card").style.display = "none";
+  calcSaleTotal();
+}
+
+function removeSaleItem(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= saleCart.length) return;
+  saleCart.splice(index, 1);
+  renderSaleCart();
+  calcSaleTotal();
+}
+
 function onPaidInFullToggle() {
   const checked = document.getElementById("s-paid-in-full").checked;
   const amountField = document.getElementById("s-amount-paid");
   if (checked) {
-    const total = Number(document.getElementById("s-price").value || 0) * Number(document.getElementById("s-qty").value || 0);
-    amountField.value = total.toFixed(2);
+    amountField.value = getSaleCartTotal() === 0 ? "" : getSaleCartTotal().toFixed(2);
     amountField.disabled = true;
   } else {
     amountField.disabled = false;
@@ -843,6 +973,7 @@ function onSaleProductChange() {
   const opt = select.selectedOptions[0];
   if (!opt || !opt.value) {
     document.getElementById("s-stock-card").style.display = "none";
+    calcSaleTotal();
     return;
   }
   document.getElementById("s-price").value = opt.dataset.price;
@@ -852,20 +983,22 @@ function onSaleProductChange() {
 }
 
 function calcSaleTotal() {
-  const price = Number(document.getElementById("s-price").value) || 0;
-  const qty = Number(document.getElementById("s-qty").value) || 0;
-  const total = price * qty;
+  const { productId, price, qty } = getCurrentSaleDraft();
+  let total = getSaleCartTotal();
+  if (productId && price > 0 && qty > 0) {
+    total += price * qty;
+  }
   document.getElementById("s-total-disp").textContent = money(total);
 
   // If "Paid in full" is checked, keep the amount field tracking the
-  // total as price/quantity change, rather than letting it go stale.
+  // complete sale total, including all cart items and the current draft.
   if (document.getElementById("s-paid-in-full").checked) {
-    document.getElementById("s-amount-paid").value = total.toFixed(2);
+    document.getElementById("s-amount-paid").value = total > 0 ? total.toFixed(2) : "";
   }
 
   const paidField = document.getElementById("s-amount-paid").value;
   const balancePreview = document.getElementById("s-balance-preview");
-  if (paidField === "") {
+  if (paidField === "" || total <= 0) {
     balancePreview.style.display = "none";
     return;
   }
@@ -898,38 +1031,70 @@ function clearSaleForm() {
   document.getElementById("s-paid-in-full").checked = false;
   document.getElementById("s-stock-card").style.display = "none";
   document.getElementById("s-balance-preview").style.display = "none";
+  saleCart = [];
+  renderSaleCart();
   calcSaleTotal();
 }
 
 async function saveSale() {
-  const productId = Number(document.getElementById("s-product").value);
-  const price = Number(document.getElementById("s-price").value);
-  const qty = Number(document.getElementById("s-qty").value);
   const customerInput = document.getElementById("s-customer");
   normalizeInputName(customerInput);
   const customer = customerInput.value.trim();
   const amountPaidField = document.getElementById("s-amount-paid").value;
   const btn = document.getElementById("s-save-btn");
+  const draft = getCurrentSaleDraft();
+  const finalItems = saleCart.map((item) => ({ ...item }));
+
+  // Preserve the original single-item workflow as well: pressing SAVE SALE
+  // with a product entered but not explicitly added to the cart includes that
+  // draft automatically. The cart button remains useful for multi-item sales.
+  if (draft.hasDraftInput) {
+    if (!draft.productId) { toast("Select a product first.", "error"); return; }
+    if (!draft.price || draft.price <= 0) { toast("Enter a valid price.", "error"); return; }
+    if (!draft.qty || draft.qty <= 0 || !Number.isInteger(draft.qty)) {
+      toast("Enter a valid whole-number quantity.", "error");
+      return;
+    }
+
+    const opt = document.getElementById("s-product").selectedOptions[0];
+    const stock = Number(opt && opt.dataset ? opt.dataset.stock : 0);
+    const alreadyInCart = saleCart
+      .filter((item) => Number(item.product_id) === draft.productId)
+      .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+    if (Number.isFinite(stock) && stock >= 0 && alreadyInCart + draft.qty > stock) {
+      toast(`Not enough stock. Only ${Math.max(stock - alreadyInCart, 0)} available for this product.`, "error");
+      return;
+    }
+
+    finalItems.push({
+      id: uuidv4(),
+      product_id: draft.productId,
+      quantity: draft.qty,
+      unit_price: draft.price,
+    });
+  }
 
   if (!customer) { toast("Enter customer name.", "error"); return; }
-  if (!productId) { toast("Select a product first.", "error"); return; }
-  if (!price || price <= 0) { toast("Enter a valid price.", "error"); return; }
-  if (!qty || qty <= 0) { toast("Enter a valid quantity.", "error"); return; }
+  if (!finalItems.length) { toast("Add at least one item to the cart.", "error"); return; }
+
+  const total = finalItems.reduce((sum, item) => sum + Number(item.unit_price) * Number(item.quantity), 0);
+  if (!Number.isFinite(total) || total <= 0) { toast("Sale total must be greater than zero.", "error"); return; }
+  if (amountPaidField !== "" && Number(amountPaidField) > total) {
+    toast("Amount paid cannot exceed the sale total.", "error");
+    return;
+  }
 
   // Generated HERE, at the moment of sale, on this device -- not by the
-  // server. This is what makes the sale idempotent and safe to sync
-  // later no matter how many times the request gets retried.
+  // server. This makes the sale idempotent and safe to sync later.
   const saleId = uuidv4();
 
   const payload = {
     id: saleId,
     customer_name: customer,
-    items: [{ product_id: productId, quantity: qty, unit_price: price }],
+    items: finalItems,
   };
   // Leaving Amount Paid blank means nothing has been paid yet -- the
-  // server defaults it to 0 (an open balance), not a full payment. We
-  // simply don't send the field at all when it's blank, and the
-  // server's own default takes over from there.
+  // server defaults it to 0 (an open balance), not a full payment.
   if (amountPaidField !== "") {
     payload.amount_paid = Number(amountPaidField);
   }
@@ -1493,6 +1658,7 @@ async function loadShopBranding(){
 }
 
 let syncPollTimer = null;
+
 function getDesktopPlatformLabel() {
   const ua = navigator.userAgent || "";
   if (/Windows/i.test(ua)) return "Windows";
@@ -1520,6 +1686,8 @@ async function ensureDeviceRegistration() {
   }
 }
 
+
+
 function startSyncStatusPolling() {
   pollSyncStatus();
   clearInterval(syncPollTimer);
@@ -1528,6 +1696,17 @@ function startSyncStatusPolling() {
       pollSyncStatus();
     }
   }, 10000);
+}
+
+async function triggerSync(options) {
+  const silent = !!(options && options.silent);
+  try {
+    await api("/sync/trigger", { method: "POST" });
+    if (!silent) syncToast("Synchronization requested. Checking the saved result.", "info");
+    setTimeout(pollSyncStatus, 1000);
+  } catch (e) {
+    if (!e.authExpired && !e.networkFailure && !silent) syncToast(e.message, "error");
+  }
 }
 
 let lastSyncSnapshot = { key: null, pending: 0 };
