@@ -48,6 +48,41 @@ def has_local_session():
     return bool(_session_cache())
 
 
+def local_session_required(fn):
+    """Require a session established by a successful central login.
+
+    This decorator is local-only. It checks the in-memory session cache and
+    never calls central /api/auth/me. A cache miss means the local sidecar
+    session is no longer established, so the client must log in again.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            return jsonify(error="Missing or invalid Authorization header"), 401
+
+        token = auth_header.split(" ", 1)[1].strip()
+        if not token:
+            return jsonify(error="Missing or invalid Authorization header"), 401
+
+        cached = _session_cache().get(_session_key(token))
+        if cached is None:
+            return jsonify(error="Session expired, please log in again"), 401
+
+        if not _staff_value(cached, "is_active", True):
+            clear_local_session(token)
+            return jsonify(error="Account is inactive, please log in again"), 401
+
+        g.staff_id = _staff_value(cached, "id")
+        g.staff_role = _staff_value(cached, "role")
+        g.staff_shop_id = _staff_value(cached, "shop_id")
+
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _staff_value(staff, key, default=None):
     if isinstance(staff, dict):
         return staff.get(key, default)
