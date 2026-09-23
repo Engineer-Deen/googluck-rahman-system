@@ -366,14 +366,20 @@ def _last_pull_failed(app):
 
 def start_background_sync(app):
     """
-    Push pending sales quickly, pull reference data slowly, and back off when
-    central is failing. Previously both ran every 5 seconds forever, even while
-    central was returning errors, which hammered the central database (17,000+
-    pulls a day per PC) and exhausted the Firestore daily quota.
+    Push pending sales promptly (cheap -- costs nothing while the outbox is
+    empty), and pull reference data exactly once at startup to catch the
+    device up. After that, further pulls are event-driven only: they happen
+    when trigger_sync_soon() is called following an actual mutating action
+    (a sale, a staff/product/settings change, etc.), not on a recurring
+    timer. A fixed-interval pull loop -- even throttled to 60s -- still
+    reads Firestore continuously whether or not anyone is using the system,
+    which is unnecessary cost for a single-shop POS: nothing changes on the
+    server unless someone here or on another device did something.
     """
     def loop():
-        push_failures = pull_failures = 0
-        next_push = next_pull = 0.0
+        push_failures = 0
+        next_push = 0.0
+        pull_reference_data_once(app)  # one catch-up pull as the app comes up
         while True:
             try:
                 if app.config.get("GLR_MODE") == "local":
@@ -382,10 +388,6 @@ def start_background_sync(app):
                         result = push_pending_once(app)
                         push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
                         next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
-                    if now >= next_pull:
-                        pull_reference_data_once(app)
-                        pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
-                        next_pull = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
             except Exception:
                 pass
             time.sleep(SYNC_INTERVAL_SECONDS)
