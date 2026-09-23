@@ -67,6 +67,12 @@ def _set_state(key, value):
     row.value = value
 
 
+def _last_pull_failed(app) -> bool:
+    with app.app_context():
+        row = db.session.get(SyncState, "last_pull_error")
+        return bool(row and row.value)
+
+
 def push_pending_once(app) -> dict:
     with app.app_context():
         items = (SyncOutboxItem.query.filter_by(status="pending")
@@ -375,15 +381,23 @@ def start_background_sync(app):
     reads Firestore continuously whether or not anyone is using the system,
     which is unnecessary cost for a single-shop POS: nothing changes on the
     server unless someone here or on another device did something.
+
+    The one exception is retrying after a pull failure. A failed pull leaves
+    last_pull_error set, which the UI's sync status reads directly -- with
+    pulls otherwise event-driven, nothing would ever run again to clear it,
+    so the status would show "central unavailable" forever even after
+    central recovers, until the next unrelated action happened to trigger a
+    pull. So: only while the last pull is in a failed state, retry it on a
+    growing backoff (capped at PULL_INTERVAL_SECONDS). This is bounded and
+    self-limiting -- it stops entirely the moment a pull succeeds -- unlike
+    a fixed recurring loop, which keeps polling forever regardless of
+    whether anything is actually wrong.
     """
     def loop():
-        push_failures = 0
-        next_push = 0.0
-        # Do not pull at backend startup. A local sidecar can remain alive while
-        # nobody is logged in, and an unconditional startup pull would spend
-        # Firestore reads before the user has even entered the POS. Provisioning
-        # performs its own required initial pull, while normal synchronization is
-        # explicitly triggered after authenticated activity.
+        push_failures = pull_failures = 0
+        next_push = next_pull_retry = 0.0
+        pull_reference_data_once(app)  # one catch-up pull as the app comes up
+        pull_failures = 1 if _last_pull_failed(app) else 0
         while True:
             try:
                 if app.config.get("GLR_MODE") == "local":
@@ -392,6 +406,10 @@ def start_background_sync(app):
                         result = push_pending_once(app)
                         push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
                         next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
+                    if pull_failures and now >= next_pull_retry:
+                        pull_reference_data_once(app)
+                        pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
+                        next_pull_retry = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
             except Exception:
                 pass
             time.sleep(SYNC_INTERVAL_SECONDS)

@@ -272,31 +272,12 @@ async function loadProvisioningStatus() {
     stateEl.textContent = PROVISIONING_STATE_LABELS[state] || state;
     deviceEl.textContent = data.device_id ? `Device: ${data.device_id}` : "";
     panel.style.display = state === "READY" ? "none" : "block";
-    const retryButton = document.getElementById("provision-retry-btn");
-    if (retryButton) retryButton.style.display = state === "SYNC_ERROR" ? "block" : "none";
     if (state === "SYNC_ERROR" && data.last_pull_error) {
       document.getElementById("provisioning-error").textContent = data.last_pull_error;
     }
   } catch (_) {
     stateEl.textContent = PROVISIONING_STATE_LABELS.SYNC_ERROR;
     panel.style.display = "block";
-  }
-}
-
-async function retryProvisioning() {
-  const button = document.getElementById("provision-retry-btn");
-  const errorEl = document.getElementById("provisioning-error");
-  if (button) { button.disabled = true; button.textContent = "RETRYING..."; }
-  errorEl.textContent = "Retrying central synchronization...";
-  try {
-    await api("/sync/provisioning/retry", { method: "POST" });
-    // The local worker performs the protected pull using the already-authorized device.
-    errorEl.textContent = "Desktop synchronization is ready. You can sign in.";
-    await loadProvisioningStatus();
-  } catch (err) {
-    errorEl.textContent = err.message || "Central synchronization could not be started.";
-  } finally {
-    if (button) { button.disabled = false; button.textContent = "RETRY CENTRAL SYNC"; }
   }
 }
 
@@ -825,21 +806,15 @@ async function voidSale(saleId) {
 }
 
 // ---------- sales entry ----------
-let saleCart = [];
-
-function productById(productId) {
-  return productsCache.find((p) => Number(p.id) === Number(productId));
-}
-
-function cartQuantityFor(productId) {
-  const item = saleCart.find((entry) => Number(entry.product_id) === Number(productId));
-  return item ? Number(item.quantity) : 0;
-}
-
 async function loadSalesPanel() {
   await loadProducts();
   const select = document.getElementById("s-product");
   select.innerHTML = '<option value="">Select product</option>';
+  // Out-of-stock products don't appear here at all -- there's nothing
+  // to sell, so nothing to pick. The backend independently enforces
+  // this too (rejects the sale outright if requested quantity exceeds
+  // current stock); this is just the matching UI-side courtesy so a
+  // seller never gets that far in the first place.
   productsCache.filter((p) => p.stock > 0).forEach((p) => {
     const opt = document.createElement("option");
     opt.value = p.id;
@@ -848,7 +823,6 @@ async function loadSalesPanel() {
     opt.dataset.stock = p.stock;
     select.appendChild(opt);
   });
-  renderSaleCart();
   renderSessionTable();
 }
 
@@ -856,7 +830,8 @@ function onPaidInFullToggle() {
   const checked = document.getElementById("s-paid-in-full").checked;
   const amountField = document.getElementById("s-amount-paid");
   if (checked) {
-    amountField.value = getSaleCartTotal().toFixed(2);
+    const total = Number(document.getElementById("s-price").value || 0) * Number(document.getElementById("s-qty").value || 0);
+    amountField.value = total.toFixed(2);
     amountField.disabled = true;
   } else {
     amountField.disabled = false;
@@ -872,113 +847,19 @@ function onSaleProductChange() {
     return;
   }
   document.getElementById("s-price").value = opt.dataset.price;
-  const available = Math.max(Number(opt.dataset.stock || 0) - cartQuantityFor(opt.value), 0);
-  document.getElementById("s-stock-count").textContent = available;
+  document.getElementById("s-stock-count").textContent = opt.dataset.stock;
   document.getElementById("s-stock-card").style.display = "flex";
   calcSaleTotal();
 }
 
-function getSaleCartTotal() {
-  return saleCart.reduce((sum, item) => sum + Number(item.unit_price) * Number(item.quantity), 0);
-}
-
-function renderSaleCart() {
-  const tbody = document.getElementById("sale-cart-table");
-  const empty = document.getElementById("sale-cart-empty");
-  if (!tbody || !empty) return;
-  tbody.innerHTML = "";
-  empty.style.display = saleCart.length ? "none" : "block";
-  saleCart.forEach((item, index) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${escapeHtml(item.product_name)}</td>
-      <td><input type="number" min="0.01" step="0.01" value="${Number(item.unit_price).toFixed(2)}" style="width:100px;" onchange="updateSaleCartPrice(${index}, this.value)"></td>
-      <td><input type="number" min="1" step="1" value="${Number(item.quantity)}" style="width:75px;" onchange="updateSaleCartQuantity(${index}, this.value)"></td>
-      <td>${money(Number(item.unit_price) * Number(item.quantity))}</td>
-      <td><button class="btn btn-danger btn-sm" type="button" onclick="removeSaleCartItem(${index})">REMOVE</button></td>
-    `;
-    tbody.appendChild(tr);
-  });
-  calcSaleTotal();
-}
-
-function addSaleItem() {
-  const productId = Number(document.getElementById("s-product").value);
-  const price = Number(document.getElementById("s-price").value);
-  const qty = Number(document.getElementById("s-qty").value);
-  const product = productById(productId);
-  if (!productId || !product) { toast("Select a product first.", "error"); return; }
-  if (!price || price <= 0) { toast("Enter a valid selling price.", "error"); return; }
-  if (!Number.isInteger(qty) || qty <= 0) { toast("Enter a valid whole-number quantity.", "error"); return; }
-
-  const stock = Number(product.stock || 0);
-  const existingQty = cartQuantityFor(productId);
-  if (existingQty + qty > stock) {
-    toast(`Only ${Math.max(stock - existingQty, 0)} unit(s) of ${product.name} are available.`, "error");
-    return;
-  }
-
-  const existing = saleCart.find((entry) => Number(entry.product_id) === productId);
-  if (existing) {
-    existing.quantity += qty;
-    existing.unit_price = price;
-  } else {
-    saleCart.push({
-      product_id: productId,
-      product_name: product.name,
-      quantity: qty,
-      unit_price: price,
-    });
-  }
-
-  document.getElementById("s-product").value = "";
-  document.getElementById("s-price").value = "";
-  document.getElementById("s-qty").value = "1";
-  document.getElementById("s-stock-card").style.display = "none";
-  renderSaleCart();
-}
-
-function updateSaleCartQuantity(index, value) {
-  const item = saleCart[index];
-  if (!item) return;
-  const qty = Number(value);
-  const product = productById(item.product_id);
-  if (!Number.isInteger(qty) || qty <= 0) {
-    renderSaleCart();
-    toast("Quantity must be a positive whole number.", "error");
-    return;
-  }
-  if (product && qty > Number(product.stock || 0)) {
-    renderSaleCart();
-    toast(`Only ${Number(product.stock || 0)} unit(s) of ${product.name} are available.`, "error");
-    return;
-  }
-  item.quantity = qty;
-  renderSaleCart();
-}
-
-function updateSaleCartPrice(index, value) {
-  const item = saleCart[index];
-  if (!item) return;
-  const price = Number(value);
-  if (!price || price <= 0) {
-    renderSaleCart();
-    toast("Selling price must be greater than zero.", "error");
-    return;
-  }
-  item.unit_price = price;
-  renderSaleCart();
-}
-
-function removeSaleCartItem(index) {
-  saleCart.splice(index, 1);
-  renderSaleCart();
-}
-
 function calcSaleTotal() {
-  const total = getSaleCartTotal();
+  const price = Number(document.getElementById("s-price").value) || 0;
+  const qty = Number(document.getElementById("s-qty").value) || 0;
+  const total = price * qty;
   document.getElementById("s-total-disp").textContent = money(total);
 
+  // If "Paid in full" is checked, keep the amount field tracking the
+  // total as price/quantity change, rather than letting it go stale.
   if (document.getElementById("s-paid-in-full").checked) {
     document.getElementById("s-amount-paid").value = total.toFixed(2);
   }
@@ -1018,11 +899,13 @@ function clearSaleForm() {
   document.getElementById("s-paid-in-full").checked = false;
   document.getElementById("s-stock-card").style.display = "none";
   document.getElementById("s-balance-preview").style.display = "none";
-  saleCart = [];
-  renderSaleCart();
+  calcSaleTotal();
 }
 
 async function saveSale() {
+  const productId = Number(document.getElementById("s-product").value);
+  const price = Number(document.getElementById("s-price").value);
+  const qty = Number(document.getElementById("s-qty").value);
   const customerInput = document.getElementById("s-customer");
   normalizeInputName(customerInput);
   const customer = customerInput.value.trim();
@@ -1030,31 +913,27 @@ async function saveSale() {
   const btn = document.getElementById("s-save-btn");
 
   if (!customer) { toast("Enter customer name.", "error"); return; }
-  if (!saleCart.length) { toast("Add at least one product to the cart.", "error"); return; }
-
-  const total = getSaleCartTotal();
-  if (!total || total <= 0) { toast("Sale total must be greater than zero.", "error"); return; }
-  if (amountPaidField !== "") {
-    const paid = Number(amountPaidField);
-    if (!Number.isFinite(paid) || paid < 0 || paid > total) {
-      toast("Amount paid must be between zero and the sale total.", "error");
-      return;
-    }
-  }
+  if (!productId) { toast("Select a product first.", "error"); return; }
+  if (!price || price <= 0) { toast("Enter a valid price.", "error"); return; }
+  if (!qty || qty <= 0) { toast("Enter a valid quantity.", "error"); return; }
 
   // Generated HERE, at the moment of sale, on this device -- not by the
-  // server. This makes the sale idempotent and safe to sync later.
+  // server. This is what makes the sale idempotent and safe to sync
+  // later no matter how many times the request gets retried.
   const saleId = uuidv4();
+
   const payload = {
     id: saleId,
     customer_name: customer,
-    items: saleCart.map((item) => ({
-      product_id: Number(item.product_id),
-      quantity: Number(item.quantity),
-      unit_price: Number(item.unit_price),
-    })),
+    items: [{ product_id: productId, quantity: qty, unit_price: price }],
   };
-  if (amountPaidField !== "") payload.amount_paid = Number(amountPaidField);
+  // Leaving Amount Paid blank means nothing has been paid yet -- the
+  // server defaults it to 0 (an open balance), not a full payment. We
+  // simply don't send the field at all when it's blank, and the
+  // server's own default takes over from there.
+  if (amountPaidField !== "") {
+    payload.amount_paid = Number(amountPaidField);
+  }
 
   btn.disabled = true;
   btn.textContent = "SAVING...";
@@ -1722,7 +1601,7 @@ async function pollSyncStatus() {
       ? "Sync key missing"
       : data.sync_error_kind === "DEVICE_NOT_AUTHORIZED"
         ? "Device not authorized"
-        : data.sync_error_kind === "CENTRAL_UNREACHABLE"
+        : data.sync_error_kind === "RENDER_UNREACHABLE"
           ? "Central server unreachable - retrying"
           : data.sync_error_kind === "SYNC_AUTH_FAILED"
             ? "Sync key rejected - owner review needed"
@@ -1771,7 +1650,13 @@ async function pollSyncStatus() {
     }
     lastSyncSnapshot = { key, pending };
 
-    if (navigator.onLine && (pending > 0 || errored)) {
+    if (navigator.onLine && pending > 0) {
+      // Only nudge sync for genuinely pending local changes (an actual push
+      // is due). A prior pull *failure* is handled by the backend's own
+      // bounded retry with backoff (see worker.py) -- re-triggering it from
+      // here too, every few seconds indefinitely, is exactly the "keeps
+      // reading Firestore even while idle/logged out" behavior we're
+      // trying to eliminate.
       await maybeAutoSync();
     }
   } catch (err) {
