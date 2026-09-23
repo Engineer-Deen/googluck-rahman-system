@@ -614,16 +614,39 @@ def status():
     device_id = get_current_device_id() if current_app.config["GLR_MODE"] == "local" else None
 
     states = {s.key: s.value for s in SyncState.query.all()} if current_app.config["GLR_MODE"] == "local" else {}
-    last_error = states.get("last_sync_error") or states.get("last_pull_error")
+
+    pending_by_table = {}
+    if current_app.config["GLR_MODE"] == "local":
+        rows = (
+            db.session.query(
+                SyncOutboxItem.table_name,
+                func.count(SyncOutboxItem.id),
+            )
+            .filter(SyncOutboxItem.status == "pending")
+            .group_by(SyncOutboxItem.table_name)
+            .all()
+        )
+        pending_by_table = {table_name: int(count) for table_name, count in rows}
+
+    # Keep upload and refresh failures separate. A pull/refresh problem must
+    # never be reported to the frontend as an upload/push failure. Otherwise
+    # the header can incorrectly say "retrying upload" while the queued
+    # records themselves are healthy.
+    last_sync_error = states.get("last_sync_error") or ""
+    last_pull_error = states.get("last_pull_error") or ""
+
     return jsonify(
         mode=current_app.config["GLR_MODE"],
         provisioning_state=_effective_provisioning_state() if current_app.config["GLR_MODE"] == "local" else "READY",
         pending_count=pending,
+        pending_by_table=pending_by_table,
         needs_review_count=needs_review,
         device_id=device_id,
         last_sync_at=states.get("last_sync_at"),
-        last_sync_error=last_error,
-        sync_error_kind=_sync_error_kind(last_error),
+        last_sync_error=last_sync_error,
+        sync_error_kind=_sync_error_kind(last_sync_error),
         last_pull_at=states.get("last_pull_success"),
+        last_pull_error=last_pull_error,
+        pull_error_kind=_sync_error_kind(last_pull_error),
         staff_needing_provisioning=int((states.get("last_pull_skipped_staff") or "0") or "0"),
     )

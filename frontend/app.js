@@ -1658,6 +1658,7 @@ async function loadShopBranding(){
 }
 
 let syncPollTimer = null;
+let syncRequestInFlight = false;
 
 function getDesktopPlatformLabel() {
   const ua = navigator.userAgent || "";
@@ -1686,7 +1687,58 @@ async function ensureDeviceRegistration() {
   }
 }
 
+function formatSyncTime(value) {
+  if (!value) return "never";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
 
+function pluralize(count, singular, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function formatPendingSummary(pendingByTable, fallbackCount) {
+  const labels = {
+    sales: "sale",
+    sale_payments: "payment",
+    stock_movements: "stock change",
+  };
+
+  const parts = Object.entries(pendingByTable || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([table, count]) => pluralize(Number(count), labels[table] || table.replace(/_/g, " ")));
+
+  return parts.length ? parts.join(" • ") : pluralize(fallbackCount, "change");
+}
+
+function setSyncUi({ state, label, detail, pending = 0, title = "", disabled = false }) {
+  const wrap = document.getElementById("sync-status");
+  const dot = document.getElementById("sync-dot");
+  const labelEl = document.getElementById("sync-label");
+  const detailEl = document.getElementById("sync-detail");
+  const badge = document.getElementById("sync-badge");
+  const button = document.getElementById("sync-btn");
+
+  if (!wrap || !dot || !labelEl || !detailEl || !badge || !button) return;
+
+  wrap.classList.remove("sync-good", "sync-busy", "sync-error", "sync-review", "sync-neutral");
+  wrap.classList.add(`sync-${state}`);
+  labelEl.textContent = label;
+  detailEl.textContent = detail;
+  wrap.title = title || detail;
+  dot.classList.toggle("online", state === "good" || state === "busy");
+
+  if (pending > 0) {
+    badge.style.display = "inline-block";
+    badge.textContent = `${pending} waiting`;
+  } else {
+    badge.style.display = "none";
+  }
+
+  button.disabled = !!disabled;
+  button.textContent = syncRequestInFlight ? "SYNCING..." : "SYNC NOW";
+}
 
 function startSyncStatusPolling() {
   pollSyncStatus();
@@ -1700,12 +1752,27 @@ function startSyncStatusPolling() {
 
 async function triggerSync(options) {
   const silent = !!(options && options.silent);
+  if (syncRequestInFlight) return;
+
+  syncRequestInFlight = true;
+  setSyncUi({
+    state: "busy",
+    label: "Syncing",
+    detail: "Sending queued changes to the central server…",
+    disabled: true,
+  });
+
   try {
     await api("/sync/trigger", { method: "POST" });
-    if (!silent) syncToast("Synchronization requested. Checking the saved result.", "info");
+    if (!silent) syncToast("Synchronization started. The status will update when the local worker finishes.", "info");
+    await pollSyncStatus();
     setTimeout(pollSyncStatus, 1000);
   } catch (e) {
     if (!e.authExpired && !e.networkFailure && !silent) syncToast(e.message, "error");
+    await pollSyncStatus();
+  } finally {
+    syncRequestInFlight = false;
+    await pollSyncStatus();
   }
 }
 
@@ -1715,99 +1782,135 @@ async function pollSyncStatus() {
   if (!authToken) return;
   try {
     const data = await api("/sync/status");
-    const dot = document.getElementById("sync-dot");
-    const label = document.getElementById("sync-label");
-    const badge = document.getElementById("sync-badge");
+
+    const pending = Number(data.pending_count || 0);
+    const pendingSummary = formatPendingSummary(data.pending_by_table, pending);
+    const needsReview = Number(data.needs_review_count || 0);
+    const lastPush = formatSyncTime(data.last_sync_at);
+    const lastPull = formatSyncTime(data.last_pull_at);
+    const pushError = data.last_sync_error || "";
+    const pullError = data.last_pull_error || "";
+    const state = data.sync_state || "synced";
+    const pushProblem = !!pushError;
+    const pullProblem = !!pullError;
 
     if (data.mode !== "local") {
-      label.textContent = "Central server";
-      badge.style.display = "none";
-      dot.classList.add("online");
+      setSyncUi({
+        state: "good",
+        label: "Central mode",
+        detail: "Connected to central server",
+        title: "Central deployment is handling synchronization directly.",
+      });
       lastSyncSnapshot = { key: "central", pending: 0 };
       return;
     }
 
     if (data.provisioning_state === "NOT_ENROLLED") {
-      label.textContent = "Not enrolled";
-      dot.classList.remove("online");
+      setSyncUi({
+        state: "neutral",
+        label: "Not enrolled",
+        detail: "Device authorization is required",
+        title: "This desktop is not yet authorized for synchronization.",
+      });
+      lastSyncSnapshot = { key: "not_enrolled", pending: 0 };
       return;
     }
+
     if (data.provisioning_state === "ENROLLED / PROVISIONING") {
-      label.textContent = "Provisioning";
-      dot.classList.add("online");
+      setSyncUi({
+        state: "busy",
+        label: "Setting up sync",
+        detail: "Downloading business data from central server…",
+        title: "The device is completing its initial synchronization.",
+      });
+      lastSyncSnapshot = { key: "provisioning", pending: 0 };
       return;
     }
 
-    const errored = !!data.last_sync_error;
-    const pending = Number(data.pending_count || 0);
-    const needsReview = Number(data.needs_review_count || 0);
-    const key = errored
-      ? "unavailable"
-      : needsReview > 0
-        ? "review"
-        : pending > 0
-          ? "pending"
-          : "synced";
+    let key = state;
+    let label = "Synced";
+    let detail = `All changes sent • Last upload ${lastPush}`;
+    let uiState = "good";
 
-    const specificErrorLabel = data.sync_error_kind === "SYNC_API_KEY_MISSING"
-      ? "Sync key missing"
-      : data.sync_error_kind === "DEVICE_NOT_AUTHORIZED"
-        ? "Device not authorized"
-        : data.sync_error_kind === "RENDER_UNREACHABLE"
-          ? "Central server unreachable - retrying"
-          : data.sync_error_kind === "SYNC_AUTH_FAILED"
-            ? "Sync key rejected - owner review needed"
-            : null;
-
-    if (specificErrorLabel) {
-      label.textContent = specificErrorLabel;
-      dot.classList.remove("online");
-    } else if (key === "unavailable") {
-      label.textContent = "Central server unavailable - retrying";
-      dot.classList.remove("online");
-    } else if (key === "review") {
-      label.textContent = "Sync failed - owner review needed";
-      dot.classList.remove("online");
-    } else if (key === "pending") {
-      label.textContent = "Syncing...";
-      dot.classList.add("online");
+    if (needsReview > 0) {
+      key = "review";
+      label = "Needs attention";
+      detail = `${pluralize(needsReview, "change")} could not be synchronized and needs review`;
+      uiState = "review";
+    } else if (pending > 0 && pushProblem) {
+      key = "retrying";
+      label = "Retrying upload";
+      detail = `${pendingSummary} waiting • retrying upload automatically`;
+      uiState = "error";
+    } else if (pending > 0) {
+      key = "pending";
+      label = syncRequestInFlight ? "Syncing" : "Queued for sync";
+      detail = pullProblem
+        ? `${pendingSummary} waiting • central refresh delayed`
+        : `${pendingSummary} queued • automatic upload active`;
+      uiState = syncRequestInFlight ? "busy" : "busy";
+    } else if (pushProblem || pullProblem) {
+      key = "error";
+      label = pullProblem && !pushProblem ? "Central refresh delayed" : "Central sync issue";
+      detail = pushProblem
+        ? "No queued changes, but the last upload reported an error"
+        : "All local changes are sent • the last central refresh reported an error";
+      uiState = "error";
     } else {
-      label.textContent = "Synced";
-      dot.classList.add("online");
+      key = "synced";
+      label = "Synced";
+      detail = lastPush === "never" && lastPull === "never"
+        ? "No synchronization has completed yet"
+        : `All changes sent • Upload ${lastPush} • Refresh ${lastPull}`;
+      uiState = "good";
     }
 
-    if (pending > 0) {
-      badge.style.display = "inline-block";
-      badge.textContent = `${pending} waiting`;
-    } else {
-      badge.style.display = "none";
-    }
+    const errorDetail = [
+      pushProblem ? `Upload error: ${pushError}` : "",
+      pullProblem ? `Refresh error: ${pullError}` : "",
+    ].filter(Boolean).join("\n");
+
+    setSyncUi({
+      state: uiState,
+      label,
+      detail,
+      pending,
+      title: errorDetail || `${detail}. Click SYNC NOW to send queued changes immediately.`,
+      disabled: syncRequestInFlight,
+    });
 
     const prev = lastSyncSnapshot;
     if (prev.key !== key) {
-      if (key === "unavailable") {
-        syncToast("Central synchronization unavailable. Local sales continue normally.", "warning");
-      } else if (prev.key === "unavailable" && (key === "synced" || key === "pending")) {
+      if (key === "error" || (key === "pending" && centralProblem)) {
+        syncToast(
+          pending > 0
+            ? `${pending} ${pending === 1 ? "change is" : "changes are"} waiting for central synchronization.`
+            : "Central synchronization reported an error.",
+          "warning"
+        );
+      } else if (prev.key === "error" && (key === "synced" || key === "pending")) {
         syncToast(
           key === "synced"
-            ? "Central synchronization restored."
-            : "Central synchronization restored. Syncing queued changes…",
+            ? "Central synchronization restored. All queued changes are clear."
+            : "Central synchronization restored. Queued changes are being sent.",
           "success"
         );
-      } else if (prev.key === "pending" && key === "synced") {
-        syncToast("Queued changes synchronized.", "success");
+      } else if ((prev.key === "pending" || prev.key === "error") && key === "synced") {
+        syncToast("Synchronization complete. All queued changes reached the central server.", "success");
       } else if (key === "review" && prev.key !== "review") {
-        syncToast("Some sync items need owner review.", "warning");
+        syncToast(`${needsReview} synchronization ${needsReview === 1 ? "item needs" : "items need"} owner review.`, "warning");
       }
     }
     lastSyncSnapshot = { key, pending };
 
   } catch (err) {
-    // Can't even reach our OWN local server -- something's actually wrong,
-    // not just central being unreachable (the local server handles that
-    // distinction internally and always answers this endpoint if it's up).
-    document.getElementById("sync-dot").classList.remove("online");
-    document.getElementById("sync-label").textContent = "POS server unavailable";
+    setSyncUi({
+      state: "error",
+      label: "POS server unavailable",
+      detail: "The local sync service cannot be reached",
+      title: "The desktop's local Flask service is unavailable.",
+      disabled: syncRequestInFlight,
+    });
   }
 }
 

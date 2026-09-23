@@ -67,10 +67,14 @@
       </div>
     </div>
     <div class="header-right" id="header-right">
-      <div class="sync-status">
+      <div class="sync-status sync-neutral" id="sync-status" title="Checking synchronization status">
         <div class="sync-dot" id="sync-dot"></div>
-        <span id="sync-label">Local mode</span>
-        <span class="badge pending" id="sync-badge" style="display:none;">0 waiting</span><button class="btn btn-secondary" style="padding:.25rem .55rem;font-size:.68rem;" onclick="triggerSync()">SYNC</button>
+        <div class="sync-copy">
+          <span class="sync-label" id="sync-label">Checking sync</span>
+          <span class="sync-detail" id="sync-detail">Reading local synchronization state…</span>
+        </div>
+        <span class="badge pending" id="sync-badge" style="display:none;">0 waiting</span>
+        <button class="btn btn-secondary sync-btn" id="sync-btn" type="button" onclick="triggerSync()">SYNC NOW</button>
       </div>
       <span id="header-staff-name" style="font-size:0.85rem;color:var(--text-secondary);"></span>
       <button class="btn-logout" onclick="doLogout()">LOGOUT</button>

@@ -311,9 +311,52 @@ header {
 
 .header-right { display: flex; align-items: center; gap: 1rem; }
 
-.sync-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-secondary); }
-.sync-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
+.sync-status {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 320px;
+  max-width: 460px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.sync-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
 .sync-dot.online { background: var(--success); }
+.sync-status.sync-busy .sync-dot { background: var(--warning); }
+.sync-status.sync-error .sync-dot { background: var(--danger); }
+.sync-status.sync-review .sync-dot { background: var(--warning); }
+.sync-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  line-height: 1.15;
+}
+.sync-label {
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.sync-detail {
+  max-width: 270px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  margin-top: 0.08rem;
+}
+.sync-btn {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.68rem;
+}
+.sync-btn:disabled { opacity: 0.7; cursor: wait; }
 .badge {
   padding: 0.2rem 0.55rem;
   border-radius: 999px;
@@ -536,7 +579,7 @@ button, .btn, .nav-tab, select, input { -webkit-tap-highlight-color: transparent
   .brand-name { font-size:.82rem; }
   .brand-tagline { font-size:.68rem; }
   .header-right { align-items:flex-start; }
-  .sync-status { width:100%; }
+  .sync-status { width:100%; min-width:0; max-width:none; }
   .stats-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:.65rem; }
   .stat-card { padding:.8rem; }
   .stat-value { font-size:1.05rem; }

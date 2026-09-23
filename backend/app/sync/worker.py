@@ -144,8 +144,25 @@ def push_pending_once(app) -> dict:
                         item.status = "needs_review"
                 failed += 1
 
-        _set_state("last_sync_at", datetime.now(timezone.utc).isoformat())
-        _set_state("last_sync_error", "")
+        if failed == 0 and confirmed == len(items):
+            # Record a successful upload only when every item in this batch
+            # was acknowledged by central. A partial batch failure must not
+            # overwrite the last error with a false success state.
+            _set_state("last_sync_at", datetime.now(timezone.utc).isoformat())
+            _set_state("last_sync_error", "")
+        else:
+            # Preserve a real push error so the UI can distinguish a queued
+            # record that is retrying from a queue that is merely waiting.
+            errors = [
+                item.last_error
+                for item in items
+                if item.last_error
+            ]
+            _set_state(
+                "last_sync_error",
+                errors[0] if errors else "One or more queued changes were not acknowledged by the central server.",
+            )
+
         db.session.commit()
         return {"pushed": len(items), "confirmed": confirmed, "failed": failed}
 
