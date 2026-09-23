@@ -136,12 +136,37 @@ def push_pending_once(app) -> dict:
                 item.attempt_count = (item.attempt_count or 0) + 1
                 item.last_attempt_at = datetime.now(timezone.utc)
                 item.last_error = result.get("error", "Unknown synchronization error")
-                # Business-rule conflicts should stop retrying forever and
-                # remain visible to the owner for reconciliation.
-                if result.get("status") == "error" and item.attempt_count >= 3:
-                    error_text = item.last_error.lower()
-                    if any(x in error_text for x in ("exceeds", "unknown sale", "not enough stock", "conflict")):
-                        item.status = "needs_review"
+                # Reaching this branch means the central server gave an
+                # explicit answer for this exact item (a real "no"), not a
+                # dropped connection -- a dropped connection is caught by
+                # the requests.RequestException branch above and returns
+                # before `results`/`by_id` even exist, so it never reaches
+                # this loop. An explicit rejection is deterministic:
+                # resending the identical payload will fail the identical
+                # way every time, no matter how many times the worker
+                # retries it.
+                #
+                # This used to only escalate to "needs_review" when the
+                # error text happened to match one of a few hardcoded
+                # phrases ("not enough stock", "conflict", ...). Every
+                # other kind of permanent rejection -- most commonly a
+                # stale shop_id on an old queued sale after the device was
+                # re-enrolled, but also an unknown product_id, a missing
+                # customer name, or any other validation error -- fell
+                # through that filter and just kept retrying identically
+                # forever. Nothing ever told the owner it was stuck; the
+                # sync badge just stayed on "N waiting / retrying upload
+                # automatically" indefinitely, because pending_count only
+                # drops when an item is deleted (confirmed) or moved to
+                # needs_review, and this item was doing neither.
+                #
+                # So: any explicit rejection that has failed repeatedly is
+                # flagged for review, full stop. It surfaces as "Needs
+                # attention" in the UI instead of silently never resolving,
+                # and the specific reason is preserved in last_error for
+                # the owner (and support) to act on.
+                if item.attempt_count >= 3:
+                    item.status = "needs_review"
                 failed += 1
 
         if failed == 0 and confirmed == len(items):
