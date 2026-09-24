@@ -14,6 +14,49 @@ const LOCAL_BACKEND_READY_TIMEOUT_MS = 45000;
 const LOCAL_BACKEND_POLL_MS = 250;
 let localBackendReady = false;
 
+/*
+  Auto-capitalize the first letter of each word as the user types, for
+  ordinary name/text fields (customer name, product name, staff name,
+  etc.) -- applied globally via event delegation so it covers every such
+  field automatically, including ones added later, without editing each
+  input individually.
+
+  Deliberately skipped:
+  - email, password, and any non-text input types (number, checkbox,
+    search, etc.) -- capitalizing those would corrupt the actual value
+    (an email must stay exactly as typed).
+  - fields marked data-no-capitalize (search/filter boxes, where
+    reshaping what the user is mid-typing is unhelpful, not harmful, but
+    still worth avoiding).
+*/
+const CAPITALIZE_SKIP_TYPES = new Set([
+  "email", "password", "number", "tel", "url", "date", "time",
+  "datetime-local", "month", "week", "color", "file", "hidden",
+  "checkbox", "radio", "range", "search",
+]);
+
+function toTitleCase(value) {
+  return value.replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+document.addEventListener("input", (event) => {
+  const el = event.target;
+  const isTextField =
+    (el instanceof HTMLInputElement && !CAPITALIZE_SKIP_TYPES.has(el.type)) ||
+    el instanceof HTMLTextAreaElement;
+  if (!isTextField || el.disabled || el.readOnly || el.dataset.noCapitalize !== undefined) {
+    return;
+  }
+  const capitalized = toTitleCase(el.value);
+  if (capitalized === el.value) return;
+  const { selectionStart, selectionEnd } = el;
+  el.value = capitalized;
+  // Restore cursor position -- setting .value otherwise jumps it to the end.
+  if (selectionStart !== null) {
+    el.setSelectionRange(selectionStart, selectionEnd);
+  }
+});
+
 let authToken = null;
 let currentStaff = null;
 localStorage.removeItem("glr_token");

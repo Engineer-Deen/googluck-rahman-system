@@ -247,7 +247,8 @@ def _upsert_transactions(data):
         if not db.session.get(Product, raw.get("product_id")):
             continue
         movement = db.session.get(StockMovement, raw["id"])
-        if not movement:
+        is_new = not movement
+        if is_new:
             movement = StockMovement(id=raw["id"])
             db.session.add(movement)
         movement.product_id = raw["product_id"]
@@ -256,8 +257,21 @@ def _upsert_transactions(data):
         movement.quantity_delta = raw["quantity_delta"]
         movement.reason = raw["reason"]
         movement.reference_id = raw.get("reference_id")
-        movement.created_at = _parse_datetime(raw.get("created_at"))
-        movement.updated_at = _parse_datetime(raw.get("updated_at") or raw.get("created_at"))
+        # created_at is set once, at creation, and never touched again on
+        # later updates. Some existing central records have no created_at
+        # in their payload (a gap from older writes); blindly reassigning it
+        # on every pull turned that missing value into an explicit NULL
+        # write against an existing row, which violates the NOT NULL
+        # column and crashes the whole pull -- which then never commits,
+        # so the sync cursor gets stuck and the "central refresh delayed"
+        # status never clears, even though nothing is actually wrong with
+        # this device's own data.
+        incoming_created_at = _parse_datetime(raw.get("created_at"))
+        if is_new:
+            movement.created_at = incoming_created_at or _parse_datetime(raw.get("updated_at")) or datetime.now(timezone.utc)
+        elif incoming_created_at:
+            movement.created_at = incoming_created_at
+        movement.updated_at = _parse_datetime(raw.get("updated_at")) or incoming_created_at or movement.created_at
         movement.server_received_at = _parse_datetime(raw.get("server_received_at"))
 
 
@@ -376,6 +390,22 @@ def pull_reference_data_once(app) -> dict:
         state.value = next_cursor
         _set_state("last_pull_success", next_cursor)
         _set_state("last_pull_error", "")
+        # provisioning_state is a separate flag from last_pull_error, only
+        # ever advanced to READY by the dedicated one-time provisioning
+        # route. If a device's *first* pull failed (e.g. on a bad record),
+        # it gets stuck at ENROLLED / PROVISIONING forever -- later
+        # successful pulls (including this file's own background retries)
+        # fix last_pull_error, but without this, they'd never clear that
+        # separate flag, so the UI would keep showing "Setting up sync"
+        # indefinitely even once everything is actually caught up. Any
+        # successful pull means the device is caught up, so advance it here
+        # too, matching what the provisioning route itself does on success.
+        # Set unconditionally (not "only if a row already exists") --
+        # _effective_provisioning_state() falls back to ENROLLED / PROVISIONING
+        # purely from the device having a shop_id when no row exists yet at
+        # all, so a missing row needs to be created here too, not just an
+        # existing one updated.
+        _set_state("provisioning_state", "READY")
         _set_state("last_pull_skipped_staff", str(skipped_staff))
 
         # A device may have been enrolled successfully but failed its initial
@@ -404,12 +434,6 @@ def backoff_delay(base_seconds, consecutive_failures):
     if consecutive_failures <= 0:
         return base_seconds
     return min(MAX_BACKOFF_SECONDS, base_seconds * (2 ** consecutive_failures))
-
-
-def _last_pull_failed(app):
-    with app.app_context():
-        row = db.session.get(SyncState, "last_pull_error")
-        return bool(row and row.value)
 
 
 def start_background_sync(app):
@@ -454,6 +478,20 @@ def start_background_sync(app):
                             result = push_pending_once(app)
                             push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
                             next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
+                        # pull_failures only tracks retries *this loop has made
+                        # itself* -- it starts at 0 every time the loop (re)starts
+                        # and is otherwise only touched inside the block below, so
+                        # it can never turn itself on. A pull that failed anywhere
+                        # else (the login flow's own initial pull, a
+                        # trigger_sync_soon() call, an earlier run of this same
+                        # loop before a restart) leaves last_pull_error set with
+                        # no way for a zeroed pull_failures to notice -- so check
+                        # the real persisted state directly whenever we're not
+                        # already mid-retry, rather than trusting a counter that
+                        # only this loop iteration knows about.
+                        if not pull_failures and _last_pull_failed(app):
+                            pull_failures = 1
+                            next_pull_retry = now
                         if pull_failures and now >= next_pull_retry:
                             pull_reference_data_once(app)
                             pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
