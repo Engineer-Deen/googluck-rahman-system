@@ -120,8 +120,32 @@ def _effective_provisioning_state(device=None):
     # timed out. If the last pull failed, surface SYNC_ERROR immediately rather
     # than making the device look as if it is still actively provisioning.
     pull_error = db.session.get(SyncState, "last_pull_error")
-    if state not in {"READY", "SYNC_ERROR"} and pull_error and pull_error.value:
+    has_pull_error = bool(pull_error and pull_error.value)
+
+    if state not in {"READY", "SYNC_ERROR"} and has_pull_error:
         return "SYNC_ERROR"
+
+    # A device that reached READY once can still be deregistered LATER --
+    # e.g. the central database was reset/restored, or an admin revoked the
+    # device -- and every pull from then on fails with a 403 "not
+    # registered to an authorized shop". The branch above only ever fires
+    # for a device that hadn't reached READY yet, so a device that WAS
+    # working has no way back into this check: state stays stuck at
+    # "READY" forever, which hides the provisioning panel entirely
+    # (index.html/app.js only shows it when state != "READY"). The owner
+    # is left with nothing but a generic sync-error tooltip and no button
+    # anywhere to fix it -- effectively locked out of ever re-authorizing
+    # this device again without a reinstall.
+    #
+    # This is specifically a "the device itself is no longer known to
+    # central" situation, not a transient network hiccup, so this drops
+    # back to NOT_ENROLLED (which surfaces the AUTHORIZE DESKTOP form,
+    # asking for central owner/admin credentials to register this device
+    # again) rather than SYNC_ERROR (which only offers a bare retry of a
+    # pull that will keep failing identically, since retrying doesn't
+    # re-create the device record centrally).
+    if state == "READY" and has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
+        return "NOT_ENROLLED"
 
     if state in {"READY", "SYNC_ERROR"}:
         return state
