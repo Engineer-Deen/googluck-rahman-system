@@ -18,6 +18,8 @@ credentials instead of one shared key later, that's a small change to
 _check_sync_key() plus a devices table lookup, not a redesign.
 """
 from datetime import datetime, timezone
+from pathlib import Path
+import os
 import requests
 
 from flask import Blueprint, current_app, g, jsonify, request
@@ -120,34 +122,7 @@ def _effective_provisioning_state(device=None):
     # timed out. If the last pull failed, surface SYNC_ERROR immediately rather
     # than making the device look as if it is still actively provisioning.
     pull_error = db.session.get(SyncState, "last_pull_error")
-    has_pull_error = bool(pull_error and pull_error.value)
-
-    # A device the central server no longer recognizes at all (its data was
-    # reset, or the device was explicitly revoked) gets a 403 "not
-    # registered to an authorized shop" on every pull, forever. That is
-    # categorically different from an ordinary SYNC_ERROR: no amount of
-    # retrying fixes it, because retrying doesn't recreate the device's
-    # registration centrally -- only re-enrolling (the AUTHORIZE DESKTOP
-    # form) can. So this check runs first and overrides whatever the
-    # persisted state flag currently says, rather than only firing on the
-    # way down from READY.
-    #
-    # That "only on the way down from READY" version was the first attempt
-    # at this fix, and it wasn't enough: clicking "RETRY CENTRAL SYNC"
-    # (provisioning_retry(), below) explicitly writes "SYNC_ERROR" into
-    # this same persisted flag on failure. Once that's already happened --
-    # exactly what occurs the first time someone hits this bug and tries
-    # the obvious button -- the flag is no longer "READY", so a check that
-    # only watches for READY can never fire again either, and the device
-    # stays stuck showing "Sync error - check connection" / a bare RETRY
-    # button that can never succeed, with no visible way back to the
-    # enrollment form. Checking the live error directly, before looking at
-    # (or trusting) the cached flag, means it self-corrects regardless of
-    # which stuck state the flag was left in.
-    if has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
-        return "NOT_ENROLLED"
-
-    if state not in {"READY", "SYNC_ERROR"} and has_pull_error:
+    if state not in {"READY", "SYNC_ERROR"} and pull_error and pull_error.value:
         return "SYNC_ERROR"
 
     if state in {"READY", "SYNC_ERROR"}:
@@ -462,9 +437,20 @@ def register_device():
             registered_at=datetime.now(timezone.utc),
             last_seen_at=datetime.now(timezone.utc),
         )
+        # Handing back the shared sync key here, to an already-authenticated
+        # owner/admin (roles_required above already checked that), lets a
+        # brand-new PC finish enrollment with nothing but the owner's email
+        # and password -- it never needs its own copy of this secret typed
+        # in by hand first. The alternative (requiring the key to already
+        # exist locally before enrollment can even be attempted) is what
+        # forced a manual .env file on every single new install: the same
+        # static secret would need to be copied out of Vercel and pasted
+        # into %LOCALAPPDATA%\...\.env by hand, every single time, which is
+        # exactly the recurring friction this endpoint is meant to remove.
         return jsonify(
             id=device.get("id", device_id), shop_id=device.get("shop_id"),
-            name=device.get("name"), platform=device.get("platform")
+            name=device.get("name"), platform=device.get("platform"),
+            sync_api_key=current_app.config.get("SYNC_API_KEY", ""),
         ), 201
 
     device = db.session.get(Device, device_id)
@@ -476,7 +462,10 @@ def register_device():
     device.platform = data.get("platform")
     device.last_seen_at = datetime.now(timezone.utc)
     db.session.commit()
-    return jsonify(id=device.id, shop_id=device.shop_id, name=device.name, platform=device.platform), 201
+    return jsonify(
+        id=device.id, shop_id=device.shop_id, name=device.name, platform=device.platform,
+        sync_api_key=current_app.config.get("SYNC_API_KEY", ""),
+    ), 201
 
 
 @sync_bp.get("/provisioning/status")
@@ -497,13 +486,45 @@ def provisioning_status():
     )
 
 
+def _persist_sync_api_key(app, value: str) -> None:
+    """Save a newly-issued sync key so this device keeps working after restart.
+
+    Central hands its SYNC_API_KEY back as part of a successful device
+    registration (see register_device() above), specifically so a new
+    install never needs this secret typed in by hand -- the owner's
+    email/password they already know is enough to enroll. That only
+    actually removes the friction if the value survives a restart, though:
+    config.py loads SYNC_API_KEY from real environment variables and then
+    this device's own <instance dir>\\.env file at startup, so writing it
+    there (not just setting it in-process) is what makes it stick
+    permanently -- the same file a person would otherwise have had to
+    create by hand, with the same key copied out of Vercel, on every
+    single new PC.
+    """
+    if not value:
+        return
+    instance_dir = Path(app.config["DEVICE_ID_FILE"]).parent
+    instance_dir.mkdir(parents=True, exist_ok=True)
+    env_path = instance_dir / ".env"
+    lines = []
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("SYNC_API_KEY="):
+                continue
+            lines.append(line)
+    lines.append(f"SYNC_API_KEY={value}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Take effect for the rest of this process's life too, so the device
+    # doesn't need a restart before its first real push/pull can succeed.
+    os.environ["SYNC_API_KEY"] = value
+    app.config["SYNC_API_KEY"] = value
+
+
 @sync_bp.post("/provisioning/enroll")
 def enroll_local_device():
     """Authorize this device centrally, then create its local offline identity."""
     if current_app.config["GLR_MODE"] != "local":
         return jsonify(error="Desktop enrollment is only available on local devices"), 400
-    if not current_app.config.get("SYNC_API_KEY"):
-        return jsonify(error="Cloud synchronization is not configured on this device"), 503
 
     data = request.get_json(silent=True) or {}
     central_email = str(data.get("central_email") or "").strip().lower()
@@ -546,12 +567,15 @@ def enroll_local_device():
             timeout=8,
         )
         registration_response.raise_for_status()
+        registration_data = registration_response.json()
     except requests.RequestException as exc:
         status = getattr(exc.response, "status_code", None)
         if status in (401, 403):
             return jsonify(error="Central owner/admin authorization was rejected"), 403
         current_app.logger.warning("Central desktop enrollment failed: %s", type(exc).__name__)
         return jsonify(error="Central enrollment service is unavailable"), 503
+
+    _persist_sync_api_key(current_app._get_current_object(), registration_data.get("sync_api_key", ""))
 
     staff_id = int(identity["id"])
     email = str(identity["email"]).strip().lower()
