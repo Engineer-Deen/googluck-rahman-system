@@ -122,30 +122,33 @@ def _effective_provisioning_state(device=None):
     pull_error = db.session.get(SyncState, "last_pull_error")
     has_pull_error = bool(pull_error and pull_error.value)
 
+    # A device the central server no longer recognizes at all (its data was
+    # reset, or the device was explicitly revoked) gets a 403 "not
+    # registered to an authorized shop" on every pull, forever. That is
+    # categorically different from an ordinary SYNC_ERROR: no amount of
+    # retrying fixes it, because retrying doesn't recreate the device's
+    # registration centrally -- only re-enrolling (the AUTHORIZE DESKTOP
+    # form) can. So this check runs first and overrides whatever the
+    # persisted state flag currently says, rather than only firing on the
+    # way down from READY.
+    #
+    # That "only on the way down from READY" version was the first attempt
+    # at this fix, and it wasn't enough: clicking "RETRY CENTRAL SYNC"
+    # (provisioning_retry(), below) explicitly writes "SYNC_ERROR" into
+    # this same persisted flag on failure. Once that's already happened --
+    # exactly what occurs the first time someone hits this bug and tries
+    # the obvious button -- the flag is no longer "READY", so a check that
+    # only watches for READY can never fire again either, and the device
+    # stays stuck showing "Sync error - check connection" / a bare RETRY
+    # button that can never succeed, with no visible way back to the
+    # enrollment form. Checking the live error directly, before looking at
+    # (or trusting) the cached flag, means it self-corrects regardless of
+    # which stuck state the flag was left in.
+    if has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
+        return "NOT_ENROLLED"
+
     if state not in {"READY", "SYNC_ERROR"} and has_pull_error:
         return "SYNC_ERROR"
-
-    # A device that reached READY once can still be deregistered LATER --
-    # e.g. the central database was reset/restored, or an admin revoked the
-    # device -- and every pull from then on fails with a 403 "not
-    # registered to an authorized shop". The branch above only ever fires
-    # for a device that hadn't reached READY yet, so a device that WAS
-    # working has no way back into this check: state stays stuck at
-    # "READY" forever, which hides the provisioning panel entirely
-    # (index.html/app.js only shows it when state != "READY"). The owner
-    # is left with nothing but a generic sync-error tooltip and no button
-    # anywhere to fix it -- effectively locked out of ever re-authorizing
-    # this device again without a reinstall.
-    #
-    # This is specifically a "the device itself is no longer known to
-    # central" situation, not a transient network hiccup, so this drops
-    # back to NOT_ENROLLED (which surfaces the AUTHORIZE DESKTOP form,
-    # asking for central owner/admin credentials to register this device
-    # again) rather than SYNC_ERROR (which only offers a bare retry of a
-    # pull that will keep failing identically, since retrying doesn't
-    # re-create the device record centrally).
-    if state == "READY" and has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
-        return "NOT_ENROLLED"
 
     if state in {"READY", "SYNC_ERROR"}:
         return state
