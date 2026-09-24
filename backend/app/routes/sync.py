@@ -113,42 +113,44 @@ def _set_provisioning_state(value):
 def _effective_provisioning_state(device=None):
     if _uses_firestore():
         return "READY"
-    state = _provisioning_state()
     if device is None:
         device = db.session.get(Device, get_current_device_id())
-
-    pull_error = db.session.get(SyncState, "last_pull_error")
-    has_pull_error = bool(pull_error and pull_error.value)
     is_enrolled = bool(device and device.shop_id is not None)
 
-    # A device the central server no longer recognizes at all (its data was
-    # reset, or the device was explicitly revoked) gets a 403 "not
-    # registered to an authorized shop" on every pull, forever -- no amount
-    # of retrying fixes that, only re-enrolling can, so this always routes
-    # back to the enrollment form regardless of whatever the cached state
-    # flag currently says (it can get stuck on SYNC_ERROR from an earlier
-    # failed "RETRY CENTRAL SYNC" click, which writes that flag directly).
+    # A device that has never actually been registered with a shop cannot,
+    # by definition, be in SYNC_ERROR ("was working, now isn't") or READY.
+    # This has to be checked FIRST, before ever trusting the persisted
+    # state flag below -- because that flag is exactly what got poisoned
+    # to "SYNC_ERROR" by an earlier, buggier build (or an earlier failed
+    # attempt on THIS install, before the fixes below existed), and every
+    # check that follows just returns the flag's cached value once it's
+    # already READY or SYNC_ERROR. Two earlier attempts at this same fix
+    # both added a smarter check ABOVE that fallback without changing the
+    # fallback itself, so a flag poisoned before either fix was deployed
+    # kept winning regardless -- this is what finally makes a truly
+    # unenrolled device unable to get stuck there again: nothing below this
+    # line can override "not enrolled" with a stale flag.
+    if not is_enrolled:
+        return "NOT_ENROLLED"
+
+    state = _provisioning_state()
+    pull_error = db.session.get(SyncState, "last_pull_error")
+    has_pull_error = bool(pull_error and pull_error.value)
+
+    # An ALREADY-enrolled device the central server no longer recognizes
+    # (its data was reset, or the device was explicitly revoked) gets a 403
+    # "not registered to an authorized shop" on every pull, forever -- no
+    # amount of retrying fixes that, only re-enrolling can. This overrides
+    # the cached flag for the same reason as the is_enrolled check above.
     if has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
         return "NOT_ENROLLED"
 
-    # Only an ALREADY-enrolled device's failed pull counts as a genuine
-    # SYNC_ERROR worth showing a retry button for. A brand-new,
-    # never-enrolled device has its background pull loop running from the
-    # moment the app opens, long before anyone has even seen the
-    # enrollment form -- and that loop fails immediately and completely
-    # predictably (there's no SYNC_API_KEY yet; nothing to authenticate
-    # with). Without this is_enrolled guard, that entirely expected
-    # pre-enrollment failure got treated exactly like a real sync error,
-    # flipping a fresh device straight to SYNC_ERROR before it ever got a
-    # chance to enroll -- hiding the AUTHORIZE DESKTOP button behind a
-    # RETRY button that can never succeed, since there's nothing registered
-    # yet to even retry.
-    if state not in {"READY", "SYNC_ERROR"} and has_pull_error and is_enrolled:
+    if state not in {"READY", "SYNC_ERROR"} and has_pull_error:
         return "SYNC_ERROR"
 
     if state in {"READY", "SYNC_ERROR"}:
         return state
-    return "ENROLLED / PROVISIONING" if is_enrolled else "NOT_ENROLLED"
+    return "ENROLLED / PROVISIONING"
 
 
 def _sync_error_kind(message):
@@ -541,75 +543,6 @@ def _persist_sync_api_key(app, value: str) -> None:
     app.config["SYNC_API_KEY"] = value
 
 
-def _authorize_device_with_central(device_id, central_email, central_password, name, platform):
-    """Log in to central as owner/admin and (re)register this device.
-
-    Shared by first-time enrollment and by a SYNC_ERROR retry that supplies
-    credentials: both need the exact same "central owner/admin password ->
-    fresh sync_api_key" exchange, so this is the one place that does it.
-
-    Returns either ("ok", identity_dict, sync_api_key) or ("error", message, http_status).
-    """
-    central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
-    try:
-        login_response = requests.post(
-            central_url + "/api/auth/login",
-            json={
-                "email": central_email,
-                "password": central_password,
-                "role_group": "owner",
-            },
-            timeout=8,
-        )
-        if login_response.status_code in (401, 403):
-            return "error", "Central owner/admin authentication failed", 401
-        login_response.raise_for_status()
-        login_data = login_response.json()
-        identity = login_data.get("staff") or {}
-        central_token = login_data.get("token")
-        if not central_token:
-            return "error", "Central authentication did not return an authorization token", 502
-        if identity.get("role") not in ("owner", "admin") or not identity.get("shop_id"):
-            return "error", "Central enrollment requires an active owner or administrator", 403
-
-        registration_response = requests.post(
-            central_url + "/api/sync/devices",
-            headers={"Authorization": "Bearer " + central_token},
-            json={
-                "device_id": device_id,
-                "shop_id": int(identity["shop_id"]),
-                "name": name or "Good Luck Rahman Main Device",
-                "platform": platform or "Unknown",
-            },
-            timeout=8,
-        )
-        registration_response.raise_for_status()
-        registration_data = registration_response.json()
-    except requests.RequestException as exc:
-        status = getattr(exc.response, "status_code", None)
-        if status in (401, 403):
-            return "error", "Central owner/admin authorization was rejected", 403
-        current_app.logger.warning("Central desktop authorization failed: %s", type(exc).__name__)
-        return "error", "Central enrollment service is unavailable", 503
-
-    sync_api_key = registration_data.get("sync_api_key", "")
-    if not sync_api_key:
-        # Central answered but didn't hand back a key -- most likely central
-        # itself is running an older deployment that predates this exchange.
-        # Surface that plainly instead of silently leaving this device
-        # stuck on the generic "not configured" error forever.
-        current_app.logger.warning(
-            "Central device registration returned no sync_api_key for device %s", device_id
-        )
-        return (
-            "error",
-            "Central server did not return a synchronization key. It may need to be redeployed.",
-            502,
-        )
-
-    return "ok", identity, sync_api_key
-
-
 @sync_bp.post("/provisioning/enroll")
 def enroll_local_device():
     """Authorize this device centrally, then create its local offline identity."""
@@ -623,15 +556,49 @@ def enroll_local_device():
         return jsonify(error="Central owner/admin authorization is required"), 400
 
     device_id = get_current_device_id()
-    outcome, first, second = _authorize_device_with_central(
-        device_id, central_email, central_password,
-        data.get("name"), data.get("platform"),
-    )
-    if outcome == "error":
-        return jsonify(error=first), second
-    identity, sync_api_key = first, second
+    central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
+    try:
+        login_response = requests.post(
+            central_url + "/api/auth/login",
+            json={
+                "email": central_email,
+                "password": central_password,
+                "role_group": "owner",
+            },
+            timeout=8,
+        )
+        if login_response.status_code in (401, 403):
+            return jsonify(error="Central owner/admin authentication failed"), 401
+        login_response.raise_for_status()
+        login_data = login_response.json()
+        identity = login_data.get("staff") or {}
+        central_token = login_data.get("token")
+        if not central_token:
+            return jsonify(error="Central authentication did not return an authorization token"), 502
+        if identity.get("role") not in ("owner", "admin") or not identity.get("shop_id"):
+            return jsonify(error="Central enrollment requires an active owner or administrator"), 403
 
-    _persist_sync_api_key(current_app._get_current_object(), sync_api_key)
+        registration_response = requests.post(
+            central_url + "/api/sync/devices",
+            headers={"Authorization": "Bearer " + central_token},
+            json={
+                "device_id": device_id,
+                "shop_id": int(identity["shop_id"]),
+                "name": data.get("name") or "Good Luck Rahman Main Device",
+                "platform": data.get("platform") or "Unknown",
+            },
+            timeout=8,
+        )
+        registration_response.raise_for_status()
+        registration_data = registration_response.json()
+    except requests.RequestException as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status in (401, 403):
+            return jsonify(error="Central owner/admin authorization was rejected"), 403
+        current_app.logger.warning("Central desktop enrollment failed: %s", type(exc).__name__)
+        return jsonify(error="Central enrollment service is unavailable"), 503
+
+    _persist_sync_api_key(current_app._get_current_object(), registration_data.get("sync_api_key", ""))
 
     staff_id = int(identity["id"])
     email = str(identity["email"]).strip().lower()
@@ -691,15 +658,6 @@ def provisioning_retry():
     failure without forcing a reinstall or asking the owner to re-register it.
     No business data is returned here; the local worker performs the protected
     X-Sync-Key pull itself.
-
-    If the last failure was specifically a missing/invalid sync key (this
-    device never got one, or central rotated/revoked it), no amount of
-    retrying the pull will ever succeed on its own -- there is nothing to
-    retry with. In that case the frontend shows the same central owner/admin
-    email + password fields as enrollment, and this endpoint accepts them
-    here: re-authenticate with central, fetch a fresh key, persist it, and
-    only then retry. This is what lets the owner clear a SYNC_ERROR with
-    nothing but their own login, never a hand-typed key.
     """
     if current_app.config["GLR_MODE"] != "local":
         return jsonify(error="Provisioning retry is only available on local devices"), 400
@@ -708,29 +666,6 @@ def provisioning_retry():
     device = db.session.get(Device, device_id)
     if not device or device.shop_id is None:
         return jsonify(error="This device is not registered to an authorized shop"), 403
-
-    data = request.get_json(silent=True) or {}
-    central_email = str(data.get("central_email") or "").strip().lower()
-    central_password = str(data.get("central_password") or "")
-
-    prior_error = db.session.get(SyncState, "last_pull_error")
-    error_kind = _sync_error_kind(prior_error.value) if prior_error else None
-    key_needs_refresh = error_kind in {"SYNC_API_KEY_MISSING", "SYNC_AUTH_FAILED"}
-
-    if key_needs_refresh:
-        if not central_email or not central_password:
-            return jsonify(
-                error="Enter the central owner/admin email and password to restore synchronization.",
-                state="SYNC_ERROR",
-                needs_credentials=True,
-            ), 400
-        outcome, first, second = _authorize_device_with_central(
-            device_id, central_email, central_password,
-            device.name, device.platform,
-        )
-        if outcome == "error":
-            return jsonify(error=first, state="SYNC_ERROR", needs_credentials=True), second
-        _persist_sync_api_key(current_app._get_current_object(), second)
 
     from app.sync.worker import pull_reference_data_once
     result = pull_reference_data_once(current_app._get_current_object())
