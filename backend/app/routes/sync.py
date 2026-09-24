@@ -117,17 +117,38 @@ def _effective_provisioning_state(device=None):
     if device is None:
         device = db.session.get(Device, get_current_device_id())
 
-    # Recover the visible state from durable sync evidence. Older builds could
-    # leave provisioning_state at ENROLLED / PROVISIONING when the first pull
-    # timed out. If the last pull failed, surface SYNC_ERROR immediately rather
-    # than making the device look as if it is still actively provisioning.
     pull_error = db.session.get(SyncState, "last_pull_error")
-    if state not in {"READY", "SYNC_ERROR"} and pull_error and pull_error.value:
+    has_pull_error = bool(pull_error and pull_error.value)
+    is_enrolled = bool(device and device.shop_id is not None)
+
+    # A device the central server no longer recognizes at all (its data was
+    # reset, or the device was explicitly revoked) gets a 403 "not
+    # registered to an authorized shop" on every pull, forever -- no amount
+    # of retrying fixes that, only re-enrolling can, so this always routes
+    # back to the enrollment form regardless of whatever the cached state
+    # flag currently says (it can get stuck on SYNC_ERROR from an earlier
+    # failed "RETRY CENTRAL SYNC" click, which writes that flag directly).
+    if has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
+        return "NOT_ENROLLED"
+
+    # Only an ALREADY-enrolled device's failed pull counts as a genuine
+    # SYNC_ERROR worth showing a retry button for. A brand-new,
+    # never-enrolled device has its background pull loop running from the
+    # moment the app opens, long before anyone has even seen the
+    # enrollment form -- and that loop fails immediately and completely
+    # predictably (there's no SYNC_API_KEY yet; nothing to authenticate
+    # with). Without this is_enrolled guard, that entirely expected
+    # pre-enrollment failure got treated exactly like a real sync error,
+    # flipping a fresh device straight to SYNC_ERROR before it ever got a
+    # chance to enroll -- hiding the AUTHORIZE DESKTOP button behind a
+    # RETRY button that can never succeed, since there's nothing registered
+    # yet to even retry.
+    if state not in {"READY", "SYNC_ERROR"} and has_pull_error and is_enrolled:
         return "SYNC_ERROR"
 
     if state in {"READY", "SYNC_ERROR"}:
         return state
-    return "ENROLLED / PROVISIONING" if device and device.shop_id is not None else "NOT_ENROLLED"
+    return "ENROLLED / PROVISIONING" if is_enrolled else "NOT_ENROLLED"
 
 
 def _sync_error_kind(message):
