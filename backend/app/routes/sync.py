@@ -142,7 +142,18 @@ def _effective_provisioning_state(device=None):
     # "not registered to an authorized shop" on every pull, forever -- no
     # amount of retrying fixes that, only re-enrolling can. This overrides
     # the cached flag for the same reason as the is_enrolled check above.
-    if has_pull_error and _sync_error_kind(pull_error.value) == "DEVICE_NOT_AUTHORIZED":
+    #
+    # A device whose local SYNC_API_KEY is missing/empty is in the exact
+    # same "only re-enrolling can fix this" category: /provisioning/retry
+    # only re-runs the pull with whatever key is already on disk, it never
+    # asks central for a new one, so a device that got an empty key back
+    # from enrollment (e.g. central's own SYNC_API_KEY was blank, or an
+    # older central deployment didn't issue a key at all) would otherwise
+    # be stuck showing "RETRY CENTRAL SYNC" forever with no way to recover
+    # short of hand-editing a .env file. Routing it back to NOT_ENROLLED
+    # instead re-shows the owner/admin credential form, and re-running
+    # enrollment re-fetches (and this time persists) a real key.
+    if has_pull_error and _sync_error_kind(pull_error.value) in ("DEVICE_NOT_AUTHORIZED", "SYNC_API_KEY_MISSING"):
         return "NOT_ENROLLED"
 
     if state not in {"READY", "SYNC_ERROR"} and has_pull_error:
@@ -621,6 +632,30 @@ def enroll_local_device():
         "response_had_field=%s",
         bool(received_key), len(received_key), "sync_api_key" in registration_data,
     )
+    if not received_key:
+        # Continuing here used to be the trap: the device would register
+        # successfully, then immediately fail its first pull with "Cloud
+        # synchronization is not configured on this device", land in
+        # SYNC_ERROR, and have no self-service way out (retry only re-runs
+        # the pull, it can't ask central for a key it never got). Failing
+        # loudly right here, before anything is marked enrolled, means the
+        # owner sees the real problem immediately instead of a generic
+        # sync error minutes or days later.
+        current_app.logger.error(
+            "Central enrollment for device_id=%s returned no sync_api_key -- "
+            "central's own SYNC_API_KEY is likely unset/blank, or central is "
+            "running an older build that doesn't issue one yet.",
+            device_id,
+        )
+        return jsonify(
+            error=(
+                "Central did not issue a sync key for this device. This is a "
+                "central server configuration problem, not something to retry "
+                "here -- check that SYNC_API_KEY is set on the central "
+                "deployment (and that it's running the current backend build), "
+                "then try authorizing this desktop again."
+            )
+        ), 502
     _persist_sync_api_key(current_app._get_current_object(), received_key)
 
     staff_id = int(identity["id"])

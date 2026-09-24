@@ -80,7 +80,7 @@ class DesktopProvisioningTests(unittest.TestCase):
         def post_response(url, **_kwargs):
             if url.endswith("/api/auth/login"):
                 return _Response({"token": "central-token", "staff": identity})
-            return _Response({}, 201)
+            return _Response({"sync_api_key": "central-issued-key"}, 201)
 
         with patch("app.routes.sync.requests.get", side_effect=get_response), patch(
             "app.routes.sync.requests.post", side_effect=post_response
@@ -109,6 +109,60 @@ class DesktopProvisioningTests(unittest.TestCase):
             self.assertEqual(staff.password_hash, "")
             self.assertNotEqual(staff.password_hash, "local-only-password")
             self.assertEqual(db.session.get(SyncState, "provisioning_state").value, "READY")
+        env_path = Path(self.temp_dir.name) / ".env"
+        self.assertIn("SYNC_API_KEY=central-issued-key", env_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.app.config["SYNC_API_KEY"], "central-issued-key")
+
+    def test_enrollment_fails_loudly_when_central_issues_no_sync_key(self):
+        """A blank/missing key from central must stop enrollment, not silently
+
+        continue into a device that will fail every pull afterward with no
+        self-service way to recover (see the SYNC_API_KEY_MISSING handling
+        in _effective_provisioning_state for the other half of this fix).
+        """
+        identity = {
+            "id": 7, "name": "Central Owner", "email": "owner@example.test",
+            "role": "owner", "shop_id": 1, "is_active": True,
+        }
+
+        def post_response(url, **_kwargs):
+            if url.endswith("/api/auth/login"):
+                return _Response({"token": "central-token", "staff": identity})
+            return _Response({}, 201)  # no sync_api_key field, e.g. stale central build
+
+        with patch("app.routes.sync.requests.post", side_effect=post_response):
+            response = self.app.test_client().post(
+                "/api/sync/provisioning/enroll",
+                json={"central_email": "owner@example.test", "central_password": "central-password"},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("did not issue a sync key", response.get_json()["error"])
+        with self.app.app_context():
+            # Nothing should have been provisioned locally -- this must be
+            # retried from scratch (after central's misconfiguration is
+            # fixed), not left in a half-enrolled state.
+            self.assertEqual(Staff.query.count(), 0)
+            self.assertIsNone(db.session.get(Device, self.device_path.read_text().strip()))
+
+    def test_already_enrolled_device_with_missing_key_can_self_recover(self):
+        """Simulates an install stuck by the OLD bug: already enrolled
+
+        (has a device row + shop_id) but SYNC_API_KEY never got persisted,
+        so every pull fails with the 'not configured' error. The device
+        must fall back to NOT_ENROLLED so the owner can just re-run
+        enrollment (no manual .env editing) once central is fixed.
+        """
+        with self.app.app_context():
+            self.device_path.write_text("stuck-device-id", encoding="utf-8")
+            db.session.add(Device(id="stuck-device-id", shop_id=1))
+            db.session.add(SyncState(key="last_pull_error", value="Cloud synchronization is not configured on this device."))
+            db.session.add(SyncState(key="provisioning_state", value="SYNC_ERROR"))
+            db.session.commit()
+
+        response = self.app.test_client().get("/api/sync/provisioning/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["state"], "NOT_ENROLLED")
 
     def test_invalid_central_credentials_do_not_provision_local_identity(self):
         with patch(
