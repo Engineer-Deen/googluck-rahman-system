@@ -384,6 +384,13 @@ async function retryProvisioning() {
   const errorEl = document.getElementById("provisioning-error");
   if (!button) return;
 
+  // Same fields the AUTHORIZE DESKTOP flow uses. When the device's sync key
+  // is what's actually missing, no amount of retrying will succeed without
+  // these -- so send them along whenever they're filled in. Leaving them
+  // blank still retries a plain reconnect, for transient network failures.
+  const email = document.getElementById("central-enrollment-email").value.trim();
+  const password = document.getElementById("central-enrollment-password").value;
+
   if (errorEl) errorEl.textContent = "";
   button.disabled = true;
   button.textContent = "RETRYING...";
@@ -391,12 +398,14 @@ async function retryProvisioning() {
     const res = await fetch(API_BASE + "/sync/provisioning/retry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ central_email: email, central_password: password }),
     });
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data.error || "Central synchronization could not complete.");
     }
 
+    document.getElementById("central-enrollment-password").value = "";
     if (errorEl) errorEl.textContent = "Central synchronization completed. Desktop is ready.";
     await loadProvisioningStatus();
   } catch (err) {
