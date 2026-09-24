@@ -470,10 +470,22 @@ def register_device():
         # static secret would need to be copied out of Vercel and pasted
         # into %LOCALAPPDATA%\...\.env by hand, every single time, which is
         # exactly the recurring friction this endpoint is meant to remove.
+        issued_key = current_app.config.get("SYNC_API_KEY", "")
+        # Logging only whether a key exists (and its length), never the key
+        # itself -- this is the one line that actually answers "is central
+        # even sending a key back right now", which nothing else on the
+        # local/device side can ever confirm on its own: if this endpoint
+        # silently hands back "", every single downstream fix (the local
+        # auto-save, the is_enrolled state check, all of it) is irrelevant,
+        # because there was never a real key for any of them to work with.
+        current_app.logger.warning(
+            "device enroll issuing sync key device_id=%s shop_id=%s key_present=%s key_length=%s",
+            device_id, requested_shop_id, bool(issued_key), len(issued_key),
+        )
         return jsonify(
             id=device.get("id", device_id), shop_id=device.get("shop_id"),
             name=device.get("name"), platform=device.get("platform"),
-            sync_api_key=current_app.config.get("SYNC_API_KEY", ""),
+            sync_api_key=issued_key,
         ), 201
 
     device = db.session.get(Device, device_id)
@@ -485,9 +497,14 @@ def register_device():
     device.platform = data.get("platform")
     device.last_seen_at = datetime.now(timezone.utc)
     db.session.commit()
+    issued_key = current_app.config.get("SYNC_API_KEY", "")
+    current_app.logger.warning(
+        "device enroll issuing sync key device_id=%s shop_id=%s key_present=%s key_length=%s",
+        device_id, requested_shop_id, bool(issued_key), len(issued_key),
+    )
     return jsonify(
         id=device.id, shop_id=device.shop_id, name=device.name, platform=device.platform,
-        sync_api_key=current_app.config.get("SYNC_API_KEY", ""),
+        sync_api_key=issued_key,
     ), 201
 
 
@@ -598,7 +615,13 @@ def enroll_local_device():
         current_app.logger.warning("Central desktop enrollment failed: %s", type(exc).__name__)
         return jsonify(error="Central enrollment service is unavailable"), 503
 
-    _persist_sync_api_key(current_app._get_current_object(), registration_data.get("sync_api_key", ""))
+    received_key = registration_data.get("sync_api_key", "")
+    current_app.logger.warning(
+        "device enroll received sync key from central key_present=%s key_length=%s "
+        "response_had_field=%s",
+        bool(received_key), len(received_key), "sync_api_key" in registration_data,
+    )
+    _persist_sync_api_key(current_app._get_current_object(), received_key)
 
     staff_id = int(identity["id"])
     email = str(identity["email"]).strip().lower()
