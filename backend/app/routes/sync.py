@@ -117,6 +117,14 @@ def _effective_provisioning_state(device=None):
     if device is None:
         device = db.session.get(Device, get_current_device_id())
 
+    # The sync key is the concrete local prerequisite for central
+    # synchronization. If it is missing, the desktop must be treated as
+    # requiring enrollment even when an older installation has a stale
+    # provisioning_state value such as SYNC_ERROR. Do not trust that cached
+    # flag over the actual credential state.
+    if not current_app.config.get("SYNC_API_KEY"):
+        return "NOT_ENROLLED"
+
     pull_error = db.session.get(SyncState, "last_pull_error")
     has_pull_error = bool(pull_error and pull_error.value)
     is_enrolled = bool(device and device.shop_id is not None)
@@ -659,6 +667,18 @@ def provisioning_retry():
     """
     if current_app.config["GLR_MODE"] != "local":
         return jsonify(error="Provisioning retry is only available on local devices"), 400
+
+    # A provisioning retry can only work after this desktop has received and
+    # persisted its local sync key. Without it, calling the pull worker would
+    # only recreate the same "SYNC_API_KEY missing" failure and can leave a
+    # stale provisioning flag looking permanently broken. The setup flow must
+    # return to desktop enrollment instead.
+    if not current_app.config.get("SYNC_API_KEY"):
+        return jsonify(
+            state="NOT_ENROLLED",
+            code="ENROLLMENT_REQUIRED",
+            error="This desktop must be authorized before synchronization can continue.",
+        ), 409
 
     device_id = get_current_device_id()
     device = db.session.get(Device, device_id)
