@@ -254,35 +254,58 @@ class DesktopProvisioningTests(unittest.TestCase):
         self.assertEqual(response.get_json()["code"], "central_auth_network")
 
     def test_authenticated_session_requires_central_validation(self):
-        with patch("app.auth.requests.get", return_value=_Response({
-            "id": 7,
-            "name": "Central Owner",
-            "email": "owner@example.test",
-            "role": "owner",
-            "shop_id": 1,
-            "is_active": True,
+        with self.app.app_context():
+            db.session.add(Staff(
+                id=7, shop_id=1, name="Central Owner", email="owner@example.test",
+                password_hash="", role="owner",
+            ))
+            db.session.commit()
+        central_staff = {
+            "id": 7, "name": "Central Owner", "email": "owner@example.test",
+            "role": "owner", "shop_id": 1, "is_active": True,
+        }
+
+        # A local session is established only by an actual central login --
+        # there is no other way into the cache _central_session_staff reads.
+        with patch("app.routes.auth.requests.post", return_value=_Response({
+            "token": "central-token", "staff": central_staff,
         })):
+            login_response = self.app.test_client().post(
+                "/api/auth/login",
+                json={"email": "owner@example.test", "password": "central-password", "role_group": "owner"},
+            )
+        self.assertEqual(login_response.status_code, 200)
+        token = login_response.get_json()["token"]
+
+        # Once that session exists, local requests authenticate from the
+        # in-memory cache and must NOT call central again -- that's the
+        # entire point of _central_session_staff (see its docstring): calling
+        # central on every request would turn routine UI polling into
+        # repeated central auth traffic. This is why the old version of this
+        # test (patching app.auth.requests.get and expecting 503s on network
+        # failure) no longer matches reality: that code path is dead for
+        # local mode.
+        with patch("app.auth.requests.get") as central_me:
             response = self.app.test_client().get(
                 "/api/auth/me",
-                headers={"Authorization": "Bearer central-token"},
+                headers={"Authorization": f"Bearer {token}"},
             )
+        central_me.assert_not_called()
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["email"], "owner@example.test")
 
-        with patch("app.auth.requests.get", side_effect=requests.Timeout):
+        # A token the local cache has never seen (forged, or from before a
+        # local backend restart, which clears the in-memory cache) is
+        # rejected locally as an expired session -- again without ever
+        # asking central, since a cache miss is exactly what tells the
+        # client to log in again.
+        with patch("app.auth.requests.get") as central_me:
             response = self.app.test_client().get(
                 "/api/auth/me",
-                headers={"Authorization": "Bearer central-token"},
+                headers={"Authorization": "Bearer some-other-token"},
             )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.get_json()["code"], "central_session_unavailable")
-
-        with patch("app.auth.requests.get", side_effect=requests.ConnectionError):
-            response = self.app.test_client().get(
-                "/api/auth/me",
-                headers={"Authorization": "Bearer central-token"},
-            )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.get_json()["code"], "central_session_network")
+        central_me.assert_not_called()
+        self.assertEqual(response.status_code, 401)
 
 
 if __name__ == "__main__":
