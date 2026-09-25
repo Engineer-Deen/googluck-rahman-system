@@ -455,7 +455,7 @@
         <div class="form-grid">
           <div class="form-group"><label>Admin inactivity lock</label><select id="setting-timeout"><option value="5">5 minutes</option><option value="10">10 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select></div>
           <div class="form-group"><label>Full login required after</label><select id="setting-full-login"><option value="2">2 hours</option><option value="4">4 hours</option><option value="8">8 hours</option><option value="12">12 hours</option></select></div>
-          <div class="form-group"><label>4-digit quick unlock PIN</label><input id="setting-pin" inputmode="numeric" maxlength="4" placeholder="Set a 4-digit PIN"></div>
+          <div class="form-group"><label>4-digit quick unlock PIN</label><input id="setting-pin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="Set a 4-digit PIN"></div>
         </div>
         <div class="settings-note">The quick PIN is stored as a secure hash in the backend database. Three wrong PIN attempts disable quick unlock and require a fresh admin login.</div>
         <button class="btn btn-primary admin-only" id="save-settings-btn" onclick="saveSystemSettings()" style="display:none;">SAVE SETTINGS</button>
@@ -509,7 +509,7 @@
   <div class="modal-card lock-modal-card">
     <div class="modal-kicker">ADMIN SECURITY</div><div class="modal-title">Session locked</div>
     <p id="admin-lock-message">Enter your 4-digit PIN to continue.</p>
-    <input id="admin-lock-pin" class="pin-input" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••">
+    <input id="admin-lock-pin" class="pin-input" type="password" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••">
     <div id="admin-lock-error" class="login-error"></div>
     <div class="modal-actions"><button class="btn btn-danger" onclick="forceAdminLogin()">FULL LOGIN</button><button class="btn btn-primary" onclick="unlockAdminSession()">UNLOCK</button></div>
   </div>
@@ -522,6 +522,10 @@
   <div class="update-toast-content">
     <div class="update-toast-title">Update available</div>
     <div class="update-toast-message" id="update-toast-message">A newer version is ready.</div>
+    <div class="update-toast-progress" id="update-toast-progress" style="display:none;">
+      <div class="update-toast-progress-track"><div class="update-toast-progress-fill" id="update-toast-progress-fill"></div></div>
+      <div class="update-toast-progress-stats" id="update-toast-progress-stats">0 MB / 0 MB</div>
+    </div>
     <div class="update-toast-actions">
       <button type="button" class="btn btn-secondary btn-sm" id="update-later-btn" onclick="dismissAppUpdate()">Later</button>
       <button type="button" class="btn btn-primary btn-sm" id="update-now-btn" onclick="installAppUpdate()">Update now</button>

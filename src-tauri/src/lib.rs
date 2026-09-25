@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -200,6 +200,51 @@ mod windows_job {
     }
 }
 
+/// On Windows, letting the display turn off (or the machine enter Modern
+/// Standby) can suspend/throttle background network activity, which is
+/// exactly what was pausing the update download until the user manually
+/// retried it. SetThreadExecutionState tells Windows "don't let the system
+/// go idle right now" for as long as this token is held -- it does NOT
+/// force the screen to stay on, it only keeps the system (and this
+/// process's network I/O) awake in the background.
+mod windows_power {
+    #![cfg(windows)]
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadExecutionState(flags: u32) -> u32;
+    }
+
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+
+    /// Held for as long as a critical background task (like downloading and
+    /// installing an update) must survive the screen turning off or the
+    /// system trying to sleep. Dropping it restores normal power management
+    /// automatically, so every return path (success, error, early `?`) is
+    /// covered without duplicating cleanup code.
+    pub struct StayAwakeGuard {
+        _private: (),
+    }
+
+    impl StayAwakeGuard {
+        pub fn acquire() -> Self {
+            unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+            }
+            StayAwakeGuard { _private: () }
+        }
+    }
+
+    impl Drop for StayAwakeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS);
+            }
+        }
+    }
+}
+
 fn stop_backend_sidecar(app: &tauri::AppHandle) {
     let Some(state) = app.try_state::<BackendSidecar>() else {
         return;
@@ -287,6 +332,12 @@ async fn glr_check_update(app: AppHandle) -> Result<Option<UpdateAvailableInfo>,
     }
 }
 
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    downloaded: u64,
+    total: u64,
+}
+
 /// Download, verify, install the signed update, then relaunch.
 #[tauri::command]
 async fn glr_install_update(app: AppHandle) -> Result<(), String> {
@@ -297,8 +348,36 @@ async fn glr_install_update(app: AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "No update is currently available.".to_string())?;
 
+    // Prevents Windows from suspending background network activity if the
+    // screen turns off or the system tries to idle-sleep mid-download --
+    // that suspension (not a code bug in the download loop itself) was why
+    // the update used to stall until the user manually clicked "Update now"
+    // again. Released automatically the moment this function returns.
+    #[cfg(windows)]
+    let _stay_awake = windows_power::StayAwakeGuard::acquire();
+
+    // Tracks bytes across chunks (download_and_install's callback only gives
+    // us the length of *this* chunk, not a running total) and pushes it to
+    // the UI as a "glr-update-progress" event so the frontend's small
+    // progress bar can show real MB downloaded / total and a live speed
+    // estimate instead of a fake/simulated one.
+    let mut downloaded: u64 = 0;
+    let progress_app = app.clone();
+
     update
-        .download_and_install(|_chunk_len, _content_len| {}, || {})
+        .download_and_install(
+            move |chunk_length, content_length| {
+                downloaded += chunk_length as u64;
+                let _ = progress_app.emit(
+                    "glr-update-progress",
+                    UpdateProgress {
+                        downloaded,
+                        total: content_length.unwrap_or(0),
+                    },
+                );
+            },
+            || {},
+        )
         .await
         .map_err(|error| error.to_string())?;
 

@@ -384,13 +384,6 @@ async function retryProvisioning() {
   const errorEl = document.getElementById("provisioning-error");
   if (!button) return;
 
-  // Same fields the AUTHORIZE DESKTOP flow uses. When the device's sync key
-  // is what's actually missing, no amount of retrying will succeed without
-  // these -- so send them along whenever they're filled in. Leaving them
-  // blank still retries a plain reconnect, for transient network failures.
-  const email = document.getElementById("central-enrollment-email").value.trim();
-  const password = document.getElementById("central-enrollment-password").value;
-
   if (errorEl) errorEl.textContent = "";
   button.disabled = true;
   button.textContent = "RETRYING...";
@@ -398,14 +391,12 @@ async function retryProvisioning() {
     const res = await fetch(API_BASE + "/sync/provisioning/retry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ central_email: email, central_password: password }),
     });
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data.error || "Central synchronization could not complete.");
     }
 
-    document.getElementById("central-enrollment-password").value = "";
     if (errorEl) errorEl.textContent = "Central synchronization completed. Desktop is ready.";
     await loadProvisioningStatus();
   } catch (err) {
@@ -2040,6 +2031,58 @@ async function waitForLocalBackend(options = {}) {
   throw error;
 }
 
+function formatMB(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+// Rolling speed estimate: average bytes/sec since the last sample, smoothed
+// a bit so it doesn't jitter wildly between fast/slow chunks.
+let _updateSpeedLastBytes = 0;
+let _updateSpeedLastAt = 0;
+let _updateSpeedSmoothedBps = 0;
+
+function _resetUpdateSpeedTracking() {
+  _updateSpeedLastBytes = 0;
+  _updateSpeedLastAt = 0;
+  _updateSpeedSmoothedBps = 0;
+}
+
+function showUpdateProgress(downloaded, total) {
+  const wrap = document.getElementById("update-toast-progress");
+  const fill = document.getElementById("update-toast-progress-fill");
+  const stats = document.getElementById("update-toast-progress-stats");
+  if (!wrap || !fill || !stats) return;
+
+  const now = Date.now();
+  if (_updateSpeedLastAt) {
+    const elapsedSec = (now - _updateSpeedLastAt) / 1000;
+    if (elapsedSec > 0) {
+      const instantBps = (downloaded - _updateSpeedLastBytes) / elapsedSec;
+      _updateSpeedSmoothedBps = _updateSpeedSmoothedBps
+        ? (_updateSpeedSmoothedBps * 0.7 + instantBps * 0.3)
+        : instantBps;
+    }
+  }
+  _updateSpeedLastBytes = downloaded;
+  _updateSpeedLastAt = now;
+
+  wrap.style.display = "block";
+  const pct = total ? Math.min(100, (downloaded / total) * 100) : 0;
+  fill.style.width = pct + "%";
+
+  const downloadedMB = formatMB(downloaded);
+  const totalMB = total ? formatMB(total) : "?";
+  const speedMB = formatMB(Math.max(_updateSpeedSmoothedBps, 0));
+  stats.innerHTML =
+    `<span>${downloadedMB} / ${totalMB} MB</span><span>${speedMB} MB/s</span>`;
+}
+
+function hideUpdateProgress() {
+  const wrap = document.getElementById("update-toast-progress");
+  if (wrap) wrap.style.display = "none";
+  _resetUpdateSpeedTracking();
+}
+
 function showUpdateToast(info) {
   const el = document.getElementById("update-toast");
   const msg = document.getElementById("update-toast-message");
@@ -2048,6 +2091,7 @@ function showUpdateToast(info) {
   if (!el || !msg || !info) return;
   pendingUpdateInfo = info;
   msg.textContent = `New version ${info.version} is available.`;
+  hideUpdateProgress();
   if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = "Update now"; }
   if (laterBtn) laterBtn.disabled = false;
   el.classList.add("show");
@@ -2071,16 +2115,43 @@ async function installAppUpdate() {
   updateInstallInProgress = true;
   const nowBtn = document.getElementById("update-now-btn");
   const laterBtn = document.getElementById("update-later-btn");
+  const msg = document.getElementById("update-toast-message");
   if (nowBtn) { nowBtn.disabled = true; nowBtn.textContent = "Updating..."; }
   if (laterBtn) laterBtn.disabled = true;
+  if (msg) msg.textContent = "Downloading update...";
+  _resetUpdateSpeedTracking();
+
+  // The Rust side (glr_install_update) is expected to emit a
+  // "glr-update-progress" event with { downloaded, total } (bytes) as it
+  // streams the download, so this bar reflects the real transfer rather
+  // than a fake/simulated one.
+  let unlisten = null;
+  const listenFn = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+  if (typeof listenFn === "function") {
+    try {
+      unlisten = await listenFn("glr-update-progress", (event) => {
+        const payload = event && event.payload;
+        if (!payload) return;
+        showUpdateProgress(payload.downloaded || 0, payload.total || 0);
+      });
+    } catch (_) {
+      // No event support (older Tauri build) -- installer still works,
+      // it just won't show live MB/speed until that side is updated.
+    }
+  }
+
   try {
     await tauriInvoke("glr_install_update");
     // Process should relaunch; if it returns, keep UI honest.
   } catch (err) {
     updateInstallInProgress = false;
+    hideUpdateProgress();
     if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = "Update now"; }
     if (laterBtn) laterBtn.disabled = false;
+    if (msg && pendingUpdateInfo) msg.textContent = `New version ${pendingUpdateInfo.version} is available.`;
     toast(err && err.message ? err.message : "Update failed. You can try again later.", "error");
+  } finally {
+    if (typeof unlisten === "function") unlisten();
   }
 }
 

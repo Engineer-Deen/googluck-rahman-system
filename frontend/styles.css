@@ -672,6 +672,19 @@ button, .btn, .nav-tab, select, input { -webkit-tap-highlight-color: transparent
 }
 .update-toast-title { font-weight:800; font-size:.82rem; margin-bottom:.12rem; }
 .update-toast-message { color:var(--text-secondary); font-size:.78rem; line-height:1.4; margin-bottom:.65rem; }
+.update-toast-progress { margin: -.15rem 0 .65rem; }
+.update-toast-progress-track {
+  height: 4px; border-radius: 999px; background: var(--border-strong);
+  overflow: hidden;
+}
+.update-toast-progress-fill {
+  height: 100%; width: 0%; border-radius: 999px; background: var(--accent);
+  transition: width .2s ease;
+}
+.update-toast-progress-stats {
+  margin-top: .32rem; font-size: .68rem; color: var(--text-secondary);
+  display:flex; justify-content:space-between; gap:.5rem;
+}
 .update-toast-actions { display:flex; gap:.45rem; justify-content:flex-end; flex-wrap:wrap; }
 @media (max-width:640px) {
   .update-toast { right: 0.75rem; bottom: 0.75rem; }
