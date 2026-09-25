@@ -29,6 +29,37 @@ products_bp = Blueprint("products", __name__, url_prefix="/api/products")
 
 FINANCE_ROLES = ("owner", "admin", "manager")
 
+PRODUCT_EDIT_REASONS = {
+    "Correct product information",
+    "Correct product name",
+    "Correct category",
+    "Correct cost price",
+    "Correct data entry mistake",
+    "Other approved reason",
+}
+PRODUCT_DEACTIVATE_REASONS = {
+    "Product discontinued",
+    "Product unavailable",
+    "Product temporarily unavailable",
+    "Product replaced",
+    "Product entered in error",
+    "Other approved reason",
+}
+PRODUCT_REACTIVATE_REASONS = {
+    "Product available again",
+    "Product returned to catalog",
+    "Previous deactivation was incorrect",
+    "Product replacement cancelled",
+    "Other approved reason",
+}
+PRODUCT_DELETE_REASONS = {
+    "Duplicate product",
+    "Product created by mistake",
+    "Product permanently removed from catalog",
+    "Product replaced or merged",
+    "Other approved reason",
+}
+
 
 def current_stock(product_id, shop_id=None):
     if current_app.config.get("GLR_MODE") == "central":
@@ -69,11 +100,10 @@ def serialize_product(p, include_stock=True, role=None, stock_value=None):
     }
     if include_stock:
         data["stock"] = current_stock(p.id) if stock_value is None else int(stock_value)
-    # Cost price (and therefore margin) is only visible to roles that
-    # should see it -- a cashier gets the selling price and stock, same
-    # as the old system kept cost data away from front-line staff.
-    if role in FINANCE_ROLES:
-        data["cost_price"] = str(value("cost_price", 0))
+    # The sales desk needs the current cost price as read-only context when
+    # setting a transaction selling price. This does not expose or calculate
+    # profit for the caller; profit remains governed by the sales responses.
+    data["cost_price"] = str(value("cost_price", 0))
     return data
 
 
@@ -173,10 +203,14 @@ def create_product():
         return jsonify(error="Please select a valid product category"), 400
 
     try:
-        unit_price = float(data.get("unit_price", 0))
         cost_price = float(data.get("cost_price", 0))
     except (TypeError, ValueError):
-        return jsonify(error="unit_price and cost_price must be numbers"), 400
+        return jsonify(error="cost_price must be a number"), 400
+    # Selling price is intentionally NOT a catalog field anymore. It is
+    # entered for each sale at the point of checkout because it can change
+    # from customer to customer and transaction to transaction. Keep the
+    # legacy database column at zero for compatibility with existing rows.
+    unit_price = 0.0
 
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service
@@ -223,18 +257,23 @@ def update_product(product_id):
         reason = (data.get("reason") or "").strip()
         if not reason:
             return jsonify(error="A reason is required to update a product"), 400
+        if set(data.keys()) == {"is_active", "reason"}:
+            reason_set = PRODUCT_REACTIVATE_REASONS if bool(data.get("is_active")) else PRODUCT_DEACTIVATE_REASONS
+            if reason not in reason_set:
+                return jsonify(error="Please select a valid product state-change reason"), 400
+        elif reason not in PRODUCT_EDIT_REASONS:
+            return jsonify(error="Please select a valid product edit reason"), 400
         before = dict(product)
         updates = {key: data[key] for key in ("name", "is_active") if key in data}
         if "category" in data:
             if data["category"] not in CATEGORY_CODES:
                 return jsonify(error="Please select a valid product category"), 400
             updates["category"] = data["category"]
-        for key in ("unit_price", "cost_price"):
-            if key in data:
-                try:
-                    updates[key] = str(float(data[key]))
-                except (TypeError, ValueError):
-                    return jsonify(error=f"{key} must be a number"), 400
+        if "cost_price" in data:
+            try:
+                updates["cost_price"] = str(float(data["cost_price"]))
+            except (TypeError, ValueError):
+                return jsonify(error="cost_price must be a number"), 400
         product = service.save_product(product_id, **updates)
         service.write_audit(f"product-updated-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_updated", entity_type="product", entity_id=str(product_id), details={"reason": reason, "before": before, "after": product})
         return jsonify(serialize_product(product, role=g.staff_role, stock_value=current_stock(product_id, g.staff_shop_id)))
@@ -243,6 +282,12 @@ def update_product(product_id):
     reason = (data.get("reason") or "").strip()
     if not reason:
         return jsonify(error="A reason is required to update a product"), 400
+    if set(data.keys()) == {"is_active", "reason"}:
+        reason_set = PRODUCT_REACTIVATE_REASONS if bool(data.get("is_active")) else PRODUCT_DEACTIVATE_REASONS
+        if reason not in reason_set:
+            return jsonify(error="Please select a valid product state-change reason"), 400
+    elif reason not in PRODUCT_EDIT_REASONS:
+        return jsonify(error="Please select a valid product edit reason"), 400
     before = {"sku": p.sku, "name": p.name, "category": p.category, "unit_price": str(p.unit_price), "cost_price": str(p.cost_price), "is_active": p.is_active}
 
     if "name" in data:
@@ -251,11 +296,6 @@ def update_product(product_id):
         if data["category"] not in CATEGORY_CODES:
             return jsonify(error="Please select a valid product category"), 400
         p.category = data["category"]
-    if "unit_price" in data:
-        try:
-            p.unit_price = float(data["unit_price"])
-        except (TypeError, ValueError):
-            return jsonify(error="unit_price must be a number"), 400
     if "cost_price" in data:
         try:
             p.cost_price = float(data["cost_price"])
@@ -300,12 +340,17 @@ def delete_product(product_id):
         if not product:
             return jsonify(error="Product not found"), 404
         data = request.get_json(silent=True) or {}
+        reason = (data.get("reason") or "").strip()
+        if reason not in PRODUCT_DELETE_REASONS:
+            return jsonify(error="Please select a valid product deletion reason"), 400
         product = service.save_product(product_id, is_active=False)
-        service.write_audit(f"product-deleted-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_deleted", entity_type="product", entity_id=str(product_id), details={"sku": product.get("sku"), "name": product.get("name"), "reason": data.get("reason")})
+        service.write_audit(f"product-deleted-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_deleted", entity_type="product", entity_id=str(product_id), details={"sku": product.get("sku"), "name": product.get("name"), "reason": reason})
         return jsonify(serialize_product(product, role=g.staff_role, stock_value=current_stock(product_id, g.staff_shop_id)))
     p = Product.query.get_or_404(product_id)
     data = request.get_json(silent=True) or {}
     reason = (data.get("reason") or "").strip()
+    if reason not in PRODUCT_DELETE_REASONS:
+        return jsonify(error="Please select a valid product deletion reason"), 400
     p.is_active = False
     db.session.commit()
 

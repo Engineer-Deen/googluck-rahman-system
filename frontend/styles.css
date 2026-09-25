@@ -292,6 +292,14 @@ input, select { font-family: inherit; }
 #app { display: none; }
 #app.visible { display: block; }
 
+.app-chrome {
+  position: sticky;
+  top: 0;
+  z-index: 900;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(0,0,0,.08);
+}
+
 header {
   display: flex;
   align-items: center;

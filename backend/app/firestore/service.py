@@ -512,7 +512,7 @@ class FirestoreSyncService:
                 raise ValueError("Item quantity must be greater than zero")
             raw_unit_price = item.get("unit_price")
             if raw_unit_price is None:
-                raw_unit_price = product.get("unit_price", 0)
+                raise ValueError("Selling price is required for each sale item")
             unit_price = Decimal(str(raw_unit_price))
             if unit_price <= 0:
                 raise ValueError("Item selling price must be greater than zero")

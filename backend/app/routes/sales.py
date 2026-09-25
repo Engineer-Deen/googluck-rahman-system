@@ -248,7 +248,9 @@ def apply_sale(payload: dict):
             raise ValueError("Item quantity must be a whole number")
         if quantity <= 0:
             raise ValueError("Item quantity must be greater than zero")
-        unit_price = Decimal(str(item.get("unit_price", product.unit_price)))
+        if item.get("unit_price") is None:
+            raise ValueError("Selling price is required for each sale item")
+        unit_price = Decimal(str(item["unit_price"]))
         if unit_price <= 0:
             raise ValueError("Item selling price must be greater than zero")
         total_amount += (unit_price * quantity).quantize(Decimal("0.01"))
@@ -281,7 +283,7 @@ def apply_sale(payload: dict):
     for item in items_data:
         product = products[item["product_id"]]
         quantity = int(item["quantity"])
-        unit_price = Decimal(str(item.get("unit_price", product.unit_price)))
+        unit_price = Decimal(str(item["unit_price"]))
         subtotal = (unit_price * quantity).quantize(Decimal("0.01"))
 
         db.session.add(

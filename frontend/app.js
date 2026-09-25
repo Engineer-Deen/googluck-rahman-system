@@ -78,6 +78,36 @@ const VOID_REASONS = [
   "Customer cancelled order",
   "Other approved reason"
 ];
+const PRODUCT_EDIT_REASONS = [
+  "Correct product information",
+  "Correct product name",
+  "Correct category",
+  "Correct cost price",
+  "Correct data entry mistake",
+  "Other approved reason"
+];
+const PRODUCT_DEACTIVATE_REASONS = [
+  "Product discontinued",
+  "Product unavailable",
+  "Product temporarily unavailable",
+  "Product replaced",
+  "Product entered in error",
+  "Other approved reason"
+];
+const PRODUCT_REACTIVATE_REASONS = [
+  "Product available again",
+  "Product returned to catalog",
+  "Previous deactivation was incorrect",
+  "Product replacement cancelled",
+  "Other approved reason"
+];
+const PRODUCT_DELETE_REASONS = [
+  "Duplicate product",
+  "Product created by mistake",
+  "Product permanently removed from catalog",
+  "Product replaced or merged",
+  "Other approved reason"
+];
 const DEFAULT_SYSTEM_SETTINGS = { timeoutMinutes: 15, fullLoginHours: 8, pinConfigured: false };
 let systemSettingsCache = Object.assign({}, DEFAULT_SYSTEM_SETTINGS);
 let historySearchTimer = null;
@@ -86,6 +116,7 @@ let reasonResolver = null;
 let adminLocked = false;
 let adminSecurityTimer = null;
 let activityTimer = null;
+let pendingSaleSubmission = null;
 
 
 // ---------- tiny UUID v4, used for client-generated ids (sales, stock
@@ -551,6 +582,8 @@ async function loadInventoryPanel() {
     });
 
     const canManageCatalog = currentStaff && FINANCE_ROLES.includes(currentStaff.role);
+    const costHeader = document.getElementById("inventory-cost-header");
+    if (costHeader) costHeader.style.display = canManageCatalog ? "" : "none";
 
     tbody.innerHTML = "";
 
@@ -567,13 +600,17 @@ async function loadInventoryPanel() {
         ? `
             <button class="btn btn-secondary btn-sm" onclick="editProduct(${product.id})">EDIT</button>
             <button class="btn btn-${product.is_active ? "danger" : "success"} btn-sm" onclick="toggleInventoryProductState(${product.id}, ${!product.is_active})">${product.is_active ? "DEACTIVATE" : "REACTIVATE"}</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteInventoryProduct(${product.id})">DELETE</button>
           `
         : '<span class="muted">Sync-managed</span>';
+      const costCell = canManageCatalog
+        ? `<td>${money(product.cost_price)}</td>`
+        : '<td style="display:none;"></td>';
       tr.innerHTML = `
         <td style="font-family:'DM Mono',monospace;font-size:0.78rem;">${escapeHtml(product.sku || "-")}</td>
         <td>${escapeHtml(product.name)}</td>
         <td>${escapeHtml(product.category)}</td>
-        <td>${money(product.unit_price)}</td>
+        ${costCell}
         <td>${product.stock}</td>
         <td class="action-cell">${actionButtons}</td>
       `;
@@ -590,7 +627,6 @@ function clearProductForm() {
   document.getElementById("p-sku").value = "";
   document.getElementById("p-name").value = "";
   document.getElementById("p-category").value = "";
-  document.getElementById("p-unit-price").value = "";
   document.getElementById("p-cost-price").value = "";
   document.getElementById("p-cancel-btn").style.display = "none";
 }
@@ -603,7 +639,6 @@ async function editProduct(productId) {
     document.getElementById("p-sku").value = product.sku || "";
     document.getElementById("p-name").value = product.name || "";
     document.getElementById("p-category").value = product.category || "";
-    document.getElementById("p-unit-price").value = product.unit_price || "";
     document.getElementById("p-cost-price").value = product.cost_price || "";
     document.getElementById("p-cancel-btn").style.display = "inline-block";
     document.getElementById("add-product-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -615,7 +650,6 @@ async function editProduct(productId) {
 async function submitProductForm() {
   const name = document.getElementById("p-name").value.trim();
   const category = document.getElementById("p-category").value;
-  const unitPrice = Number(document.getElementById("p-unit-price").value || 0);
   const costPrice = Number(document.getElementById("p-cost-price").value || 0);
 
   if (!name) {
@@ -629,14 +663,13 @@ async function submitProductForm() {
 
   try {
     if (inventoryEditProductId) {
-      const reason = await openReasonModal("Why are you changing this product?");
+      const reason = await openReasonModal("Why are you editing this product?", PRODUCT_EDIT_REASONS);
       if (!reason) return;
       await api(`/products/${inventoryEditProductId}`, {
         method: "PUT",
         body: JSON.stringify({
           name,
           category,
-          unit_price: unitPrice,
           cost_price: costPrice,
           reason,
         }),
@@ -648,7 +681,6 @@ async function submitProductForm() {
         body: JSON.stringify({
           name,
           category,
-          unit_price: unitPrice,
           cost_price: costPrice,
         }),
       });
@@ -665,7 +697,11 @@ async function submitProductForm() {
 
 async function toggleInventoryProductState(productId, makeActive) {
   try {
-    const reason = await openReasonModal(makeActive ? "Why are you reactivating this product?" : "Why are you deactivating this product?");
+    const reasons = makeActive ? PRODUCT_REACTIVATE_REASONS : PRODUCT_DEACTIVATE_REASONS;
+    const reason = await openReasonModal(
+      makeActive ? "Why are you reactivating this product?" : "Why are you deactivating this product?",
+      reasons,
+    );
     if (!reason) return;
     await api(`/products/${productId}`, {
       method: "PUT",
@@ -675,6 +711,25 @@ async function toggleInventoryProductState(productId, makeActive) {
       }),
     });
     toast(makeActive ? "Product reactivated." : "Product deactivated.", "success");
+    await loadProducts(true);
+    await loadInventoryPanel();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+async function deleteInventoryProduct(productId) {
+  const product = productsCache.find((p) => Number(p.id) === Number(productId));
+  const productName = product ? product.name : `Product #${productId}`;
+  const reason = await openReasonModal(`Why are you deleting ${productName}?`, PRODUCT_DELETE_REASONS);
+  if (!reason) return;
+
+  try {
+    await api(`/products/${productId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ reason }),
+    });
+    toast("Product deleted.", "success");
     await loadProducts(true);
     await loadInventoryPanel();
   } catch (err) {
@@ -907,8 +962,8 @@ async function loadSalesPanel() {
     const opt = document.createElement("option");
     opt.value = p.id;
     opt.textContent = p.name;
-    opt.dataset.price = p.unit_price;
     opt.dataset.stock = p.stock;
+    opt.dataset.costPrice = p.cost_price ?? "";
     select.appendChild(opt);
   });
   renderSessionTable();
@@ -986,6 +1041,7 @@ function addSaleItem() {
   // The current line has now been added. Clear only the line-entry controls;
   // customer/payment information belongs to the whole sale and stays intact.
   select.value = "";
+  document.getElementById("s-cost-price").value = "";
   document.getElementById("s-price").value = "";
   document.getElementById("s-qty").value = "1";
   document.getElementById("s-stock-card").style.display = "none";
@@ -1005,8 +1061,10 @@ function onPaidInFullToggle() {
   if (checked) {
     amountField.value = getSaleCartTotal() === 0 ? "" : getSaleCartTotal().toFixed(2);
     amountField.disabled = true;
+    amountField.placeholder = "Automatically set to full sale total";
   } else {
     amountField.disabled = false;
+    amountField.placeholder = "Enter only for part payment";
   }
   calcSaleTotal();
 }
@@ -1014,12 +1072,18 @@ function onPaidInFullToggle() {
 function onSaleProductChange() {
   const select = document.getElementById("s-product");
   const opt = select.selectedOptions[0];
+  const costField = document.getElementById("s-cost-price");
   if (!opt || !opt.value) {
+    if (costField) costField.value = "";
     document.getElementById("s-stock-card").style.display = "none";
     calcSaleTotal();
     return;
   }
-  document.getElementById("s-price").value = opt.dataset.price;
+  document.getElementById("s-price").value = "";
+  if (costField) {
+    const cost = Number(opt.dataset.costPrice);
+    costField.value = Number.isFinite(cost) ? money(cost) : "Not available";
+  }
   document.getElementById("s-stock-count").textContent = opt.dataset.stock;
   document.getElementById("s-stock-card").style.display = "flex";
   calcSaleTotal();
@@ -1065,18 +1129,47 @@ function normalizeInputName(input) {
 }
 
 function clearSaleForm() {
+  pendingSaleSubmission = null;
   document.getElementById("s-customer").value = "";
   document.getElementById("s-product").value = "";
+  document.getElementById("s-cost-price").value = "";
   document.getElementById("s-price").value = "";
   document.getElementById("s-qty").value = "1";
   document.getElementById("s-amount-paid").value = "";
   document.getElementById("s-amount-paid").disabled = false;
+  document.getElementById("s-amount-paid").placeholder = "Enter only for part payment";
   document.getElementById("s-paid-in-full").checked = false;
   document.getElementById("s-stock-card").style.display = "none";
   document.getElementById("s-balance-preview").style.display = "none";
   saleCart = [];
   renderSaleCart();
   calcSaleTotal();
+}
+
+function buildSaleSubmissionSignature(customer, amountPaidField, items) {
+  return JSON.stringify({
+    customer_name: customer,
+    amount_paid: amountPaidField === "" ? null : Number(amountPaidField),
+    items: items.map((item) => ({
+      product_id: Number(item.product_id),
+      quantity: Number(item.quantity),
+      unit_price: Number(item.unit_price),
+    })),
+  });
+}
+
+function refreshSalesUiAfterSave() {
+  // The sale has already been accepted at this point. UI refresh is deliberately
+  // best-effort and must never turn a successful sale into a client-side failure.
+  Promise.resolve().then(async () => {
+    try {
+      await loadProducts(true);
+      await Promise.all([loadSalesPanel(), loadDashboard()]);
+    } catch (err) {
+      // Do not report the sale as failed just because a background refresh failed.
+      // The next panel open or sync cycle will refresh the data again.
+    }
+  });
 }
 
 async function saveSale() {
@@ -1127,17 +1220,17 @@ async function saveSale() {
     return;
   }
 
-  // Generated HERE, at the moment of sale, on this device -- not by the
-  // server. This makes the sale idempotent and safe to sync later.
-  const saleId = uuidv4();
+  const signature = buildSaleSubmissionSignature(customer, amountPaidField, finalItems);
+  const saleId = pendingSaleSubmission && pendingSaleSubmission.signature === signature
+    ? pendingSaleSubmission.id
+    : uuidv4();
+  pendingSaleSubmission = { id: saleId, signature };
 
   const payload = {
     id: saleId,
     customer_name: customer,
     items: finalItems,
   };
-  // Leaving Amount Paid blank means nothing has been paid yet -- the
-  // server defaults it to 0 (an open balance), not a full payment.
   if (amountPaidField !== "") {
     payload.amount_paid = Number(amountPaidField);
   }
@@ -1150,6 +1243,10 @@ async function saveSale() {
       body: JSON.stringify(payload),
     });
 
+    // The server has accepted this exact sale ID. Clear the retry guard before
+    // any background UI work so a refresh failure can never create a duplicate.
+    pendingSaleSubmission = null;
+
     const syncPending = !sale.invoice_number;
     if (sale.stock_warning) {
       toast(`${syncPending ? "Sale saved locally" : "Sale completed"}, but stock is now negative. Restock needed.`, "warning");
@@ -1161,20 +1258,31 @@ async function saveSale() {
       toast("Sale completed and saved.", "success");
     }
 
+    // Update the visible session immediately. Do not block the cashier on
+    // dashboard/inventory refreshes after the sale itself has succeeded.
     sessionSales.unshift(sale);
     clearSaleForm();
+    renderSessionTable();
     if (!sale.invoice_number) watchSaleSync(saleId);
-    await loadProducts(true);
-    await loadSalesPanel();
-    await loadDashboard();
+    refreshSalesUiAfterSave();
   } catch (err) {
-    if (err.authExpired) return;
-    toast(err.networkFailure
-      ? "The local POS server is unavailable. The sale status is unknown. Check Transaction History before retrying."
-      : `Sale failed. It was not completed. ${err.message}`, "error");
+    if (err.authExpired) {
+      btn.textContent = "RETRY SAVE SALE";
+      return;
+    }
+    if (err.networkFailure) {
+      // Keep the same sale ID. If the first request actually reached the local
+      // server but its response was lost, retrying this exact ID is idempotent
+      // and returns the existing sale instead of creating a duplicate.
+      btn.textContent = "RETRY SAVE SALE";
+      toast("The sale status is unknown. Retry this same sale; it will not be duplicated.", "warning");
+    } else {
+      pendingSaleSubmission = null;
+      toast(`Sale failed. It was not completed. ${err.message}`, "error");
+    }
   } finally {
     btn.disabled = false;
-    btn.textContent = "SAVE SALE";
+    if (!pendingSaleSubmission) btn.textContent = "SAVE SALE";
   }
 }
 
