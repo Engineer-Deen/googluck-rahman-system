@@ -39,6 +39,8 @@ node_modules/
 glr-postgres-sync-*/
 glr-sqlite-probe-*/
 e2e_desktop_report.json
+src-tauri/binaries/ 
+src-tauri/target/ target/ #
 
 # ============================================================
 #  Tooling
