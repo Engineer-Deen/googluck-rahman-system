@@ -298,6 +298,11 @@ async function doLogin() {
       localStorage.setItem("glr_admin_session_started", String(Date.now()));
       localStorage.setItem("glr_admin_last_active", String(Date.now()));
     }
+    // A full, explicit login (real credentials just typed) always starts
+    // unlocked -- clear any stale lock flag left over from a previous
+    // session (this device, or even a different staff member) so it can
+    // never block someone who just correctly authenticated.
+    localStorage.removeItem("glr_admin_locked");
     await enterApp();
   } catch (err) {
     if (!navigator.onLine || err.code === "central_auth_network") {
@@ -464,6 +469,7 @@ async function doLogout() {
   localStorage.removeItem("glr_staff");
   localStorage.removeItem("glr_admin_session_started");
   localStorage.removeItem("glr_admin_last_active");
+  localStorage.removeItem("glr_admin_locked");
   saleCart = [];
   renderSaleCart();
   document.getElementById("app").classList.remove("visible");
@@ -491,7 +497,7 @@ async function enterApp() {
   headerRight.insertBefore(toggle, headerRight.firstChild);
 
   applyRoleVisibility();
-  initializeAdminSecurity();
+  await initializeAdminSecurity();
 
   const savedPanel = localStorage.getItem("glr_active_panel");
   const availablePanels = new Set(
@@ -515,7 +521,6 @@ async function enterApp() {
   });
 
   loadShopBranding();
-  if (currentStaff && ADMIN_ROLES.includes(currentStaff.role)) loadSystemSettings();
   startSyncStatusPolling();
 
   if (authToken && currentStaff) {
@@ -1766,6 +1771,10 @@ function checkAdminSessionSecurity() {
 function showAdminLock(message) {
   if (adminLocked || !currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) return;
   adminLocked = true;
+  // Persisted, not just held in memory: without this, refreshing the page
+  // while locked would drop the person straight back into the unlocked app,
+  // since adminLocked itself doesn't survive a page reload.
+  localStorage.setItem("glr_admin_locked", "1");
   document.getElementById("admin-lock-message").textContent = message;
   document.getElementById("admin-lock-pin").value = "";
   document.getElementById("admin-lock-error").textContent = systemSettingsCache.pinConfigured ? "" : "No quick PIN is configured. Use FULL LOGIN.";
@@ -1779,6 +1788,7 @@ async function unlockAdminSession() {
   try {
     await api("/auth/verify-pin", { method: "POST", body: JSON.stringify({ pin: entered }) });
     adminLocked = false;
+    localStorage.removeItem("glr_admin_locked");
     localStorage.setItem("glr_admin_last_active", String(Date.now()));
     document.getElementById("admin-lock-modal").style.display = "none";
     toast("Session unlocked.", "success");
@@ -1790,16 +1800,32 @@ async function unlockAdminSession() {
 function forceAdminLogin() {
   adminLocked = false;
   localStorage.removeItem("glr_token"); localStorage.removeItem("glr_staff");
+  localStorage.removeItem("glr_admin_locked");
   authToken = null; currentStaff = null;
   document.getElementById("admin-lock-modal").style.display = "none";
   document.getElementById("app").classList.remove("visible");
   document.getElementById("login-overlay").style.display = "flex";
   toast("Please sign in again to continue.", "error");
 }
-function initializeAdminSecurity() {
+async function initializeAdminSecurity() {
   if (!currentStaff || !ADMIN_ROLES.includes(currentStaff.role)) return;
   if (!localStorage.getItem("glr_admin_session_started")) localStorage.setItem("glr_admin_session_started", String(Date.now()));
-  localStorage.setItem("glr_admin_last_active", String(Date.now()));
+
+  // Load the current PIN/timeout settings before deciding whether to show
+  // the lock screen, so a restored lock (see below) shows the right PIN
+  // hint immediately instead of a stale "no PIN configured" default. This
+  // is a local read (no central round trip), so it costs nothing noticeable.
+  await loadSystemSettings();
+
+  // A lock from before a page refresh must still be enforced -- otherwise
+  // reloading the page while locked would bypass the PIN requirement
+  // entirely, since the session itself now survives a refresh too.
+  if (localStorage.getItem("glr_admin_locked") === "1") {
+    showAdminLock("Enter your 4-digit PIN to continue.");
+  } else {
+    localStorage.setItem("glr_admin_last_active", String(Date.now()));
+  }
+
   document.addEventListener("click", touchAdminActivity);
   document.addEventListener("keydown", touchAdminActivity);
   if (adminSecurityTimer) clearInterval(adminSecurityTimer);

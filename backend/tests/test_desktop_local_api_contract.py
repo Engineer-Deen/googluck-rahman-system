@@ -33,13 +33,31 @@ class DesktopLocalApiContractTests(unittest.TestCase):
             boot.index("loadLoginBranding()"),
         )
 
-    def test_frontend_never_restores_cached_authentication_at_startup(self):
+    def test_frontend_restores_session_only_by_reverifying_with_local_backend(self):
+        """A refresh is now allowed to restore a cached session (deliberate
+        product decision), but ONLY by re-checking the cached token against
+        this device's own local backend (/auth/me) -- it must never treat a
+        cached localStorage token as sufficient on its own, since that's the
+        difference between "resume this still-valid session" and "trust
+        whatever a browser storage value claims"."""
         text = FRONTEND_APP_JS.read_text(encoding="utf-8")
         startup = text[text.index("let authToken"):text.index("// ----------", text.index("let authToken"))]
-        self.assertIn("let authToken = null", startup)
-        self.assertIn("let currentStaff = null", startup)
+        self.assertIn('localStorage.getItem("glr_token")', startup)
         boot = text[text.index("(async function boot"):]
-        self.assertNotIn("enterApp().catch", boot)
+        self.assertIn('await api("/auth/me")', boot)
+        self.assertIn("await enterApp()", boot)
+
+    def test_admin_quick_lock_survives_a_page_refresh(self):
+        """The admin quick-lock (PIN) state must be persisted, not just held
+        in a JS variable -- otherwise, now that sessions survive a refresh,
+        simply reloading the page while locked would bypass the PIN screen
+        entirely. A fresh, explicit login must still always start unlocked,
+        even if a stale lock flag was left over from a previous session."""
+        text = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        self.assertIn('localStorage.setItem("glr_admin_locked", "1")', text)
+        self.assertIn('localStorage.getItem("glr_admin_locked") === "1"', text)
+        login = text[text.index("async function doLogin"):text.index("async function enterApp")]
+        self.assertIn('localStorage.removeItem("glr_admin_locked")', login)
 
     def test_provisioning_does_not_request_an_offline_password(self):
         html = FRONTEND_INDEX.read_text(encoding="utf-8")
