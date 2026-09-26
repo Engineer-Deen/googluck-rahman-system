@@ -311,12 +311,20 @@ def pull_reference_data_once(app) -> dict:
             skipped_staff = 0
             for raw in data.get("staff", []):
                 staff = db.session.get(Staff, raw["id"])
-                if not staff:
-                    # Authentication secrets are intentionally absent from sync
-                    # payloads. A new account must be provisioned through the
-                    # authenticated account flow before it can be used offline.
-                    skipped_staff += 1
-                    continue
+                is_new = not staff
+                if is_new:
+                    # Bring the shadow record in immediately, just like shops
+                    # and products already do -- do not wait for this staff
+                    # member to log in on this specific PC first. That used
+                    # to be the behavior here, but it doesn't add any real
+                    # protection: local-mode login never checks this local
+                    # password_hash at all (see _authenticate_against_central
+                    # in routes/auth.py), it always re-verifies the password
+                    # against the real central server. So skipping this just
+                    # hid staff accounts created elsewhere -- an account
+                    # that's in Firestore should always show up locally too.
+                    staff = Staff(id=raw["id"], password_hash="")
+                    db.session.add(staff)
 
                 # Keep local staff rows stable when the central payload is unchanged.
                 # Re-writing the same values would advance updated_at, which would
@@ -330,6 +338,7 @@ def pull_reference_data_once(app) -> dict:
                     "is_active": raw["is_active"],
                 }
                 if (
+                    not is_new and
                     staff.shop_id == desired["shop_id"] and
                     staff.name == desired["name"] and
                     staff.email == desired["email"] and

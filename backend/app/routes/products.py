@@ -215,8 +215,22 @@ def create_product():
     if current_app.config.get("GLR_MODE") == "central":
         from app.firestore import get_firestore_sync_service
         service = get_firestore_sync_service()
+        # Idempotency: if this exact submission (double-click, or a retry
+        # after the response was lost to a dropped connection) already
+        # created a product, return that product instead of creating a
+        # second one. See _mirror_product_locally/app.js for the other half
+        # of this -- the client sends the same client_request_id on retry.
+        client_request_id = (data.get("client_request_id") or "").strip()
+        if client_request_id:
+            existing = service.get_product_by_client_request_id(client_request_id)
+            if existing:
+                shop_id = None if g.staff_role == "owner" else g.staff_shop_id
+                return jsonify(serialize_product(
+                    existing, role=g.staff_role,
+                    stock_value=current_stock(existing["id"], shop_id),
+                )), 200
         product_id = service._allocate_product_id()
-        product = service.save_product(product_id, sku=f"GLR-{CATEGORY_CODES[category]}-{product_id:06d}", name=name, category=category, unit_price=str(unit_price), cost_price=str(cost_price), is_active=True, shop_ids=[g.staff_shop_id] if g.staff_shop_id else [])
+        product = service.save_product(product_id, sku=f"GLR-{CATEGORY_CODES[category]}-{product_id:06d}", name=name, category=category, unit_price=str(unit_price), cost_price=str(cost_price), is_active=True, shop_ids=[g.staff_shop_id] if g.staff_shop_id else [], client_request_id=client_request_id or None)
         service.write_audit(f"product-created-{product_id}-{uuid.uuid4().hex}", actor_staff_id=g.staff_id, actor_role=g.staff_role, action="product_created", entity_type="product", entity_id=str(product_id), details={"sku": product["sku"], "name": name, "category": category})
         return jsonify(serialize_product(product, role=g.staff_role, stock_value=0)), 201
     product = Product(

@@ -57,10 +57,15 @@ document.addEventListener("input", (event) => {
   }
 });
 
-let authToken = null;
+let authToken = localStorage.getItem("glr_token") || null;
 let currentStaff = null;
-localStorage.removeItem("glr_token");
-localStorage.removeItem("glr_staff");
+try {
+  const storedStaff = localStorage.getItem("glr_staff");
+  currentStaff = storedStaff ? JSON.parse(storedStaff) : null;
+} catch (_) {
+  localStorage.removeItem("glr_staff");
+  currentStaff = null;
+}
 let currentMode = "local";
 let productsCache = [];
 let inventoryEditProductId = null;
@@ -117,6 +122,7 @@ let adminLocked = false;
 let adminSecurityTimer = null;
 let activityTimer = null;
 let pendingSaleSubmission = null;
+let pendingProductSubmission = null;
 
 
 // ---------- tiny UUID v4, used for client-generated ids (sales, stock
@@ -286,6 +292,8 @@ async function doLogin() {
     });
     authToken = data.token;
     currentStaff = data.staff;
+    localStorage.setItem("glr_token", authToken);
+    localStorage.setItem("glr_staff", JSON.stringify(currentStaff));
     if (ADMIN_ROLES.includes(currentStaff.role)) {
       localStorage.setItem("glr_admin_session_started", String(Date.now()));
       localStorage.setItem("glr_admin_last_active", String(Date.now()));
@@ -484,7 +492,28 @@ async function enterApp() {
 
   applyRoleVisibility();
   initializeAdminSecurity();
-  refreshAll();
+
+  const savedPanel = localStorage.getItem("glr_active_panel");
+  const availablePanels = new Set(
+    Array.from(document.querySelectorAll(".nav-tab"))
+      .filter((tab) => tab.style.display !== "none")
+      .map((tab) => tab.dataset.panel)
+  );
+  const panelToRestore =
+    savedPanel && availablePanels.has(savedPanel) && document.getElementById("panel-" + savedPanel)
+      ? savedPanel
+      : "dashboard";
+
+  // Restore the visible panel without triggering an extra API read.
+  showPanel(panelToRestore, { restore: true, uiOnly: true });
+
+  refreshAll().then(() => {
+    // Dashboard data is already loaded by refreshAll(). Other panels need
+    // their normal loader once after the refresh so the restored view is
+    // populated without issuing duplicate reads.
+    if (panelToRestore !== "dashboard") showPanel(panelToRestore, { restore: true });
+  });
+
   loadShopBranding();
   if (currentStaff && ADMIN_ROLES.includes(currentStaff.role)) loadSystemSettings();
   startSyncStatusPolling();
@@ -541,11 +570,19 @@ function applyRoleVisibility() {
 }
 
 // ---------- panels ----------
-function showPanel(name) {
+function showPanel(name, options = {}) {
+  const panel = document.getElementById("panel-" + name);
+  const tab = document.querySelector(`.nav-tab[data-panel="${name}"]`);
+  if (!panel || !tab) return;
+
   document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
   document.querySelectorAll(".nav-tab").forEach((t) => t.classList.remove("active"));
-  document.getElementById("panel-" + name).classList.add("active");
-  document.querySelector(`.nav-tab[data-panel="${name}"]`).classList.add("active");
+  panel.classList.add("active");
+  tab.classList.add("active");
+
+  if (!options.restore) localStorage.setItem("glr_active_panel", name);
+  if (options.uiOnly) return;
+
   if (name === "dashboard") loadDashboard();
   if (name === "sales") loadSalesPanel();
   if (name === "payments") loadPaymentDesk();
@@ -647,6 +684,10 @@ async function editProduct(productId) {
   }
 }
 
+function buildProductSubmissionSignature(name, category, costPrice) {
+  return JSON.stringify({ name, category, cost_price: costPrice });
+}
+
 async function submitProductForm() {
   const name = document.getElementById("p-name").value.trim();
   const category = document.getElementById("p-category").value;
@@ -661,8 +702,29 @@ async function submitProductForm() {
     return;
   }
 
+  const btn = document.getElementById("p-save-btn");
+  const isEdit = !!inventoryEditProductId;
+
+  // Only "create" needs a client-generated id: editing an existing product
+  // is already safe to repeat (same product_id, same fields every time).
+  // For create, reuse the same id across a retry of the exact same
+  // submission (double-click, or a retry after the connection drops) so the
+  // server can recognize it and never create a second product -- same
+  // pattern as saveSale()'s idempotency guard above.
+  let clientRequestId = null;
+  if (!isEdit) {
+    const signature = buildProductSubmissionSignature(name, category, costPrice);
+    clientRequestId = pendingProductSubmission && pendingProductSubmission.signature === signature
+      ? pendingProductSubmission.id
+      : uuidv4();
+    pendingProductSubmission = { id: clientRequestId, signature };
+  }
+
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = "SAVING...";
   try {
-    if (inventoryEditProductId) {
+    if (isEdit) {
       const reason = await openReasonModal("Why are you editing this product?", PRODUCT_EDIT_REASONS);
       if (!reason) return;
       await api(`/products/${inventoryEditProductId}`, {
@@ -682,8 +744,12 @@ async function submitProductForm() {
           name,
           category,
           cost_price: costPrice,
+          client_request_id: clientRequestId,
         }),
       });
+      // The server has accepted this exact submission. Clear the retry guard
+      // now so a later, unrelated "add product" click gets its own fresh id.
+      pendingProductSubmission = null;
       toast("Product created.", "success");
     }
 
@@ -691,7 +757,18 @@ async function submitProductForm() {
     await loadProducts(true);
     await loadInventoryPanel();
   } catch (err) {
-    toast(err.message, "error");
+    if (err.networkFailure && !isEdit) {
+      // Keep the same client_request_id. If the request actually reached
+      // the server but the response was lost, retrying with this same id
+      // is safe and will not create a duplicate product.
+      toast("The product status is unknown. Click SAVE PRODUCT again; it will not be duplicated.", "warning");
+    } else {
+      if (!isEdit) pendingProductSubmission = null;
+      toast(err.message, "error");
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
   }
 }
 
@@ -2300,6 +2377,26 @@ function scheduleAppUpdateCheck() {
   }
 
   loadLoginBranding();
+
+  // Restore the existing local desktop session after a page refresh.
+  // The token is checked against the local Flask session only; this does
+  // not perform a central authentication request. If the local session no
+  // longer exists, the normal 401 handling returns the user to login.
+  if (authToken) {
+    try {
+      const session = await api("/auth/me");
+      currentStaff = session;
+      localStorage.setItem("glr_staff", JSON.stringify(currentStaff));
+      await enterApp();
+    } catch (_) {
+      // api() already handles an expired token by clearing the session and
+      // showing the login screen. Keep booting so the normal provisioning
+      // and update checks still initialize.
+      authToken = null;
+      currentStaff = null;
+    }
+  }
+
   loadProvisioningStatus();
   scheduleAppUpdateCheck();
   window.addEventListener("online", async () => {

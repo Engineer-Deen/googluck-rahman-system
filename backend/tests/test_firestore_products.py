@@ -27,6 +27,14 @@ class ProductService:
     def get_product(self, product_id):
         return self.products.get(int(product_id))
 
+    def get_product_by_client_request_id(self, client_request_id):
+        if not client_request_id:
+            return None
+        for product in self.products.values():
+            if product.get("client_request_id") == client_request_id:
+                return product
+        return None
+
     def _allocate_product_id(self):
         return max(self.products, default=0) + 1
 
@@ -68,6 +76,57 @@ class FirestoreProductTests(unittest.TestCase):
         self.assertEqual(updated.get_json()["name"], "Updated Phone")
         self.assertFalse(deleted.get_json()["is_active"])
         self.assertTrue(self.service.audit)
+
+
+class FirestoreProductIdempotencyTests(unittest.TestCase):
+    """Uses the real FirestoreSyncService (against a fake Firestore client)
+    rather than the hand-rolled mock above, so this exercises the actual
+    get_product_by_client_request_id query path, not a re-implementation of it.
+    """
+
+    def setUp(self):
+        from tests.test_firestore_provider import FakeFirestoreClient
+        from app.firestore.service import FirestoreSyncService
+
+        self.client = FakeFirestoreClient()
+        self.service = FirestoreSyncService(self.client)
+        self.staff = {"id": 1, "name": "Owner", "email": "owner@test", "role": "owner", "shop_id": 1, "is_active": True, "updated_at": datetime(2020, 1, 1, tzinfo=timezone.utc), "password_hash": generate_password_hash("secret")}
+        self.client.collections["staff"]["1"] = self.staff
+        self.app = Flask(__name__)
+        self.app.config.update(GLR_MODE="central", CENTRAL_DATA_PROVIDER="firestore", JWT_SECRET_KEY="test-secret")
+        self.app.register_blueprint(products_bp)
+        with self.app.app_context():
+            self.token = issue_token(self.staff)
+
+    def test_repeated_create_with_same_client_request_id_does_not_duplicate(self):
+        """Simulates a double-click or a retry after a dropped connection:
+        the exact same create-product request arrives twice with the same
+        client_request_id. Only one product should ever be created."""
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {"name": "Bluetooth Speaker", "category": "Speakers & Audio", "cost_price": 40, "client_request_id": "req-abc-123"}
+        with patch("app.firestore.get_firestore_sync_service", return_value=self.service), patch("app.auth._central_staff", side_effect=self.service.get_staff):
+            client = self.app.test_client()
+            first = client.post("/api/products", headers=headers, json=payload)
+            second = client.post("/api/products", headers=headers, json=payload)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.get_json()["id"], second.get_json()["id"])
+        products = [v for v in self.client.collections["products"].values()]
+        self.assertEqual(len(products), 1)
+
+    def test_create_without_client_request_id_is_unaffected(self):
+        """A client too old to send client_request_id (or a direct API call
+        without one) keeps working exactly as before -- no idempotency check
+        is attempted when there's nothing to key it on."""
+        headers = {"Authorization": f"Bearer {self.token}"}
+        payload = {"name": "USB Cable", "category": "Cables & Chargers", "cost_price": 5}
+        with patch("app.firestore.get_firestore_sync_service", return_value=self.service), patch("app.auth._central_staff", side_effect=self.service.get_staff):
+            client = self.app.test_client()
+            first = client.post("/api/products", headers=headers, json=payload)
+            second = client.post("/api/products", headers=headers, json=payload)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertNotEqual(first.get_json()["id"], second.get_json()["id"])
 
 
 if __name__ == "__main__":

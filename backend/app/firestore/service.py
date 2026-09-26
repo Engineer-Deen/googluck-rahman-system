@@ -310,6 +310,25 @@ class FirestoreSyncService:
         snapshot = self._collection("products").document(str(product_id)).get()
         return snapshot.to_dict() if snapshot.exists else None
 
+    def get_product_by_client_request_id(self, client_request_id: str) -> dict | None:
+        """Look up a product by the client-generated id of the request that created it.
+
+        This is what makes POST /api/products idempotent: the frontend sends
+        the same client_request_id if a "create product" submission is
+        retried (double-click, or a retry after the response was lost), and
+        this lets the route return the product already created instead of
+        allocating a brand-new one.
+        """
+        if not client_request_id:
+            return None
+        snapshots = self._collection("products").where(
+            "client_request_id", "==", client_request_id
+        ).limit(1).stream()
+        snapshot = next(iter(snapshots), None)
+        if snapshot is None or not getattr(snapshot, "exists", True):
+            return None
+        return snapshot.to_dict() or {}
+
     def _allocate_product_id(self) -> int:
         sequence_ref = self._collection("sync_metadata").document("product_sequence")
         transaction = self.client.transaction()
@@ -331,17 +350,39 @@ class FirestoreSyncService:
         return self.get_product(product_id) or data
 
     def stock_map(self, product_ids=None, shop_id=None) -> dict[int, int]:
-        wanted = {int(product_id) for product_id in product_ids} if product_ids else None
+        """Sum stock movements for the given products.
+
+        Every caller in this codebase already passes explicit product_ids, so
+        this queries Firestore filtered to just those products (chunked into
+        groups of 30, Firestore's limit for an `in` filter) instead of
+        streaming the entire stock_movements collection on every call -- the
+        collection only ever grows, so an unfiltered scan gets slower with
+        every sale and stock adjustment the shop ever records. shop_id is
+        still applied client-side to avoid requiring a composite index.
+        """
         totals: dict[int, int] = {}
-        for snapshot in self._collection("stock_movements").stream():
-            movement = snapshot.to_dict() or {}
-            product_id = movement.get("product_id")
-            if product_id is None or (wanted is not None and int(product_id) not in wanted):
-                continue
-            if shop_id is not None and movement.get("shop_id") != shop_id:
-                continue
-            product_id = int(product_id)
-            totals[product_id] = totals.get(product_id, 0) + int(movement.get("quantity_delta", 0) or 0)
+
+        def accumulate(snapshots):
+            for snapshot in snapshots:
+                movement = snapshot.to_dict() or {}
+                product_id = movement.get("product_id")
+                if product_id is None:
+                    continue
+                if shop_id is not None and movement.get("shop_id") != shop_id:
+                    continue
+                product_id = int(product_id)
+                totals[product_id] = totals.get(product_id, 0) + int(movement.get("quantity_delta", 0) or 0)
+
+        if product_ids is not None:
+            wanted = sorted({int(product_id) for product_id in product_ids})
+            for start in range(0, len(wanted), 30):  # Firestore `in` allows 30 values
+                chunk = wanted[start:start + 30]
+                accumulate(self._collection("stock_movements").where("product_id", "in", chunk).stream())
+            return totals
+
+        # No specific products requested -- rare/admin-only path, kept as a
+        # full scan since there is nothing narrower to filter by.
+        accumulate(self._collection("stock_movements").stream())
         return totals
 
     def get_stock_movement(self, movement_id: str) -> dict | None:
@@ -379,11 +420,11 @@ class FirestoreSyncService:
         return result, created
 
     def list_stock_movements(self, product_id: int, shop_id=None, limit=100) -> list[dict]:
+        # Filtered by product_id in the query itself instead of streaming
+        # every stock movement ever recorded and discarding most of them.
         movements = []
-        for snapshot in self._collection("stock_movements").stream():
+        for snapshot in self._collection("stock_movements").where("product_id", "==", int(product_id)).stream():
             movement = snapshot.to_dict() or {}
-            if int(movement.get("product_id", -1)) != int(product_id):
-                continue
             if shop_id is not None and movement.get("shop_id") != shop_id:
                 continue
             movements.append(movement)
@@ -395,16 +436,18 @@ class FirestoreSyncService:
         if not sale_snapshot.exists:
             return None
         sale = sale_snapshot.to_dict() or {}
-        items = []
-        for snapshot in self._collection("sale_items").stream():
-            item = snapshot.to_dict() or {}
-            if str(item.get("sale_id")) == str(sale_id):
-                items.append(item)
-        payments = []
-        for snapshot in self._collection("sale_payments").stream():
-            payment = snapshot.to_dict() or {}
-            if str(payment.get("sale_id")) == str(sale_id):
-                payments.append(payment)
+        # Filtered by sale_id in the query itself -- this used to stream the
+        # entire sale_items and sale_payments collections on every call, and
+        # this method runs after every sale creation, payment, void, and
+        # correction, plus once per row of every sales listing.
+        items = [
+            snapshot.to_dict() or {}
+            for snapshot in self._collection("sale_items").where("sale_id", "==", str(sale_id)).stream()
+        ]
+        payments = [
+            snapshot.to_dict() or {}
+            for snapshot in self._collection("sale_payments").where("sale_id", "==", str(sale_id)).stream()
+        ]
         return {"sale": sale, "items": items, "payments": payments}
 
     def list_sale_graphs(self, shop_id=None, limit=100, period="all", search="", status=None) -> list[dict]:
@@ -457,12 +500,21 @@ class FirestoreSyncService:
 
         sales = [sale for sale in (snapshot.to_dict() or {} for snapshot in self._collection("sales").stream()) if matches(sale)]
 
+        def _in_chunks(sale_ids):
+            """Yield 30-id groups -- Firestore's limit for an `in` filter."""
+            for start in range(0, len(sale_ids), 30):
+                yield sale_ids[start:start + 30]
+
         if status == "incomplete":
+            # Only the payments for the sales already selected above are
+            # needed, not every payment ever recorded.
+            candidate_ids = [str(sale.get("id")) for sale in sales if sale.get("id") is not None]
             paid_by_sale = {}
-            for snapshot in self._collection("sale_payments").stream():
-                payment = snapshot.to_dict() or {}
-                sale_id = str(payment.get("sale_id"))
-                paid_by_sale[sale_id] = paid_by_sale.get(sale_id, Decimal("0")) + Decimal(str(payment.get("amount") or "0"))
+            for chunk in _in_chunks(candidate_ids):
+                for snapshot in self._collection("sale_payments").where("sale_id", "in", chunk).stream():
+                    payment = snapshot.to_dict() or {}
+                    sale_id = str(payment.get("sale_id"))
+                    paid_by_sale[sale_id] = paid_by_sale.get(sale_id, Decimal("0")) + Decimal(str(payment.get("amount") or "0"))
 
             def is_incomplete(sale):
                 if sale.get("voided_at"):
@@ -474,12 +526,32 @@ class FirestoreSyncService:
             sales = [sale for sale in sales if is_incomplete(sale)]
 
         sales.sort(key=lambda sale: _iso(sale.get("created_at")) or "", reverse=True)
-        result = []
-        for sale in sales[:limit]:
-            graph = self.get_sale_graph(sale.get("id"))
-            if graph:
-                result.append(graph)
-        return result
+        selected = sales[:limit]
+
+        # Fetch every selected sale's items and payments in a couple of
+        # batched queries instead of calling get_sale_graph() once per sale
+        # (each of which used to stream the whole sale_items/sale_payments
+        # collections) -- that was an O(sales shown x total historical rows)
+        # scan on every dashboard/sales-list load.
+        selected_ids = [str(sale.get("id")) for sale in selected if sale.get("id") is not None]
+        items_by_sale: dict[str, list] = {}
+        payments_by_sale: dict[str, list] = {}
+        for chunk in _in_chunks(selected_ids):
+            for snapshot in self._collection("sale_items").where("sale_id", "in", chunk).stream():
+                item = snapshot.to_dict() or {}
+                items_by_sale.setdefault(str(item.get("sale_id")), []).append(item)
+            for snapshot in self._collection("sale_payments").where("sale_id", "in", chunk).stream():
+                payment = snapshot.to_dict() or {}
+                payments_by_sale.setdefault(str(payment.get("sale_id")), []).append(payment)
+
+        return [
+            {
+                "sale": sale,
+                "items": items_by_sale.get(str(sale.get("id")), []),
+                "payments": payments_by_sale.get(str(sale.get("id")), []),
+            }
+            for sale in selected
+        ]
 
     def create_sale(self, payload: dict, device=None) -> tuple[dict, bool]:
         sale_id = payload.get("id")
@@ -562,7 +634,10 @@ class FirestoreSyncService:
         sale_id = payload.get("sale_id")
         sale_ref = self._collection("sales").document(str(sale_id))
         payment_ref = self._collection("sale_payments").document(str(payment_id))
-        payment_snapshots = list(self._collection("sale_payments").stream())
+        # Only this sale's existing payments are needed to compute the
+        # outstanding balance -- filtering here avoids streaming every
+        # payment ever recorded, for every shop, on every payment attempt.
+        payment_snapshots = list(self._collection("sale_payments").where("sale_id", "==", str(sale_id)).stream())
         transaction = self.client.transaction()
 
         @transactional

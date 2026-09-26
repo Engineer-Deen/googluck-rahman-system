@@ -132,6 +132,35 @@ class SyncCursorTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in payload["products"]}, {7})
         self.assertEqual(len(payload["stock_movements"]), 1)
 
+    def test_pull_creates_local_shadow_row_for_staff_unknown_to_this_device(self):
+        """A staff account created on another PC (or the central dashboard)
+        must show up here too, without that staff member first logging in
+        on this specific device. See app/sync/worker.py's staff loop."""
+        response = _Response({
+            "next_cursor": "2026-01-02T03:04:05",
+            "shops": [], "settings": [],
+            "staff": [{
+                "id": 2, "shop_id": 1, "name": "New Cashier",
+                "email": "new.cashier@cursor.test", "role": "cashier", "is_active": True,
+            }],
+            "products": [], "sales": [], "sale_items": [], "payments": [], "stock_movements": [],
+        })
+        with patch("app.sync.worker.requests.get", return_value=response):
+            result = pull_reference_data_once(self.app)
+
+        self.assertEqual(result["staff_needing_provisioning"], 0)
+        with self.app.app_context():
+            staff = db.session.get(Staff, 2)
+            self.assertIsNotNone(staff)
+            self.assertEqual(staff.name, "New Cashier")
+            self.assertEqual(staff.email, "new.cashier@cursor.test")
+            self.assertEqual(staff.role, "cashier")
+            self.assertTrue(staff.is_active)
+            # No credentials travel in the sync payload -- login on this
+            # device still always re-verifies against central.
+            self.assertEqual(staff.password_hash, "")
+            self.assertIsNone(staff.quick_pin_hash)
+
     def test_worker_prefers_next_cursor_over_legacy_server_time(self):
         response = _Response({
             "next_cursor": "2026-01-02T03:04:05",

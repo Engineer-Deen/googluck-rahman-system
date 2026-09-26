@@ -73,7 +73,12 @@ class FirestoreSalesTests(unittest.TestCase):
     def test_central_sales_listing_applies_period_search_and_incomplete_filters(self):
         from datetime import timedelta
 
-        now = datetime.now(timezone.utc)
+        # Anchored to noon UTC (not datetime.now()) so this test can't flake
+        # depending on what hour of the day it happens to run: with a plain
+        # datetime.now(), "now - 1 hour" rolls back into the previous
+        # calendar day whenever the suite runs between 00:00 and 01:00 UTC,
+        # which made sale-today wrongly fall outside the "today" window.
+        now = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
         self.client.collections["sales"].update({
             "sale-today": {
                 "id": "sale-today", "shop_id": 1, "customer_name": "Alice",
