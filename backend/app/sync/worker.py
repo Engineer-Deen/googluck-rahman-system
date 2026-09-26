@@ -336,6 +336,15 @@ def pull_reference_data_once(app) -> dict:
                     "email": raw["email"],
                     "role": raw["role"],
                     "is_active": raw["is_active"],
+                    # The quick-unlock PIN IS synchronized (unlike password_hash
+                    # below): verify_pin in local mode checks this local row
+                    # directly rather than calling central, so without this, a
+                    # PIN set on one PC would never work as that same PIN on
+                    # any other PC logged into the same account, even though
+                    # it's already sitting in Firestore the whole time.
+                    "quick_pin_hash": raw.get("quick_pin_hash"),
+                    "quick_pin_failed_attempts": raw.get("quick_pin_failed_attempts") or 0,
+                    "quick_pin_locked_until": _parse_datetime(raw.get("quick_pin_locked_until")),
                 }
                 if (
                     not is_new and
@@ -343,18 +352,26 @@ def pull_reference_data_once(app) -> dict:
                     staff.name == desired["name"] and
                     staff.email == desired["email"] and
                     staff.role == desired["role"] and
-                    staff.is_active == desired["is_active"]
+                    staff.is_active == desired["is_active"] and
+                    staff.quick_pin_hash == desired["quick_pin_hash"] and
+                    staff.quick_pin_failed_attempts == desired["quick_pin_failed_attempts"] and
+                    staff.quick_pin_locked_until == desired["quick_pin_locked_until"]
                 ):
                     continue
 
                 staff.shop_id = desired["shop_id"]
                 staff.name = desired["name"]
                 staff.email = desired["email"]
-                # Authentication secrets are never synchronized. Existing local
-                # credentials remain intact; central account changes require the
-                # normal authenticated login/update flow.
+                # password_hash is the one auth secret that genuinely never needs
+                # to travel: local-mode login always re-verifies against central
+                # (see _authenticate_against_central in routes/auth.py) and never
+                # reads this local column at all, so there's nothing for syncing
+                # it to fix, and every reason to keep it out of local storage.
                 staff.role = desired["role"]
                 staff.is_active = desired["is_active"]
+                staff.quick_pin_hash = desired["quick_pin_hash"]
+                staff.quick_pin_failed_attempts = desired["quick_pin_failed_attempts"]
+                staff.quick_pin_locked_until = desired["quick_pin_locked_until"]
 
             for raw in data.get("settings", []):
                 setting = SystemSetting.query.filter_by(key=raw["key"]).first()

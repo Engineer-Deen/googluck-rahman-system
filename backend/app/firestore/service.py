@@ -20,14 +20,18 @@ from flask import current_app
 from google.cloud.firestore_v1.transaction import transactional
 _SENSITIVE_STAFF_FIELDS = {
     "password_hash",
-    "quick_pin_hash",
-    "quick_pin_failed_attempts",
-    "quick_pin_locked_until",
     "password",
     "token",
     "secret",
     "api_key",
 }
+# quick_pin_hash/quick_pin_failed_attempts/quick_pin_locked_until are
+# intentionally NOT in the set above (unlike password_hash): the quick-unlock
+# PIN is verified locally on each shop PC (see verify_pin in routes/auth.py),
+# so it must sync down for the same PIN to work on every device logged into
+# an account, not just the one it was set on. password_hash never needs to
+# travel because local-mode login always re-verifies against central instead
+# of reading this column.
 _service_lock = threading.Lock()
 _service_cache: dict[tuple[str, str], "FirestoreSyncService"] = {}
 
@@ -1019,10 +1023,27 @@ class FirestoreSyncService:
             for doc in self._collection("sale_items").where("sale_id", "in", chunk).stream():
                 sale_items.append(doc.to_dict() or {})
 
-        # Product catalog rows are synchronized independently. Sale/stock child
-        # rows do not require an extra product document read here because the
-        # local device already has the product catalog needed to render them.
-        # A genuinely new/changed product is included by the products query above.
+        # A stock movement or sale item can reference a product this device
+        # doesn't have locally yet (created in a sync window this device
+        # missed, or its local copy is otherwise gone) even when the product
+        # itself hasn't changed recently. Without this, that product is
+        # silently left out of the payload, so the movement lands with
+        # nothing to attach to and the stock change never appears locally --
+        # this is exactly what the full/first-sync pull already guards
+        # against below; incremental pulls need the same safety net.
+        known_product_ids = {product.get("id") for product in rows["products"]}
+        needed_product_ids = {
+            value.get("product_id")
+            for value in (*rows["stock_movements"], *sale_items)
+            if value.get("product_id") is not None
+        }
+        for product_id in needed_product_ids - known_product_ids:
+            snapshot = self._collection("products").document(str(product_id)).get()
+            if not snapshot.exists:
+                continue
+            product = snapshot.to_dict() or {}
+            if shop_id in (product.get("shop_ids") or []):
+                rows["products"].append(product)
 
         rows["staff"] = [_clean_staff({**staff, "shop_id": shop_id}) for staff in rows["staff"]]
 

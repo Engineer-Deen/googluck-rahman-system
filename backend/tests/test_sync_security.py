@@ -146,9 +146,15 @@ class SyncSecurityTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in payload["sales"]}, {"sale-a"})
         self.assertEqual({row["id"] for row in payload["stock_movements"]}, {"move-a"})
         self.assertNotIn("password_hash", payload["staff"][0])
-        self.assertNotIn("quick_pin_hash", payload["staff"][0])
+        # The quick-unlock PIN DOES travel now (unlike password_hash): it's
+        # verified locally on each shop PC, so a PIN set on one device has to
+        # sync down to work as the same PIN on any other device logged into
+        # that same account. Cross-shop isolation must still hold though --
+        # device A must only ever receive its OWN shop's staff pin, never
+        # shop B's, which the shop_id-scoped query above already enforces.
+        self.assertEqual(payload["staff"][0]["quick_pin_hash"], "a-pin-hash")
         serialized = str(payload)
-        for secret in ("a-password-hash", "b-password-hash", "a-pin-hash", "b-pin-hash", "sync-secret"):
+        for secret in ("a-password-hash", "b-password-hash", "b-pin-hash", "sync-secret"):
             self.assertNotIn(secret, serialized)
 
     def test_cursor_boundary_still_replays_authorized_shop_rows(self):

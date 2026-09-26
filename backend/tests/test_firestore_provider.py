@@ -502,8 +502,11 @@ class FirestoreAdapterTests(unittest.TestCase):
 
         self.assertEqual(payload["next_cursor"], "2026-01-02T07:00:00+00:00")
         self.assertNotIn("password_hash", payload["staff"][0])
-        self.assertNotIn("quick_pin_hash", payload["staff"][0])
         self.assertNotIn("token", payload["staff"][0])
+        # The quick-unlock PIN travels now -- it's verified locally on each
+        # shop PC, so it has to sync down to work as the same PIN on every
+        # device logged into an account.
+        self.assertEqual(payload["staff"][0]["quick_pin_hash"], "secret-pin")
         self.assertEqual(payload["sales"][0]["invoice_number"], "INV-2026-1001")
         self.assertEqual(payload["sale_items"][0]["sale_id"], "sale-1")
         self.assertEqual(payload["payments"][0]["amount"], "25.00")
@@ -542,7 +545,6 @@ class FirestoreProviderTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["shops"][0]["id"], 1)
         self.assertNotIn("password_hash", payload["staff"][0])
-        self.assertNotIn("quick_pin_hash", payload["staff"][0])
         self.assertEqual(self.app.config["FIRESTORE_SYNC_SERVICE"].shop_ids[0][0], 1)
 
     def test_firestore_push_preserves_device_shop_and_acknowledges(self):
@@ -592,6 +594,12 @@ class FirestoreProviderTests(unittest.TestCase):
         self.assertEqual(response.get_json()["results"][0]["status"], "error")
 
     def test_staff_cleaner_removes_sensitive_fields(self):
+        # password_hash/api_key are stripped (never needed locally: local-mode
+        # login always re-verifies against central instead of reading a local
+        # password). quick_pin_hash and its lockout fields are NOT stripped:
+        # the quick-unlock PIN is checked locally on each shop PC, so it has
+        # to travel for the same PIN to work on every device an account logs
+        # into, not just the one it was set on.
         clean = _clean_staff({
             "id": 1,
             "name": "Cashier",
@@ -602,7 +610,14 @@ class FirestoreProviderTests(unittest.TestCase):
             "api_key": "secret",
             "role": "cashier",
         })
-        self.assertEqual(clean, {"id": 1, "name": "Cashier", "role": "cashier"})
+        self.assertEqual(clean, {
+            "id": 1,
+            "name": "Cashier",
+            "role": "cashier",
+            "quick_pin_hash": "pin",
+            "quick_pin_failed_attempts": 2,
+            "quick_pin_locked_until": "2026-01-01T00:00:00+00:00",
+        })
 
     def test_central_config_accepts_service_account_file_and_local_stays_sqlite(self):
         names = (

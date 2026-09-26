@@ -161,6 +161,31 @@ class SyncCursorTests(unittest.TestCase):
             self.assertEqual(staff.password_hash, "")
             self.assertIsNone(staff.quick_pin_hash)
 
+    def test_pull_syncs_quick_pin_so_it_works_on_a_new_device(self):
+        """A PIN set on one PC must work as the same PIN on any other device
+        logged into that account -- it's checked locally on each shop PC, so
+        it has to travel here, unlike password_hash which never does."""
+        response = _Response({
+            "next_cursor": "2026-01-02T03:04:05",
+            "shops": [], "settings": [],
+            "staff": [{
+                "id": 2, "shop_id": 1, "name": "Owner",
+                "email": "owner@cursor.test", "role": "owner", "is_active": True,
+                "quick_pin_hash": "scrypt:32768:8:1$fakehash",
+                "quick_pin_failed_attempts": 1,
+                "quick_pin_locked_until": "2026-01-02T03:04:05+00:00",
+            }],
+            "products": [], "sales": [], "sale_items": [], "payments": [], "stock_movements": [],
+        })
+        with patch("app.sync.worker.requests.get", return_value=response):
+            pull_reference_data_once(self.app)
+
+        with self.app.app_context():
+            staff = db.session.get(Staff, 2)
+            self.assertEqual(staff.quick_pin_hash, "scrypt:32768:8:1$fakehash")
+            self.assertEqual(staff.quick_pin_failed_attempts, 1)
+            self.assertIsNotNone(staff.quick_pin_locked_until)
+
     def test_worker_prefers_next_cursor_over_legacy_server_time(self):
         response = _Response({
             "next_cursor": "2026-01-02T03:04:05",
