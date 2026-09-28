@@ -745,10 +745,12 @@ def provisioning_retry():
 @sync_bp.post("/trigger")
 @local_session_required
 def trigger():
-    from app.sync.worker import trigger_sync_soon
+    from app.sync.worker import trigger_full_sync_now
     if current_app.config["GLR_MODE"] != "local":
         return jsonify(error="Manual sync is only needed on local devices"), 400
-    trigger_sync_soon(current_app._get_current_object())
+    # Manual SYNC NOW means both directions: send this PC's waiting changes
+    # and fetch what the owner/other PCs changed.
+    trigger_full_sync_now(current_app._get_current_object())
     return jsonify(message="Synchronization started")
 
 

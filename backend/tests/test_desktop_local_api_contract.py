@@ -138,6 +138,24 @@ class DesktopLocalApiContractTests(unittest.TestCase):
             self.assertIn("window.event", body, f"{fn_name} should grab the clicked button via window.event")
             self.assertIn(".disabled = true", body, f"{fn_name} should disable its button while running")
 
+    def test_auto_refresh_baseline_does_not_swallow_the_first_real_change(self):
+        """A PC that has never had a change-bringing pull has no
+        last_pull_changed_at on its first status poll. "Has a baseline yet"
+        must be tracked separately from "has a value", or the first real
+        change after an upgrade gets swallowed as if it were the baseline and
+        the screen never refreshes for it."""
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        self.assertIn("syncBaselineReady", script)
+        self.assertNotIn("lastPullChangedAt === null", script)
+
+    def test_sync_timestamps_say_which_day_when_not_today(self):
+        """A bare "Refresh 1:28 pm" hides a PC that hasn't synced since
+        yesterday. Anything not from today must say so."""
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        body = script[script.index("function formatSyncTime"):script.index("function pluralize")]
+        self.assertIn("yesterday", body)
+        self.assertIn("daysAgo", body)
+
     def test_tauri_surfaces_sidecar_spawn_errors(self):
         text = TAURI_LIB.read_text(encoding="utf-8")
         self.assertIn("fn glr_local_backend_status", text)

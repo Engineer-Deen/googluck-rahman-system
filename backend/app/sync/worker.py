@@ -558,9 +558,10 @@ def start_background_sync(app):
 def trigger_sync_soon(app):
     """Push queued local changes without forcing a central pull.
 
-    Pulls are performed explicitly after successful login (and retried only
-    after an actual pull failure). This keeps the status/pending-change path
-    from turning into repeated Firestore reads while the POS is otherwise idle.
+    Called automatically after mutating actions. It deliberately doesn't
+    pull: the routine background loop (start_background_sync) already pulls
+    on its own cadence, and pulling after every single sale/edit would only
+    add reads without showing anything the loop wouldn't pick up anyway.
     """
     from app.auth import has_local_session
     if not has_local_session():
@@ -570,5 +571,29 @@ def trigger_sync_soon(app):
         daemon=True,
         name="glr-push-trigger",
     )
+    thread.start()
+    return thread
+
+
+def trigger_full_sync_now(app):
+    """Push AND pull, for the manual SYNC NOW button.
+
+    A person pressing SYNC NOW expects both directions: send what's waiting
+    on this PC and fetch what other PCs (or the owner) changed. Previously
+    the button only pushed, so it could report "Synced" while this PC was
+    still missing the owner's latest products and stock. Runs on one
+    background thread (push, then pull); the module locks make it safe if
+    the routine loop happens to be mid-cycle, and the pull's marker check
+    keeps it to a single cheap read when nothing has changed.
+    """
+    from app.auth import has_local_session
+    if not has_local_session():
+        return None
+
+    def run():
+        push_pending_once(app)
+        pull_reference_data_once(app)
+
+    thread = threading.Thread(target=run, daemon=True, name="glr-full-sync")
     thread.start()
     return thread

@@ -465,7 +465,8 @@ async function doLogout() {
   lastSyncSnapshot = { key: null, pending: 0 };
   lastSyncToastMsg = "";
   lastSyncToastAt = 0;
-  lastPullChangedAt = null;
+  lastPullChangedAt = "";
+  syncBaselineReady = false;
   authToken = null;
   currentStaff = null;
   localStorage.removeItem("glr_token");
@@ -2027,7 +2028,8 @@ async function loadShopBranding(){
 
 let syncPollTimer = null;
 let syncRequestInFlight = false;
-let lastPullChangedAt = null;
+let lastPullChangedAt = "";
+let syncBaselineReady = false;
 
 function getDesktopPlatformLabel() {
   const ua = navigator.userAgent || "";
@@ -2060,7 +2062,17 @@ function formatSyncTime(value) {
   if (!value) return "never";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "unknown";
-  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  // A bare "1:28 pm" reads as "recent" even when it's from yesterday, which
+  // hides exactly the situation someone most needs to notice: a PC that
+  // hasn't synced in a long time. Say which day whenever it isn't today.
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfThatDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const daysAgo = Math.round((startOfToday - startOfThatDay) / 86400000);
+  if (daysAgo <= 0) return time;
+  if (daysAgo === 1) return `yesterday ${time}`;
+  return `${date.toLocaleDateString([], { day: "numeric", month: "short" })} ${time}`;
 }
 
 function pluralize(count, singular, plural = `${singular}s`) {
@@ -2157,13 +2169,18 @@ async function pollSyncStatus() {
     // Firestore, whether it came from another PC or from this same one.
     // Silently re-fetch whatever's currently on screen so it shows up
     // without the person needing to log out and back in or hit refresh.
-    // Only fires once the very first status poll has established a
-    // baseline, so loading the app doesn't immediately re-fetch a panel
-    // it just fetched a moment ago.
-    if (data.mode === "local" && data.last_pull_changed_at) {
-      const isFirstCheck = lastPullChangedAt === null;
-      if (!isFirstCheck && data.last_pull_changed_at !== lastPullChangedAt) silentlyRefreshActivePanel();
-      lastPullChangedAt = data.last_pull_changed_at;
+    // The first status poll only establishes a baseline (so loading the app
+    // doesn't immediately re-fetch a panel it just fetched) -- but "first
+    // poll" is tracked separately from "has a value", because a PC that has
+    // never had a change-bringing pull has NO value yet on that first poll.
+    // Treating "no value yet" as "still waiting for a baseline" made the very
+    // first real change after an upgrade get swallowed as if it were the
+    // baseline, so that first update never refreshed the screen.
+    if (data.mode === "local") {
+      const changedAt = data.last_pull_changed_at || "";
+      if (syncBaselineReady && changedAt && changedAt !== lastPullChangedAt) silentlyRefreshActivePanel();
+      lastPullChangedAt = changedAt;
+      syncBaselineReady = true;
     }
 
     const pending = Number(data.pending_count || 0);

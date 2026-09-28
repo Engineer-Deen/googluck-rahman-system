@@ -268,6 +268,50 @@ class SyncCursorTests(unittest.TestCase):
         with self.app.app_context():
             self.assertIsNotNone(db.session.get(SyncState, "last_pull_changed_at"))
 
+    def test_manual_sync_now_pushes_and_pulls(self):
+        """The SYNC NOW button used to only push, so a PC could show
+        "Synced" while still missing what the owner had just added. It has
+        to do both directions."""
+        from app.auth import register_local_session
+        from app.sync import worker
+
+        calls = []
+        with patch.object(worker, "push_pending_once", side_effect=lambda app: calls.append("push") or {}), \
+             patch.object(worker, "pull_reference_data_once", side_effect=lambda app: calls.append("pull") or {}):
+            with self.app.app_context():
+                register_local_session("tok", {"id": 1, "role": "admin", "shop_id": 1, "is_active": True})
+                thread = worker.trigger_full_sync_now(self.app)
+            self.assertIsNotNone(thread)
+            thread.join(timeout=3)
+        self.assertEqual(calls, ["push", "pull"])
+
+    def test_manual_sync_now_does_nothing_without_a_session(self):
+        from app.sync import worker
+
+        with patch.object(worker, "push_pending_once") as push, \
+             patch.object(worker, "pull_reference_data_once") as pull:
+            with self.app.app_context():
+                self.assertIsNone(worker.trigger_full_sync_now(self.app))
+        push.assert_not_called()
+        pull.assert_not_called()
+
+    def test_sync_trigger_route_starts_a_full_sync(self):
+        from app.auth import register_local_session
+        from app.sync import worker
+
+        with patch.object(worker, "push_pending_once", return_value={}), \
+             patch.object(worker, "pull_reference_data_once", return_value={}) as pull:
+            with self.app.app_context():
+                register_local_session("route-token", {"id": 1, "role": "admin", "shop_id": 1, "is_active": True})
+            response = self.app.test_client().post(
+                "/api/sync/trigger", headers={"Authorization": "Bearer route-token"},
+            )
+            self.assertEqual(response.status_code, 200)
+            for t in __import__("threading").enumerate():
+                if t.name == "glr-full-sync":
+                    t.join(timeout=3)
+        pull.assert_called()
+
     def test_worker_prefers_next_cursor_over_legacy_server_time(self):
         response = _Response({
             "next_cursor": "2026-01-02T03:04:05",
