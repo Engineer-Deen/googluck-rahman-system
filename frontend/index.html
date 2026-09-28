@@ -8,6 +8,10 @@
 </head>
 <body>
 
+<div id="offline-banner" role="status" hidden>
+  <span id="offline-banner-text">⚠ No internet connection — some actions may not work until you're back online.</span>
+</div>
+
 <div class="theme-toggle" id="theme-toggle">
   <button id="theme-btn-dark" class="active" onclick="setTheme('dark')">DARK</button>
   <button id="theme-btn-light" onclick="setTheme('light')">LIGHT</button>
@@ -78,7 +82,7 @@
         <button class="btn btn-secondary sync-btn" id="sync-btn" type="button" onclick="triggerSync()">SYNC NOW</button>
       </div>
       <span id="header-staff-name" style="font-size:0.85rem;color:var(--text-secondary);"></span>
-      <button class="btn-logout" onclick="doLogout()">LOGOUT</button>
+      <button class="btn-logout" id="logout-btn" onclick="doLogout()">LOGOUT</button>
     </div>
   </header>
 
@@ -327,7 +331,7 @@
             <input type="number" id="r-qty" placeholder="e.g. 50 or -3">
           </div>
         </div>
-        <button class="btn btn-primary" onclick="submitRestock()">APPLY</button>
+        <button class="btn btn-primary" id="restock-apply-btn" onclick="submitRestock()">APPLY</button>
       </div>
       <div class="card">
         <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
@@ -383,7 +387,7 @@
             </select>
           </div>
         </div>
-        <button class="btn btn-primary" onclick="createStaff()">CREATE ACCOUNT</button>
+        <button class="btn btn-primary" id="st-create-btn" onclick="createStaff()">CREATE ACCOUNT</button>
       </div>
       <div class="card" id="staff-edit-card" style="display:none;">
         <div class="card-title">Edit Staff Account</div>
@@ -412,7 +416,7 @@
           </div>
         </div>
         <div style="display:flex;gap:1rem;">
-          <button class="btn btn-primary" onclick="saveStaffEdit()">SAVE CHANGES</button>
+          <button class="btn btn-primary" id="st-save-edit-btn" onclick="saveStaffEdit()">SAVE CHANGES</button>
           <button class="btn btn-secondary" onclick="cancelStaffEdit()">CANCEL</button>
         </div>
       </div>
@@ -423,7 +427,7 @@
           <div class="form-group"><label>Email</label><input id="ad-email" type="email" placeholder="Administrator email"></div>
           <div class="form-group"><label>Password</label><input id="ad-password" type="password" placeholder="At least 6 characters"></div>
         </div>
-        <button class="btn btn-primary" onclick="createAdminAccount()">REGISTER ADMIN</button>
+        <button class="btn btn-primary" id="ad-register-btn" onclick="createAdminAccount()">REGISTER ADMIN</button>
       </div>
       <div class="card">
         <div class="card-title">Staff Accounts</div>
@@ -443,7 +447,7 @@
           </div>
         </div>
         <div style="display:flex;gap:1rem;">
-          <button class="btn btn-primary" onclick="submitPasswordReset()">SET NEW PASSWORD</button>
+          <button class="btn btn-primary" id="st-reset-submit-btn" onclick="submitPasswordReset()">SET NEW PASSWORD</button>
           <button class="btn btn-secondary" onclick="cancelPasswordReset()">CANCEL</button>
         </div>
       </div>
@@ -513,7 +517,7 @@
     <p id="admin-lock-message">Enter your 4-digit PIN to continue.</p>
     <input id="admin-lock-pin" class="pin-input" type="password" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••">
     <div id="admin-lock-error" class="login-error"></div>
-    <div class="modal-actions"><button class="btn btn-danger" onclick="forceAdminLogin()">FULL LOGIN</button><button class="btn btn-primary" onclick="unlockAdminSession()">UNLOCK</button></div>
+    <div class="modal-actions"><button class="btn btn-danger" onclick="forceAdminLogin()">FULL LOGIN</button><button class="btn btn-primary" id="admin-unlock-btn" onclick="unlockAdminSession()">UNLOCK</button></div>
   </div>
 </div>
 

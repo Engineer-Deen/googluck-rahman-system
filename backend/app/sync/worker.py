@@ -16,11 +16,14 @@ from app.models import (
 from app.sync.device import get_current_device_id
 
 SYNC_INTERVAL_SECONDS = 5      # push cadence -- costs nothing while the outbox is empty
-PULL_INTERVAL_SECONDS = 60     # every pull costs central database reads, so keep it slow
+IDLE_PULL_INTERVAL_SECONDS = 15  # routine pull cadence -- see start_background_sync
 MAX_BACKOFF_SECONDS = 15 * 60  # ceiling when the central server keeps failing
 BATCH_SIZE = 50
 REQUEST_TIMEOUT_SECONDS = 30
 LAST_PULL_KEY = "last_pull_at"
+
+_push_lock = threading.Lock()
+_pull_lock = threading.Lock()
 
 
 def _parse_datetime(value):
@@ -74,122 +77,132 @@ def _last_pull_failed(app) -> bool:
 
 
 def push_pending_once(app) -> dict:
-    with app.app_context():
-        items = (SyncOutboxItem.query.filter_by(status="pending")
-                 .order_by(SyncOutboxItem.created_at.asc()).limit(BATCH_SIZE).all())
-        if not current_app.config.get("SYNC_API_KEY"):
-            _set_state("last_sync_error", "Cloud synchronization is not configured on this device.")
-            db.session.commit()
-            return {"pushed": 0, "confirmed": 0, "failed": len(items)}
-        if not items:
-            return {"pushed": 0, "confirmed": 0, "failed": 0}
+    # trigger_sync_soon() spawns its own one-off push thread *in addition
+    # to* this module's routine background-loop pushes -- without mutual
+    # exclusion those two can run concurrently against the same SQLite
+    # session and corrupt state. A second caller arriving mid-push just
+    # skips this cycle: the in-progress push covers the same outbox rows.
+    if not _push_lock.acquire(blocking=False):
+        return {"pushed": 0, "confirmed": 0, "failed": 0}
+    try:
+        with app.app_context():
+            items = (SyncOutboxItem.query.filter_by(status="pending")
+                     .order_by(SyncOutboxItem.created_at.asc()).limit(BATCH_SIZE).all())
+            if not current_app.config.get("SYNC_API_KEY"):
+                _set_state("last_sync_error", "Cloud synchronization is not configured on this device.")
+                db.session.commit()
+                return {"pushed": 0, "confirmed": 0, "failed": len(items)}
+            if not items:
+                return {"pushed": 0, "confirmed": 0, "failed": 0}
 
-        device_id = get_current_device_id()
-        batch = [{
-            "outbox_id": item.id,
-            "table_name": item.table_name,
-            "record_id": item.record_id,
-            "payload": json.loads(item.payload_json),
-        } for item in items]
+            device_id = get_current_device_id()
+            batch = [{
+                "outbox_id": item.id,
+                "table_name": item.table_name,
+                "record_id": item.record_id,
+                "payload": json.loads(item.payload_json),
+            } for item in items]
 
-        url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/push"
-        headers = {
-            "X-Sync-Key": current_app.config["SYNC_API_KEY"],
-            "X-Device-ID": device_id,
-        }
-        try:
-            resp = requests.post(url, json={"device_id": device_id, "items": batch}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-        except requests.RequestException as exc:
+            url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/push"
+            headers = {
+                "X-Sync-Key": current_app.config["SYNC_API_KEY"],
+                "X-Device-ID": device_id,
+            }
+            try:
+                resp = requests.post(url, json={"device_id": device_id, "items": batch}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+            except requests.RequestException as exc:
+                for item in items:
+                    item.attempt_count = (item.attempt_count or 0) + 1
+                    item.last_attempt_at = datetime.now(timezone.utc)
+                    item.last_error = str(exc)
+                _set_state("last_sync_error", str(exc))
+                db.session.commit()
+                return {"pushed": 0, "confirmed": 0, "failed": len(items)}
+
+            by_id = {r.get("outbox_id"): r for r in results}
+            confirmed = failed = 0
             for item in items:
-                item.attempt_count = (item.attempt_count or 0) + 1
-                item.last_attempt_at = datetime.now(timezone.utc)
-                item.last_error = str(exc)
-            _set_state("last_sync_error", str(exc))
-            db.session.commit()
-            return {"pushed": 0, "confirmed": 0, "failed": len(items)}
+                result = by_id.get(item.id) or {}
+                if result.get("status") == "ok":
+                    if item.table_name == "sales" and result.get("invoice_number"):
+                        sale = db.session.get(Sale, item.record_id)
+                        if sale and sale.invoice_number is None:
+                            # Local SQLite can already contain another sale with the
+                            # same invoice number from an earlier sync/replay. In that
+                            # case, the worker must acknowledge the central insert
+                            # without trying to overwrite the local row with a
+                            # duplicate invoice value; a later pull will reconcile
+                            # the authoritative invoice back into this device.
+                            existing = (
+                                Sale.query.filter(Sale.id != sale.id, Sale.invoice_number == result["invoice_number"])
+                                .first()
+                            )
+                            if not existing:
+                                sale.invoice_number = result["invoice_number"]
+                    db.session.delete(item)
+                    confirmed += 1
+                else:
+                    item.attempt_count = (item.attempt_count or 0) + 1
+                    item.last_attempt_at = datetime.now(timezone.utc)
+                    item.last_error = result.get("error", "Unknown synchronization error")
+                    # Reaching this branch means the central server gave an
+                    # explicit answer for this exact item (a real "no"), not a
+                    # dropped connection -- a dropped connection is caught by
+                    # the requests.RequestException branch above and returns
+                    # before `results`/`by_id` even exist, so it never reaches
+                    # this loop. An explicit rejection is deterministic:
+                    # resending the identical payload will fail the identical
+                    # way every time, no matter how many times the worker
+                    # retries it.
+                    #
+                    # This used to only escalate to "needs_review" when the
+                    # error text happened to match one of a few hardcoded
+                    # phrases ("not enough stock", "conflict", ...). Every
+                    # other kind of permanent rejection -- most commonly a
+                    # stale shop_id on an old queued sale after the device was
+                    # re-enrolled, but also an unknown product_id, a missing
+                    # customer name, or any other validation error -- fell
+                    # through that filter and just kept retrying identically
+                    # forever. Nothing ever told the owner it was stuck; the
+                    # sync badge just stayed on "N waiting / retrying upload
+                    # automatically" indefinitely, because pending_count only
+                    # drops when an item is deleted (confirmed) or moved to
+                    # needs_review, and this item was doing neither.
+                    #
+                    # So: any explicit rejection that has failed repeatedly is
+                    # flagged for review, full stop. It surfaces as "Needs
+                    # attention" in the UI instead of silently never resolving,
+                    # and the specific reason is preserved in last_error for
+                    # the owner (and support) to act on.
+                    if item.attempt_count >= 3:
+                        item.status = "needs_review"
+                    failed += 1
 
-        by_id = {r.get("outbox_id"): r for r in results}
-        confirmed = failed = 0
-        for item in items:
-            result = by_id.get(item.id) or {}
-            if result.get("status") == "ok":
-                if item.table_name == "sales" and result.get("invoice_number"):
-                    sale = db.session.get(Sale, item.record_id)
-                    if sale and sale.invoice_number is None:
-                        # Local SQLite can already contain another sale with the
-                        # same invoice number from an earlier sync/replay. In that
-                        # case, the worker must acknowledge the central insert
-                        # without trying to overwrite the local row with a
-                        # duplicate invoice value; a later pull will reconcile
-                        # the authoritative invoice back into this device.
-                        existing = (
-                            Sale.query.filter(Sale.id != sale.id, Sale.invoice_number == result["invoice_number"])
-                            .first()
-                        )
-                        if not existing:
-                            sale.invoice_number = result["invoice_number"]
-                db.session.delete(item)
-                confirmed += 1
+            if failed == 0 and confirmed == len(items):
+                # Record a successful upload only when every item in this batch
+                # was acknowledged by central. A partial batch failure must not
+                # overwrite the last error with a false success state.
+                _set_state("last_sync_at", datetime.now(timezone.utc).isoformat())
+                _set_state("last_sync_error", "")
             else:
-                item.attempt_count = (item.attempt_count or 0) + 1
-                item.last_attempt_at = datetime.now(timezone.utc)
-                item.last_error = result.get("error", "Unknown synchronization error")
-                # Reaching this branch means the central server gave an
-                # explicit answer for this exact item (a real "no"), not a
-                # dropped connection -- a dropped connection is caught by
-                # the requests.RequestException branch above and returns
-                # before `results`/`by_id` even exist, so it never reaches
-                # this loop. An explicit rejection is deterministic:
-                # resending the identical payload will fail the identical
-                # way every time, no matter how many times the worker
-                # retries it.
-                #
-                # This used to only escalate to "needs_review" when the
-                # error text happened to match one of a few hardcoded
-                # phrases ("not enough stock", "conflict", ...). Every
-                # other kind of permanent rejection -- most commonly a
-                # stale shop_id on an old queued sale after the device was
-                # re-enrolled, but also an unknown product_id, a missing
-                # customer name, or any other validation error -- fell
-                # through that filter and just kept retrying identically
-                # forever. Nothing ever told the owner it was stuck; the
-                # sync badge just stayed on "N waiting / retrying upload
-                # automatically" indefinitely, because pending_count only
-                # drops when an item is deleted (confirmed) or moved to
-                # needs_review, and this item was doing neither.
-                #
-                # So: any explicit rejection that has failed repeatedly is
-                # flagged for review, full stop. It surfaces as "Needs
-                # attention" in the UI instead of silently never resolving,
-                # and the specific reason is preserved in last_error for
-                # the owner (and support) to act on.
-                if item.attempt_count >= 3:
-                    item.status = "needs_review"
-                failed += 1
+                # Preserve a real push error so the UI can distinguish a queued
+                # record that is retrying from a queue that is merely waiting.
+                errors = [
+                    item.last_error
+                    for item in items
+                    if item.last_error
+                ]
+                _set_state(
+                    "last_sync_error",
+                    errors[0] if errors else "One or more queued changes were not acknowledged by the central server.",
+                )
 
-        if failed == 0 and confirmed == len(items):
-            # Record a successful upload only when every item in this batch
-            # was acknowledged by central. A partial batch failure must not
-            # overwrite the last error with a false success state.
-            _set_state("last_sync_at", datetime.now(timezone.utc).isoformat())
-            _set_state("last_sync_error", "")
-        else:
-            # Preserve a real push error so the UI can distinguish a queued
-            # record that is retrying from a queue that is merely waiting.
-            errors = [
-                item.last_error
-                for item in items
-                if item.last_error
-            ]
-            _set_state(
-                "last_sync_error",
-                errors[0] if errors else "One or more queued changes were not acknowledged by the central server.",
-            )
-
-        db.session.commit()
-        return {"pushed": len(items), "confirmed": confirmed, "failed": failed}
+            db.session.commit()
+            return {"pushed": len(items), "confirmed": confirmed, "failed": failed}
+    finally:
+        _push_lock.release()
 
 
 def _upsert_transactions(data):
@@ -276,183 +289,208 @@ def _upsert_transactions(data):
 
 
 def pull_reference_data_once(app) -> dict:
-    with app.app_context():
-        if not current_app.config.get("SYNC_API_KEY"):
-            _set_state("last_pull_error", "Cloud synchronization is not configured on this device.")
+    # Login spawns its own one-off pull thread (see routes/auth.py) *in
+    # addition to* this module's routine background-loop pulls (every
+    # IDLE_PULL_INTERVAL_SECONDS) -- without mutual exclusion those two can
+    # run concurrently against the same SQLite session and corrupt state (a
+    # duplicate-key IntegrityError, or rarer, a hard crash). This became far
+    # more likely once routine pulls started running every 15s instead of
+    # almost never. A second caller arriving mid-pull just skips this cycle:
+    # the in-progress pull will finish and cover the same ground anyway.
+    if not _pull_lock.acquire(blocking=False):
+        return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
+    try:
+        with app.app_context():
+            if not current_app.config.get("SYNC_API_KEY"):
+                _set_state("last_pull_error", "Cloud synchronization is not configured on this device.")
+                db.session.commit()
+                return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
+            state = db.session.get(SyncState, LAST_PULL_KEY)
+            since = state.value if state else None
+            url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/pull"
+            headers = {
+                "X-Sync-Key": current_app.config["SYNC_API_KEY"],
+                "X-Device-ID": get_current_device_id(),
+            }
+            params = {"since": since} if since else {}
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.RequestException as exc:
+                _set_state("last_pull_error", str(exc))
+                db.session.commit()
+                return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
+
+            try:
+                for raw in data.get("shops", []):
+                    shop = db.session.get(Shop, raw["id"])
+                    if not shop:
+                        shop = Shop(id=raw["id"])
+                        db.session.add(shop)
+                    shop.name = raw["name"]
+                    shop.location = raw.get("location")
+                    shop.logo_data = raw.get("logo_data")
+
+                skipped_staff = 0
+                for raw in data.get("staff", []):
+                    staff = db.session.get(Staff, raw["id"])
+                    is_new = not staff
+                    if is_new:
+                        # Bring the shadow record in immediately, just like shops
+                        # and products already do -- do not wait for this staff
+                        # member to log in on this specific PC first. That used
+                        # to be the behavior here, but it doesn't add any real
+                        # protection: local-mode login never checks this local
+                        # password_hash at all (see _authenticate_against_central
+                        # in routes/auth.py), it always re-verifies the password
+                        # against the real central server. So skipping this just
+                        # hid staff accounts created elsewhere -- an account
+                        # that's in Firestore should always show up locally too.
+                        staff = Staff(id=raw["id"], password_hash="")
+                        db.session.add(staff)
+
+                    # Keep local staff rows stable when the central payload is unchanged.
+                    # Re-writing the same values would advance updated_at, which would
+                    # invalidate any already-issued JWTs because login_required rechecks
+                    # the token against the current staff row timestamp.
+                    desired = {
+                        "shop_id": raw.get("shop_id"),
+                        "name": raw["name"],
+                        "email": raw["email"],
+                        "role": raw["role"],
+                        "is_active": raw["is_active"],
+                        # The quick-unlock PIN IS synchronized (unlike password_hash
+                        # below): verify_pin in local mode checks this local row
+                        # directly rather than calling central, so without this, a
+                        # PIN set on one PC would never work as that same PIN on
+                        # any other PC logged into the same account, even though
+                        # it's already sitting in Firestore the whole time.
+                        "quick_pin_hash": raw.get("quick_pin_hash"),
+                        "quick_pin_failed_attempts": raw.get("quick_pin_failed_attempts") or 0,
+                        "quick_pin_locked_until": _parse_datetime(raw.get("quick_pin_locked_until")),
+                    }
+                    if (
+                        not is_new and
+                        staff.shop_id == desired["shop_id"] and
+                        staff.name == desired["name"] and
+                        staff.email == desired["email"] and
+                        staff.role == desired["role"] and
+                        staff.is_active == desired["is_active"] and
+                        staff.quick_pin_hash == desired["quick_pin_hash"] and
+                        staff.quick_pin_failed_attempts == desired["quick_pin_failed_attempts"] and
+                        staff.quick_pin_locked_until == desired["quick_pin_locked_until"]
+                    ):
+                        continue
+
+                    staff.shop_id = desired["shop_id"]
+                    staff.name = desired["name"]
+                    staff.email = desired["email"]
+                    # password_hash is the one auth secret that genuinely never needs
+                    # to travel: local-mode login always re-verifies against central
+                    # (see _authenticate_against_central in routes/auth.py) and never
+                    # reads this local column at all, so there's nothing for syncing
+                    # it to fix, and every reason to keep it out of local storage.
+                    staff.role = desired["role"]
+                    staff.is_active = desired["is_active"]
+                    staff.quick_pin_hash = desired["quick_pin_hash"]
+                    staff.quick_pin_failed_attempts = desired["quick_pin_failed_attempts"]
+                    staff.quick_pin_locked_until = desired["quick_pin_locked_until"]
+
+                for raw in data.get("settings", []):
+                    setting = SystemSetting.query.filter_by(key=raw["key"]).first()
+                    if not setting:
+                        setting = SystemSetting(key=raw["key"])
+                        db.session.add(setting)
+                    setting.value = raw.get("value")
+
+                for raw in data.get("products", []):
+                    product = db.session.get(Product, raw["id"])
+                    if not product:
+                        product = Product(id=raw["id"])
+                        db.session.add(product)
+                    product.sku = raw["sku"]
+                    product.name = raw["name"]
+                    product.category = raw.get("category")
+                    product.unit_price = raw["unit_price"]
+                    product.cost_price = raw.get("cost_price", 0)
+                    product.is_active = raw.get("is_active", True)
+
+                _upsert_transactions(data)
+            except Exception as exc:
+                # A single malformed record (e.g. an unparseable timestamp) must
+                # never be allowed to crash the thread mid-transaction and leave
+                # partially-applied staff/product/sale changes pending. That both
+                # (a) stops the sync cursor from ever advancing -- so every future
+                # pull re-fetches the same expensive "everything since the old
+                # cursor" range forever -- and (b) risks flushing a dirty,
+                # invalidating staff.updated_at write on a later unrelated commit.
+                db.session.rollback()
+                _set_state("last_pull_error", f"{type(exc).__name__}: {exc}")
+                db.session.commit()
+                return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
+
+            if not state:
+                state = SyncState(key=LAST_PULL_KEY)
+                db.session.add(state)
+            # New central servers send a high-water-mark cursor captured before
+            # querying. Fall back to the legacy server_time only while upgrading
+            # an older central server.
+            next_cursor = data.get("next_cursor") or data.get("server_time")
+            state.value = next_cursor
+            _set_state("last_pull_success", next_cursor)
+            _set_state("last_pull_error", "")
+            # provisioning_state is a separate flag from last_pull_error, only
+            # ever advanced to READY by the dedicated one-time provisioning
+            # route. If a device's *first* pull failed (e.g. on a bad record),
+            # it gets stuck at ENROLLED / PROVISIONING forever -- later
+            # successful pulls (including this file's own background retries)
+            # fix last_pull_error, but without this, they'd never clear that
+            # separate flag, so the UI would keep showing "Setting up sync"
+            # indefinitely even once everything is actually caught up. Any
+            # successful pull means the device is caught up, so advance it here
+            # too, matching what the provisioning route itself does on success.
+            # Set unconditionally (not "only if a row already exists") --
+            # _effective_provisioning_state() falls back to ENROLLED / PROVISIONING
+            # purely from the device having a shop_id when no row exists yet at
+            # all, so a missing row needs to be created here too, not just an
+            # existing one updated.
+            _set_state("provisioning_state", "READY")
+            _set_state("last_pull_skipped_staff", str(skipped_staff))
+
+            # A device may have been enrolled successfully but failed its initial
+            # pull because the central service was temporarily unavailable. Once a
+            # later pull succeeds, recover the provisioning state automatically so
+            # the device does not remain stuck in SYNC_ERROR forever.
+            provisioning = db.session.get(SyncState, "provisioning_state")
+            if provisioning and provisioning.value in {"ENROLLED / PROVISIONING", "SYNC_ERROR"}:
+                provisioning.value = "READY"
+
             db.session.commit()
-            return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
-        state = db.session.get(SyncState, LAST_PULL_KEY)
-        since = state.value if state else None
-        url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/") + "/api/sync/pull"
-        headers = {
-            "X-Sync-Key": current_app.config["SYNC_API_KEY"],
-            "X-Device-ID": get_current_device_id(),
-        }
-        params = {"since": since} if since else {}
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as exc:
-            _set_state("last_pull_error", str(exc))
-            db.session.commit()
-            return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
-
-        try:
-            for raw in data.get("shops", []):
-                shop = db.session.get(Shop, raw["id"])
-                if not shop:
-                    shop = Shop(id=raw["id"])
-                    db.session.add(shop)
-                shop.name = raw["name"]
-                shop.location = raw.get("location")
-                shop.logo_data = raw.get("logo_data")
-
-            skipped_staff = 0
-            for raw in data.get("staff", []):
-                staff = db.session.get(Staff, raw["id"])
-                is_new = not staff
-                if is_new:
-                    # Bring the shadow record in immediately, just like shops
-                    # and products already do -- do not wait for this staff
-                    # member to log in on this specific PC first. That used
-                    # to be the behavior here, but it doesn't add any real
-                    # protection: local-mode login never checks this local
-                    # password_hash at all (see _authenticate_against_central
-                    # in routes/auth.py), it always re-verifies the password
-                    # against the real central server. So skipping this just
-                    # hid staff accounts created elsewhere -- an account
-                    # that's in Firestore should always show up locally too.
-                    staff = Staff(id=raw["id"], password_hash="")
-                    db.session.add(staff)
-
-                # Keep local staff rows stable when the central payload is unchanged.
-                # Re-writing the same values would advance updated_at, which would
-                # invalidate any already-issued JWTs because login_required rechecks
-                # the token against the current staff row timestamp.
-                desired = {
-                    "shop_id": raw.get("shop_id"),
-                    "name": raw["name"],
-                    "email": raw["email"],
-                    "role": raw["role"],
-                    "is_active": raw["is_active"],
-                    # The quick-unlock PIN IS synchronized (unlike password_hash
-                    # below): verify_pin in local mode checks this local row
-                    # directly rather than calling central, so without this, a
-                    # PIN set on one PC would never work as that same PIN on
-                    # any other PC logged into the same account, even though
-                    # it's already sitting in Firestore the whole time.
-                    "quick_pin_hash": raw.get("quick_pin_hash"),
-                    "quick_pin_failed_attempts": raw.get("quick_pin_failed_attempts") or 0,
-                    "quick_pin_locked_until": _parse_datetime(raw.get("quick_pin_locked_until")),
-                }
-                if (
-                    not is_new and
-                    staff.shop_id == desired["shop_id"] and
-                    staff.name == desired["name"] and
-                    staff.email == desired["email"] and
-                    staff.role == desired["role"] and
-                    staff.is_active == desired["is_active"] and
-                    staff.quick_pin_hash == desired["quick_pin_hash"] and
-                    staff.quick_pin_failed_attempts == desired["quick_pin_failed_attempts"] and
-                    staff.quick_pin_locked_until == desired["quick_pin_locked_until"]
-                ):
-                    continue
-
-                staff.shop_id = desired["shop_id"]
-                staff.name = desired["name"]
-                staff.email = desired["email"]
-                # password_hash is the one auth secret that genuinely never needs
-                # to travel: local-mode login always re-verifies against central
-                # (see _authenticate_against_central in routes/auth.py) and never
-                # reads this local column at all, so there's nothing for syncing
-                # it to fix, and every reason to keep it out of local storage.
-                staff.role = desired["role"]
-                staff.is_active = desired["is_active"]
-                staff.quick_pin_hash = desired["quick_pin_hash"]
-                staff.quick_pin_failed_attempts = desired["quick_pin_failed_attempts"]
-                staff.quick_pin_locked_until = desired["quick_pin_locked_until"]
-
-            for raw in data.get("settings", []):
-                setting = SystemSetting.query.filter_by(key=raw["key"]).first()
-                if not setting:
-                    setting = SystemSetting(key=raw["key"])
-                    db.session.add(setting)
-                setting.value = raw.get("value")
-
-            for raw in data.get("products", []):
-                product = db.session.get(Product, raw["id"])
-                if not product:
-                    product = Product(id=raw["id"])
-                    db.session.add(product)
-                product.sku = raw["sku"]
-                product.name = raw["name"]
-                product.category = raw.get("category")
-                product.unit_price = raw["unit_price"]
-                product.cost_price = raw.get("cost_price", 0)
-                product.is_active = raw.get("is_active", True)
-
-            _upsert_transactions(data)
-        except Exception as exc:
-            # A single malformed record (e.g. an unparseable timestamp) must
-            # never be allowed to crash the thread mid-transaction and leave
-            # partially-applied staff/product/sale changes pending. That both
-            # (a) stops the sync cursor from ever advancing -- so every future
-            # pull re-fetches the same expensive "everything since the old
-            # cursor" range forever -- and (b) risks flushing a dirty,
-            # invalidating staff.updated_at write on a later unrelated commit.
-            db.session.rollback()
-            _set_state("last_pull_error", f"{type(exc).__name__}: {exc}")
-            db.session.commit()
-            return {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}
-
-        if not state:
-            state = SyncState(key=LAST_PULL_KEY)
-            db.session.add(state)
-        # New central servers send a high-water-mark cursor captured before
-        # querying. Fall back to the legacy server_time only while upgrading
-        # an older central server.
-        next_cursor = data.get("next_cursor") or data.get("server_time")
-        state.value = next_cursor
-        _set_state("last_pull_success", next_cursor)
-        _set_state("last_pull_error", "")
-        # provisioning_state is a separate flag from last_pull_error, only
-        # ever advanced to READY by the dedicated one-time provisioning
-        # route. If a device's *first* pull failed (e.g. on a bad record),
-        # it gets stuck at ENROLLED / PROVISIONING forever -- later
-        # successful pulls (including this file's own background retries)
-        # fix last_pull_error, but without this, they'd never clear that
-        # separate flag, so the UI would keep showing "Setting up sync"
-        # indefinitely even once everything is actually caught up. Any
-        # successful pull means the device is caught up, so advance it here
-        # too, matching what the provisioning route itself does on success.
-        # Set unconditionally (not "only if a row already exists") --
-        # _effective_provisioning_state() falls back to ENROLLED / PROVISIONING
-        # purely from the device having a shop_id when no row exists yet at
-        # all, so a missing row needs to be created here too, not just an
-        # existing one updated.
-        _set_state("provisioning_state", "READY")
-        _set_state("last_pull_skipped_staff", str(skipped_staff))
-
-        # A device may have been enrolled successfully but failed its initial
-        # pull because the central service was temporarily unavailable. Once a
-        # later pull succeeds, recover the provisioning state automatically so
-        # the device does not remain stuck in SYNC_ERROR forever.
-        provisioning = db.session.get(SyncState, "provisioning_state")
-        if provisioning and provisioning.value in {"ENROLLED / PROVISIONING", "SYNC_ERROR"}:
-            provisioning.value = "READY"
-
-        db.session.commit()
-        return {
-            "shops": len(data.get("shops", [])),
-            "staff": len(data.get("staff", [])),
-            "products": len(data.get("products", [])),
-            "settings": len(data.get("settings", [])),
-            "sales": len(data.get("sales", [])),
-            "payments": len(data.get("payments", [])),
-            "stock_movements": len(data.get("stock_movements", [])),
-            "staff_needing_provisioning": skipped_staff,
-        }
+            counts = {
+                "shops": len(data.get("shops", [])),
+                "staff": len(data.get("staff", [])),
+                "products": len(data.get("products", [])),
+                "settings": len(data.get("settings", [])),
+                "sales": len(data.get("sales", [])),
+                "payments": len(data.get("payments", [])),
+                "stock_movements": len(data.get("stock_movements", [])),
+                "staff_needing_provisioning": skipped_staff,
+            }
+            if any(counts[key] for key in ("shops", "staff", "products", "settings", "sales", "payments", "stock_movements")):
+                # Only advance this when a pull actually brought in real
+                # changes (the marker short-circuit in _pull_incremental
+                # means most pulls bring in nothing) -- the frontend polls
+                # last_pull_at already for its sync indicator, but that
+                # advances on every attempt regardless of content, which
+                # would make it refresh the visible screen every cycle even
+                # when nothing changed. This field only moves when there's
+                # something worth re-rendering for.
+                _set_state("last_pull_changed_at", datetime.now(timezone.utc).isoformat())
+                db.session.commit()
+            return counts
+    finally:
+        _pull_lock.release()
 
 
 def backoff_delay(base_seconds, consecutive_failures):
@@ -465,29 +503,30 @@ def backoff_delay(base_seconds, consecutive_failures):
 def start_background_sync(app):
     """
     Push pending sales promptly (cheap -- costs nothing while the outbox is
-    empty). A successful online login performs the initial reference-data
-    pull. After that, further pulls are event-driven only: they happen
-    when trigger_sync_soon() is called following an actual mutating action
-    (a sale, a staff/product/settings change, etc.), not on a recurring
-    timer. A fixed-interval pull loop -- even throttled to 60s -- still
-    reads Firestore continuously whether or not anyone is using the system,
-    which is unnecessary cost for a single-shop POS: nothing changes on the
-    server unless someone here or on another device did something.
+    empty). Pulls run on a routine timer (IDLE_PULL_INTERVAL_SECONDS) so a
+    change made on one device -- the owner adding stock, say -- shows up on
+    every other logged-in device on its own, the way it would in any other
+    synced app, instead of requiring that device to log out and back in.
 
-    The one exception is retrying after a pull failure. A failed pull leaves
-    last_pull_error set, which the UI's sync status reads directly -- with
-    pulls otherwise event-driven, nothing would ever run again to clear it,
-    so the status would show "central unavailable" forever even after
-    central recovers, until the next unrelated action happened to trigger a
-    pull. So: only while the last pull is in a failed state, retry it on a
-    growing backoff (capped at PULL_INTERVAL_SECONDS). This is bounded and
-    self-limiting -- it stops entirely the moment a pull succeeds -- unlike
-    a fixed recurring loop, which keeps polling forever regardless of
-    whether anything is actually wrong.
+    This does NOT mean constantly re-reading the whole database. Every pull
+    first reads a single small "did anything change for this shop" marker
+    document (see _pull_incremental in firestore/service.py); the real,
+    multi-collection query only runs when that marker says something
+    actually changed since this device's last pull. So an idle shop, with
+    nobody adding stock or recording sales, costs exactly one cheap document
+    read per interval, on each logged-in device -- not a growing per-second
+    tax regardless of activity. At the default 15-second interval, one
+    idle device costs under 6,000 reads/day, comfortably inside Firestore's
+    free-tier daily quota even with several devices polling at once.
+
+    If a pull fails (central unreachable), the interval backs off
+    exponentially up to MAX_BACKOFF_SECONDS instead of retrying every
+    15 seconds against a server that's already down, and returns to the
+    normal cadence the moment a pull succeeds again.
     """
     def loop():
         push_failures = pull_failures = 0
-        next_push = next_pull_retry = 0.0
+        next_push = next_pull = 0.0
         while True:
             try:
                 if app.config.get("GLR_MODE") == "local":
@@ -497,31 +536,17 @@ def start_background_sync(app):
                     # successful online login establishes a local session.
                     if not has_local_session():
                         push_failures = pull_failures = 0
-                        next_push = next_pull_retry = 0.0
+                        next_push = next_pull = 0.0
                     else:
                         now = time.monotonic()
                         if now >= next_push:
                             result = push_pending_once(app)
                             push_failures = push_failures + 1 if (result.get("failed") and not result.get("confirmed")) else 0
                             next_push = now + backoff_delay(SYNC_INTERVAL_SECONDS, push_failures)
-                        # pull_failures only tracks retries *this loop has made
-                        # itself* -- it starts at 0 every time the loop (re)starts
-                        # and is otherwise only touched inside the block below, so
-                        # it can never turn itself on. A pull that failed anywhere
-                        # else (the login flow's own initial pull, a
-                        # trigger_sync_soon() call, an earlier run of this same
-                        # loop before a restart) leaves last_pull_error set with
-                        # no way for a zeroed pull_failures to notice -- so check
-                        # the real persisted state directly whenever we're not
-                        # already mid-retry, rather than trusting a counter that
-                        # only this loop iteration knows about.
-                        if not pull_failures and _last_pull_failed(app):
-                            pull_failures = 1
-                            next_pull_retry = now
-                        if pull_failures and now >= next_pull_retry:
+                        if now >= next_pull:
                             pull_reference_data_once(app)
                             pull_failures = pull_failures + 1 if _last_pull_failed(app) else 0
-                            next_pull_retry = now + backoff_delay(PULL_INTERVAL_SECONDS, pull_failures)
+                            next_pull = now + backoff_delay(IDLE_PULL_INTERVAL_SECONDS, pull_failures)
             except Exception:
                 pass
             time.sleep(SYNC_INTERVAL_SECONDS)

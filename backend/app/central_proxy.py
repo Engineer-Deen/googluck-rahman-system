@@ -41,7 +41,9 @@ def forward_to_central(method, path, offline_message):
     # .get(...) with a fallback, not config[...]: a misconfigured or minimal
     # app (missing this key entirely) must still fail as "offline", never as
     # an unhandled 500 that hides the real, customer-facing error message.
-    central_url = current_app.config["CENTRAL_SYNC_URL"]
+    central_url = current_app.config.get("CENTRAL_SYNC_URL")
+    if not central_url:
+        return None, (jsonify(error=offline_message, code="central_unreachable"), 503)
     url = central_url.rstrip("/") + path
     try:
         resp = requests.request(

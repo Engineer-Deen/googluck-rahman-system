@@ -253,6 +253,19 @@ class DesktopProvisioningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.get_json()["code"], "central_auth_network")
 
+    def test_central_auth_url_not_configured_is_a_clear_503_not_a_crash(self):
+        """A shop PC whose .env never got a central address is a real
+        misconfiguration, not a network blip -- it must fail with a clear,
+        diagnosable message (and a code support can search for), not a raw
+        500 from an unguarded dict lookup."""
+        del self.app.config["CENTRAL_SYNC_URL"]
+        response = self.app.test_client().post(
+            "/api/auth/login",
+            json={"email": "owner@example.test", "password": "central-password"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["code"], "central_auth_not_configured")
+
     def test_authenticated_session_requires_central_validation(self):
         with self.app.app_context():
             db.session.add(Staff(

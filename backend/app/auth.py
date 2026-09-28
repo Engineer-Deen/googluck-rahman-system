@@ -18,6 +18,16 @@ from flask import current_app, g, jsonify, request
 
 ALGORITHM = "HS256"
 
+# How often an already-cached local session gets re-checked against central
+# (deactivation, role change, shop reassignment). This is deliberately NOT
+# on every request -- that would turn every product view, every sale, every
+# ordinary click into a central round trip (and, on the Firestore-backed
+# deployment, a Firestore read), which is exactly the cost problem this
+# system works hard to avoid elsewhere. A minute-old worst case is an
+# acceptable trade for keeping ordinary use fast and cheap; logout still
+# takes effect immediately regardless of this interval (see clear_local_session).
+SESSION_REVALIDATE_SECONDS = 60
+
 
 def _session_cache():
     return current_app.extensions.setdefault("glr_session_cache", {})
@@ -32,12 +42,14 @@ def register_local_session(token, staff):
 
     The desktop must authenticate online first. After that, local API requests
     use this in-memory session instead of calling central /auth/me on every
-    request. The cache disappears when the local backend restarts.
+    request -- only once per SESSION_REVALIDATE_SECONDS (see
+    _central_session_staff). The cache disappears when the local backend
+    restarts.
     """
     cache = _session_cache()
     if len(cache) >= 200:
         cache.pop(next(iter(cache)), None)
-    cache[_session_key(token)] = dict(staff)
+    cache[_session_key(token)] = {"staff": dict(staff), "checked_at": time.monotonic()}
 
 
 def clear_local_session(token):
@@ -52,8 +64,11 @@ def local_session_required(fn):
     """Require a session established by a successful central login.
 
     This decorator is local-only. It checks the in-memory session cache and
-    never calls central /api/auth/me. A cache miss means the local sidecar
-    session is no longer established, so the client must log in again.
+    never calls central /api/auth/me, not even the periodic re-check that
+    login_required's local-mode path does -- this guards high-frequency
+    internal endpoints (sync status polling, etc.) where even an occasional
+    extra central round trip would be wasteful. A cache miss means the local
+    sidecar session is no longer established, so the client must log in again.
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -66,9 +81,10 @@ def local_session_required(fn):
         if not token:
             return jsonify(error="Missing or invalid Authorization header"), 401
 
-        cached = _session_cache().get(_session_key(token))
-        if cached is None:
+        entry = _session_cache().get(_session_key(token))
+        if entry is None:
             return jsonify(error="Session expired, please log in again"), 401
+        cached = entry["staff"]
 
         if not _staff_value(cached, "is_active", True):
             clear_local_session(token)
@@ -141,21 +157,48 @@ def _central_session_staff(token):
     """Return the identity for an already-established local session.
 
     Local authentication is established only after a successful online
-    central login. Once that login succeeds, the token and staff identity are
-    cached in this local Flask process. A cache miss means the local session
-    no longer exists and the client must log in again.
+    central login. A cache miss means the local session no longer exists and
+    the client must log in again.
 
-    This function deliberately does NOT call central /api/auth/me on a cache
-    miss. Doing so would turn ordinary local API requests and UI polling into
-    repeated central authentication requests and unnecessary Firestore reads.
+    Once established, the cached identity is re-checked against central at
+    most once every SESSION_REVALIDATE_SECONDS -- not on every request, which
+    would turn ordinary local API use into constant central/Firestore traffic
+    -- so a deactivation, role change, or shop reassignment made centrally
+    takes effect on this device within that bound, without paying for it on
+    every single click. If central can't be reached when a re-check is due,
+    this fails OPEN (keeps the last-known-good cached identity, and tries
+    again after another interval) rather than locking an already-logged-in
+    person out of a device that's working perfectly well offline -- an
+    explicit central rejection (401/403, "actually invalid") still logs the
+    session out immediately either way.
     """
-    cached = _session_cache().get(_session_key(token))
-    if cached is None:
+    key = _session_key(token)
+    entry = _session_cache().get(key)
+    if entry is None:
         return None, jsonify(
             error="Session expired, please log in again"
         ), 401
 
-    return dict(cached), None, None
+    now = time.monotonic()
+    if now - entry["checked_at"] >= SESSION_REVALIDATE_SECONDS:
+        staff, error_response, error_status = _fetch_central_session_staff(token)
+        if error_response is not None:
+            if error_status == 401:
+                # Central explicitly rejected this token/account -- do not
+                # keep honoring it locally just because it used to be valid.
+                clear_local_session(token)
+                return None, error_response, error_status
+            # Central is unreachable (network/timeout/5xx) -- stay working
+            # offline on the last-known-good identity rather than locking
+            # someone out because of a connectivity blip. Bump checked_at
+            # regardless, so a prolonged outage doesn't retry on every
+            # single request either.
+            entry["checked_at"] = now
+            return dict(entry["staff"]), None, None
+        entry["staff"] = staff
+        entry["checked_at"] = now
+
+    return dict(entry["staff"]), None, None
 
 
 def issue_token(staff) -> str:

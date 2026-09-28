@@ -186,6 +186,88 @@ class SyncCursorTests(unittest.TestCase):
             self.assertEqual(staff.quick_pin_failed_attempts, 1)
             self.assertIsNotNone(staff.quick_pin_locked_until)
 
+    def test_concurrent_pull_calls_do_not_run_at_the_same_time(self):
+        """Login spawns nothing extra anymore (see routes/auth.py), but the
+        routine background loop and a manual "Sync Now" click can still both
+        try to pull at once. Two threads calling pull_reference_data_once
+        concurrently must never both reach the network/DB work at the same
+        time -- concurrent, uncoordinated access to the same SQLite session
+        from two threads is what used to crash the process outright, not
+        just respond slowly."""
+        import threading
+        import time as time_module
+
+        release = threading.Event()
+        call_count = {"n": 0}
+        lock = threading.Lock()
+
+        class _SlowResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                with lock:
+                    call_count["n"] += 1
+                release.wait(timeout=2)
+                return {
+                    "next_cursor": "2026-01-02T03:04:05",
+                    "shops": [], "staff": [], "products": [], "settings": [],
+                    "sales": [], "sale_items": [], "payments": [], "stock_movements": [],
+                }
+
+        results = []
+
+        def run():
+            with patch("app.sync.worker.requests.get", return_value=_SlowResponse()):
+                results.append(pull_reference_data_once(self.app))
+
+        t1 = threading.Thread(target=run)
+        t1.start()
+        time_module.sleep(0.1)  # let t1 reach and start blocking inside json()
+        t2 = threading.Thread(target=run)
+        t2.start()
+        time_module.sleep(0.1)  # give t2 a chance to try (and be turned away)
+        release.set()
+        t1.join(timeout=3)
+        t2.join(timeout=3)
+
+        self.assertEqual(call_count["n"], 1, "only one thread should have reached the network call")
+        self.assertEqual(len(results), 2)
+        # The turned-away caller gets the same "nothing happened" shape as
+        # every other early-return in pull_reference_data_once.
+        skipped = [r for r in results if r == {"shops": 0, "staff": 0, "products": 0, "sales": 0, "payments": 0, "stock_movements": 0}]
+        self.assertEqual(len(skipped), 1)
+
+    def test_last_pull_changed_at_only_advances_when_something_actually_changed(self):
+        """The frontend uses this timestamp to decide whether to silently
+        refresh the screen. It must not advance on a pull that brought in
+        nothing (the common case, thanks to the marker short-circuit in
+        _pull_incremental) -- otherwise the UI would re-fetch every cycle
+        regardless of whether there was ever anything new to show."""
+        empty_response = _Response({
+            "next_cursor": "2026-01-02T03:04:05",
+            "shops": [], "staff": [], "products": [], "settings": [],
+            "sales": [], "sale_items": [], "payments": [], "stock_movements": [],
+        })
+        with patch("app.sync.worker.requests.get", return_value=empty_response):
+            pull_reference_data_once(self.app)
+        with self.app.app_context():
+            self.assertIsNone(db.session.get(SyncState, "last_pull_changed_at"))
+
+        changed_response = _Response({
+            "next_cursor": "2026-01-02T04:04:05",
+            "shops": [], "staff": [], "settings": [],
+            "products": [{
+                "id": 99, "sku": "P-99", "name": "New Product", "unit_price": "5.00",
+                "cost_price": "3.00", "is_active": True, "shop_ids": [1],
+            }],
+            "sales": [], "sale_items": [], "payments": [], "stock_movements": [],
+        })
+        with patch("app.sync.worker.requests.get", return_value=changed_response):
+            pull_reference_data_once(self.app)
+        with self.app.app_context():
+            self.assertIsNotNone(db.session.get(SyncState, "last_pull_changed_at"))
+
     def test_worker_prefers_next_cursor_over_legacy_server_time(self):
         response = _Response({
             "next_cursor": "2026-01-02T03:04:05",

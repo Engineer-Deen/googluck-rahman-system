@@ -208,32 +208,36 @@ class CustomerFacingMessageTests(unittest.TestCase):
             db.engine.dispose()
 
     def test_staff_create_offline_message_is_customer_friendly(self):
-        session_response = Mock(status_code=200)
-        session_response.json.return_value = {
-            "id": 1,
-            "name": "Admin",
-            "email": "admin@customer.shop",
-            "role": "admin",
-            "shop_id": 1,
-            "is_active": True,
-        }
-        with patch("app.auth.requests.get", return_value=session_response):
-            response = self.app.test_client().post(
-                "/api/staff",
-                headers={"Authorization": "Bearer central-token"},
-                json={
-                    "name": "New Seller",
-                    "email": "new@customer.shop",
-                    "password": "secret12",
-                    "role": "cashier",
-                },
-            )
-        # This request is authenticated (the session check above is mocked to
-        # succeed) but the actual staff-creation call to central is not mocked,
-        # so it genuinely cannot reach central here -- 503, not 403, is the
-        # correct status for "this shop computer has no route to the internet
-        # right now". A flat 403 regardless of real connectivity was the
-        # original bug: it showed even when the shop PC was online. The
+        from app.auth import register_local_session
+
+        # An authenticated request needs an actual established local session
+        # (the product of a prior successful central login), not just a
+        # bearer token that happens to look plausible -- register one
+        # directly rather than re-running a full mocked login flow, since
+        # this test's real interest is what happens next (staff-creation
+        # forwarding to central), not the login step itself.
+        with self.app.app_context():
+            register_local_session("central-token", {
+                "id": 1, "name": "Admin", "email": "admin@customer.shop",
+                "role": "admin", "shop_id": 1, "is_active": True,
+            })
+
+        response = self.app.test_client().post(
+            "/api/staff",
+            headers={"Authorization": "Bearer central-token"},
+            json={
+                "name": "New Seller",
+                "email": "new@customer.shop",
+                "password": "secret12",
+                "role": "cashier",
+            },
+        )
+        # This request is authenticated (the session above was established
+        # directly) but the actual staff-creation call to central is not
+        # mocked, so it genuinely cannot reach central here -- 503, not 403,
+        # is the correct status for "this shop computer has no route to the
+        # internet right now". A flat 403 regardless of real connectivity was
+        # the original bug: it showed even when the shop PC was online. The
         # frontend shows this same friendly message for both 403 and 503 and
         # does not log the user out for it, so the status code change here is
         # not user-visible.

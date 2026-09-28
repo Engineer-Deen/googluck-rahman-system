@@ -66,6 +66,78 @@ class DesktopLocalApiContractTests(unittest.TestCase):
         self.assertNotIn("local_password", script)
         self.assertNotIn("offline access", html.lower())
 
+    def test_offline_banner_is_global_and_refreshes_silently_when_back_online(self):
+        """A no-internet indicator confined to the login screen isn't enough
+        -- it must show everywhere, and reconnecting should quietly refresh
+        whatever's on screen rather than requiring the person to notice and
+        act themselves."""
+        html = FRONTEND_INDEX.read_text(encoding="utf-8")
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+        self.assertIn('id="offline-banner"', html)
+        # Not nested inside login-overlay or app -- must render regardless
+        # of which screen is showing.
+        login_idx = html.index('id="login-overlay"')
+        banner_idx = html.index('id="offline-banner"')
+        self.assertLess(banner_idx, login_idx)
+        self.assertIn("function updateOfflineBanner", script)
+        self.assertIn('addEventListener("offline", updateOfflineBanner)', script)
+        self.assertIn("function silentlyRefreshActivePanel", script)
+        online_handler = script[script.index('addEventListener("online"'):]
+        online_handler = online_handler[:online_handler.index("\n  });")]
+        self.assertIn("silentlyRefreshActivePanel", online_handler)
+
+    def test_static_buttons_show_progress_while_their_action_is_in_flight(self):
+        """logout / restock-apply / create-account / register-admin / and
+        the admin quick-unlock must all disable themselves and show an
+        in-progress label while their request is running, matching the
+        pattern already used elsewhere (submitPayment, saveSystemSettings)
+        -- otherwise a slow response looks exactly like a dead button."""
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+
+        def body_of(fn_name):
+            start = script.index(f"async function {fn_name}")
+            # crude but sufficient: take up to the next top-level function
+            end = script.index("\nasync function ", start + 1)
+            return script[start:end]
+
+        for fn_name, btn_id in [
+            ("doLogout", "logout-btn"),
+            ("submitRestock", "restock-apply-btn"),
+            ("createStaff", "st-create-btn"),
+            ("createAdminAccount", "ad-register-btn"),
+            ("saveStaffEdit", "st-save-edit-btn"),
+            ("submitPasswordReset", "st-reset-submit-btn"),
+            ("unlockAdminSession", "admin-unlock-btn"),
+        ]:
+            body = body_of(fn_name)
+            self.assertIn(btn_id, body, f"{fn_name} should reference #{btn_id}")
+            self.assertIn(".disabled = true", body, f"{fn_name} should disable its button while running")
+
+    def test_dynamic_row_buttons_show_progress_while_their_action_is_in_flight(self):
+        """The per-row action buttons (deactivate/reactivate/delete a product,
+        deactivate/reactivate staff, void or edit a sale) are rendered
+        dynamically with no fixed id, so they can't reference
+        getElementById the way the static buttons above do. They must still
+        disable themselves and show progress, using the click event's own
+        target instead."""
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+
+        def body_of(fn_name):
+            start = script.index(f"async function {fn_name}")
+            end = script.index("\nasync function ", start + 1)
+            return script[start:end]
+
+        for fn_name in [
+            "toggleInventoryProductState",
+            "deleteInventoryProduct",
+            "toggleStaffActive",
+            "voidSale",
+            "editSale",
+        ]:
+            body = body_of(fn_name)
+            self.assertIn("window.event", body, f"{fn_name} should grab the clicked button via window.event")
+            self.assertIn(".disabled = true", body, f"{fn_name} should disable its button while running")
+
     def test_tauri_surfaces_sidecar_spawn_errors(self):
         text = TAURI_LIB.read_text(encoding="utf-8")
         self.assertIn("fn glr_local_backend_status", text)

@@ -232,6 +232,30 @@ input, select { font-family: inherit; }
   min-height: 1.2em;
 }
 
+#offline-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  padding: .5rem 1rem;
+  text-align: center;
+  font-size: .8rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-bottom: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+}
+#offline-banner[hidden] { display: none; }
+/* Push fixed/visible content below the banner instead of letting it cover
+   the top of the login card or the app header when it's showing. Toggled
+   via a body class from JS rather than a :has() selector, so this doesn't
+   depend on the embedding webview supporting newer CSS selectors. */
+body.is-offline #login-overlay,
+body.is-offline #app {
+  padding-top: 2.1rem;
+}
 .login-connectivity-state {
   display: grid;
   gap: .45rem;

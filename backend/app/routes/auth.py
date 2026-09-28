@@ -62,7 +62,17 @@ def _get_central_service():
 
 
 def _authenticate_against_central(email, password, role_group):
-    central_url = current_app.config["CENTRAL_SYNC_URL"].rstrip("/")
+    central_url = current_app.config.get("CENTRAL_SYNC_URL")
+    if not central_url:
+        # A genuine misconfiguration (this shop PC's .env never got a central
+        # address) -- without this check, current_app.config["CENTRAL_SYNC_URL"]
+        # raises a raw KeyError and the person sees an unhelpful 500 instead of
+        # a diagnosable message, and support has no code to search for.
+        return None, (jsonify(
+            error="This device is not configured with a central server address. Please contact support.",
+            code="central_auth_not_configured",
+        ), 503)
+    central_url = central_url.rstrip("/")
     try:
         response = requests.post(
             central_url + "/api/auth/login",
@@ -190,17 +200,18 @@ def login():
     token = issue_token(staff) if _central_mode() else central_token
     if not _central_mode():
         register_local_session(token, staff)
-        # Synchronization is event-driven: successful login is the explicit
-        # reason to perform a central pull. The background worker does not pull
-        # merely because the local Flask process started.
-        import threading
-        from app.sync.worker import pull_reference_data_once
-        app_obj = current_app._get_current_object()
-        threading.Thread(
-            target=lambda: pull_reference_data_once(app_obj),
-            daemon=True,
-            name="glr-login-pull",
-        ).start()
+        # No dedicated per-login pull thread here anymore. The persistent
+        # background loop (start_background_sync, started once when the
+        # local Flask process starts) already checks for an active session
+        # every few seconds and pulls the moment it finds one -- so a login
+        # still gets fresh data within a handful of seconds regardless.
+        # Spawning a second, separate thread here as well used to mean two
+        # independent threads could both call pull_reference_data_once at
+        # once (this login's own thread, and the routine loop's own pull
+        # landing at the same moment) -- concurrent, uncoordinated access to
+        # the same SQLite-backed session from two threads, which is exactly
+        # the kind of thing that corrupts state or crashes the process
+        # outright, not just a slow response.
     return jsonify(
         token=token,
         staff={

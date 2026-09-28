@@ -43,14 +43,16 @@ class FirestoreSalesTests(unittest.TestCase):
         self.assertIn("item-1", self.client.collections["sale_items"])
         self.assertEqual(self.service.stock_map([10], 1)[10], 3)
 
-    def test_central_sale_uses_catalog_price_when_item_price_is_omitted(self):
-        payload = {"id": "sale-catalog-price", "device_id": "device-a", "customer_name": "Alice", "items": [{"product_id": 10, "quantity": 1}]}
+    def test_central_sale_requires_selling_price_per_item(self):
+        # Selling price is deliberately NOT a catalog fallback (see the
+        # comment in routes/products.py): it's entered at the point of
+        # checkout because it can change sale to sale. A sale item with no
+        # unit_price must be rejected, not silently priced from the catalog.
+        payload = {"id": "sale-no-price", "device_id": "device-a", "customer_name": "Alice", "items": [{"product_id": 10, "quantity": 1}]}
 
-        result, created = self.service.create_sale(payload)
-
-        self.assertTrue(created)
-        self.assertEqual(result["sale"]["total_amount"], "10.00")
-        self.assertEqual(result["items"][0]["unit_price"], "10.00")
+        with self.assertRaises(ValueError) as ctx:
+            self.service.create_sale(payload)
+        self.assertIn("Selling price is required", str(ctx.exception))
 
     def test_duplicate_sale_is_idempotent_and_stock_is_not_deducted_twice(self):
         headers = {"Authorization": f"Bearer {self.token}"}

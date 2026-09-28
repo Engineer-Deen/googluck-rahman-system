@@ -453,6 +453,8 @@ async function retryProvisioning() {
 }
 
 async function doLogout() {
+  const btn = document.getElementById("logout-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "LOGGING OUT..."; }
   try {
     if (authToken) await api("/auth/logout", { method: "POST" });
   } catch (_) {}
@@ -463,6 +465,7 @@ async function doLogout() {
   lastSyncSnapshot = { key: null, pending: 0 };
   lastSyncToastMsg = "";
   lastSyncToastAt = 0;
+  lastPullChangedAt = null;
   authToken = null;
   currentStaff = null;
   localStorage.removeItem("glr_token");
@@ -474,6 +477,12 @@ async function doLogout() {
   renderSaleCart();
   document.getElementById("app").classList.remove("visible");
   document.getElementById("login-overlay").style.display = "flex";
+
+  // Reset for next time -- this element persists across the login/logout
+  // cycle (it's not recreated), so without this it would still show
+  // "LOGGING OUT..." disabled the next time this person's session reaches
+  // the logged-in screen again.
+  if (btn) { btn.disabled = false; btn.textContent = "LOGOUT"; }
 
   // Move the theme toggle back to its floating position over the login
   // screen, since the header it was living in is no longer visible.
@@ -592,7 +601,7 @@ function showPanel(name, options = {}) {
   if (name === "sales") loadSalesPanel();
   if (name === "payments") loadPaymentDesk();
   if (name === "inventory") loadInventoryPanel();
-  if (name === "history") loadHistory("today");
+  if (name === "history") loadHistory(currentHistoryPeriod, document.getElementById("history-search").value.trim());
   if (name === "staff") loadStaffPanel();
   if (name === "audit") loadAuditLog();
   if (name === "settings") loadSystemSettings();
@@ -601,6 +610,58 @@ function showPanel(name, options = {}) {
 async function refreshAll() {
   await loadProducts();
   loadDashboard();
+}
+
+function canSilentlyRefreshPanel(name) {
+  // A background refresh must never clobber something the person is in the
+  // middle of entering. Each of these reloads a dropdown or closes a card
+  // unconditionally, so if there's a sign of unsaved, in-progress work on
+  // this specific panel, skip this cycle's refresh entirely -- the data
+  // will still catch up next time they navigate away and back, or on a
+  // later cycle once they're done.
+  if (name === "sales") {
+    const productSelected = document.getElementById("s-product").value !== "";
+    return saleCart.length === 0 && !productSelected;
+  }
+  if (name === "payments") {
+    const payCardOpen = document.getElementById("pd-pay-card").style.display !== "none";
+    return !payCardOpen;
+  }
+  if (name === "inventory") {
+    const restockSelected = document.getElementById("r-product").value !== "";
+    return !restockSelected;
+  }
+  if (name === "staff") {
+    const editing = document.getElementById("staff-edit-card").style.display !== "none";
+    const resetting = document.getElementById("st-reset-card").style.display !== "none";
+    return !editing && !resetting;
+  }
+  if (name === "settings") {
+    const pinTyped = document.getElementById("setting-pin").value.trim() !== "";
+    const timeoutChanged = document.getElementById("setting-timeout").value !== String(systemSettingsCache.timeoutMinutes);
+    const fullLoginChanged = document.getElementById("setting-full-login").value !== String(systemSettingsCache.fullLoginHours);
+    return !pinTyped && !timeoutChanged && !fullLoginChanged;
+  }
+  return true;
+}
+
+function silentlyRefreshActivePanel() {
+  // Called after the connection comes back, or after a routine background
+  // pull brings in a real change from another device -- re-fetch whatever
+  // the person is currently looking at, without touching which tab is open
+  // or any in-progress form input.
+  if (!authToken || !currentStaff) return;
+  const activeTab = document.querySelector(".nav-tab.active");
+  const name = activeTab && activeTab.dataset.panel;
+  if (name && canSilentlyRefreshPanel(name)) showPanel(name, { restore: true });
+}
+
+function updateOfflineBanner() {
+  const banner = document.getElementById("offline-banner");
+  if (!banner) return;
+  const offline = !navigator.onLine;
+  banner.hidden = !offline;
+  document.body.classList.toggle("is-offline", offline);
 }
 
 // ---------- inventory management ----------
@@ -778,6 +839,7 @@ async function submitProductForm() {
 }
 
 async function toggleInventoryProductState(productId, makeActive) {
+  const btn = window.event && window.event.target;
   try {
     const reasons = makeActive ? PRODUCT_REACTIVATE_REASONS : PRODUCT_DEACTIVATE_REASONS;
     const reason = await openReasonModal(
@@ -785,6 +847,7 @@ async function toggleInventoryProductState(productId, makeActive) {
       reasons,
     );
     if (!reason) return;
+    if (btn) { btn.disabled = true; btn.textContent = makeActive ? "REACTIVATING..." : "DEACTIVATING..."; }
     await api(`/products/${productId}`, {
       method: "PUT",
       body: JSON.stringify({
@@ -797,15 +860,18 @@ async function toggleInventoryProductState(productId, makeActive) {
     await loadInventoryPanel();
   } catch (err) {
     toast(err.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = makeActive ? "REACTIVATE" : "DEACTIVATE"; }
   }
 }
 
 async function deleteInventoryProduct(productId) {
+  const btn = window.event && window.event.target;
   const product = productsCache.find((p) => Number(p.id) === Number(productId));
   const productName = product ? product.name : `Product #${productId}`;
   const reason = await openReasonModal(`Why are you deleting ${productName}?`, PRODUCT_DELETE_REASONS);
   if (!reason) return;
 
+  if (btn) { btn.disabled = true; btn.textContent = "DELETING..."; }
   try {
     await api(`/products/${productId}`, {
       method: "DELETE",
@@ -816,6 +882,7 @@ async function deleteInventoryProduct(productId) {
     await loadInventoryPanel();
   } catch (err) {
     toast(err.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = "DELETE"; }
   }
 }
 
@@ -833,6 +900,9 @@ async function submitRestock() {
     return;
   }
 
+  const btn = document.getElementById("restock-apply-btn");
+  btn.disabled = true;
+  btn.textContent = "APPLYING...";
   try {
     await api("/stock-movements", {
       method: "POST",
@@ -849,6 +919,9 @@ async function submitRestock() {
     await loadInventoryPanel();
   } catch (err) {
     toast(err.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "APPLY";
   }
 }
 
@@ -983,6 +1056,7 @@ function closeReasonModal(value) {
   if (reasonResolver) { const resolve = reasonResolver; reasonResolver = null; resolve(value); }
 }
 async function editSale(saleId) {
+  const btn = window.event && window.event.target;
   try {
     const sale = await api(`/sales/${saleId}`);
     const customer = prompt("Customer name:", sale.customer_name || "");
@@ -997,17 +1071,23 @@ async function editSale(saleId) {
     }
     const reason = await openReasonModal("Why are you correcting this sale?", ["Wrong product or quantity entered", "Wrong price entered", "Customer information correction", "Payment correction", "Other approved reason"]);
     if (!reason) return;
+    if (btn) { btn.disabled = true; btn.textContent = "SAVING..."; }
     await api(`/sales/${saleId}`, { method: "PUT", body: JSON.stringify({ customer_name: customer.trim(), payment_method: sale.payment_method, items, reason }) });
     toast("Sale updated and audit recorded.", "success");
     await loadProducts();
     await loadDashboard();
     await loadHistory(currentHistoryPeriod);
-  } catch (err) { toast(err.message, "error"); }
+  } catch (err) {
+    toast(err.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = "EDIT"; }
+  }
 }
 
 async function voidSale(saleId) {
+  const btn = window.event && window.event.target;
   const reason = await openReasonModal("Why are you deleting/voiding this sale?");
   if (!reason) return;
+  if (btn) { btn.disabled = true; btn.textContent = "VOIDING..."; }
   try {
     const result = await api(`/sales/${saleId}/void`, {
       method: "POST",
@@ -1027,6 +1107,7 @@ async function voidSale(saleId) {
     if (document.getElementById("panel-sales").classList.contains("active")) renderSessionTable();
   } catch (err) {
     toast(err.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = "DELETE"; }
   }
 }
 
@@ -1587,6 +1668,9 @@ async function saveStaffEdit() {
     return;
   }
 
+  const btn = document.getElementById("st-save-edit-btn");
+  btn.disabled = true;
+  btn.textContent = "SAVING...";
   try {
     await api(`/staff/${editingStaffId}`, {
       method: "PUT",
@@ -1601,6 +1685,9 @@ async function saveStaffEdit() {
     await loadStaffPanel();
   } catch (err) {
     toast(err.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "SAVE CHANGES";
   }
 }
 
@@ -1613,6 +1700,9 @@ async function createStaff() {
   if (!name || !email) { toast("Enter a name and email.", "error"); return; }
   if (password.length < 6) { toast("Password must be at least 6 characters.", "error"); return; }
 
+  const btn = document.getElementById("st-create-btn");
+  btn.disabled = true;
+  btn.textContent = "CREATING...";
   try {
     await api("/staff", {
       method: "POST",
@@ -1625,6 +1715,9 @@ async function createStaff() {
     await loadStaffPanel();
   } catch (err) {
     toast(err.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "CREATE ACCOUNT";
   }
 }
 
@@ -1633,12 +1726,18 @@ async function createAdminAccount() {
   const email = document.getElementById("ad-email").value.trim();
   const password = document.getElementById("ad-password").value;
   if (!name || !email || password.length < 6) { toast("Enter a name, valid email and password of at least 6 characters.", "error"); return; }
+  const btn = document.getElementById("ad-register-btn");
+  btn.disabled = true;
+  btn.textContent = "REGISTERING...";
   try {
     await api("/staff/admins", { method: "POST", body: JSON.stringify({ name, email, password }) });
     toast("Administrator account created.", "success");
     document.getElementById("ad-name").value = ""; document.getElementById("ad-email").value = ""; document.getElementById("ad-password").value = "";
     await loadStaffPanel();
-  } catch (err) { toast(err.message, "error"); }
+  } catch (err) { toast(err.message, "error"); } finally {
+    btn.disabled = false;
+    btn.textContent = "REGISTER ADMIN";
+  }
 }
 
 function startPasswordReset(staffId) {
@@ -1661,6 +1760,9 @@ async function submitPasswordReset() {
   const newPassword = document.getElementById("st-reset-password").value;
   if (newPassword.length < 6) { toast("Password must be at least 6 characters.", "error"); return; }
 
+  const btn = document.getElementById("st-reset-submit-btn");
+  btn.disabled = true;
+  btn.textContent = "SAVING...";
   try {
     await api(`/staff/${resetPasswordStaffId}/reset-password`, {
       method: "POST",
@@ -1670,10 +1772,15 @@ async function submitPasswordReset() {
     cancelPasswordReset();
   } catch (err) {
     toast(err.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "SET NEW PASSWORD";
   }
 }
 
 async function toggleStaffActive(staffId, makeActive) {
+  const btn = window.event && window.event.target;
+  if (btn) { btn.disabled = true; btn.textContent = makeActive ? "REACTIVATING..." : "DEACTIVATING..."; }
   try {
     await api(`/staff/${staffId}`, {
       method: "PUT",
@@ -1683,6 +1790,7 @@ async function toggleStaffActive(staffId, makeActive) {
     await loadStaffPanel();
   } catch (err) {
     toast(err.message, "error");
+    if (btn) { btn.disabled = false; btn.textContent = makeActive ? "REACTIVATE" : "DEACTIVATE"; }
   }
 }
 
@@ -1785,6 +1893,9 @@ async function unlockAdminSession() {
   const entered = document.getElementById("admin-lock-pin").value.trim();
   const errorEl = document.getElementById("admin-lock-error");
   if (!systemSettingsCache.pinConfigured) { errorEl.textContent = "No quick PIN is configured. Use FULL LOGIN."; return; }
+  const btn = document.getElementById("admin-unlock-btn");
+  btn.disabled = true;
+  btn.textContent = "UNLOCKING...";
   try {
     await api("/auth/verify-pin", { method: "POST", body: JSON.stringify({ pin: entered }) });
     adminLocked = false;
@@ -1795,6 +1906,9 @@ async function unlockAdminSession() {
   } catch (e) {
     errorEl.textContent = e.message;
     if (/fresh|sign in again|three incorrect|disabled/i.test(e.message)) forceAdminLogin();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "UNLOCK";
   }
 }
 function forceAdminLogin() {
@@ -1913,6 +2027,7 @@ async function loadShopBranding(){
 
 let syncPollTimer = null;
 let syncRequestInFlight = false;
+let lastPullChangedAt = null;
 
 function getDesktopPlatformLabel() {
   const ua = navigator.userAgent || "";
@@ -2036,6 +2151,20 @@ async function pollSyncStatus() {
   if (!authToken) return;
   try {
     const data = await api("/sync/status");
+
+    // A background pull on this device just merged in a real change --
+    // stock the owner added, a new product, a staff update, etc. -- from
+    // Firestore, whether it came from another PC or from this same one.
+    // Silently re-fetch whatever's currently on screen so it shows up
+    // without the person needing to log out and back in or hit refresh.
+    // Only fires once the very first status poll has established a
+    // baseline, so loading the app doesn't immediately re-fetch a panel
+    // it just fetched a moment ago.
+    if (data.mode === "local" && data.last_pull_changed_at) {
+      const isFirstCheck = lastPullChangedAt === null;
+      if (!isFirstCheck && data.last_pull_changed_at !== lastPullChangedAt) silentlyRefreshActivePanel();
+      lastPullChangedAt = data.last_pull_changed_at;
+    }
 
     const pending = Number(data.pending_count || 0);
     const pendingSummary = formatPendingSummary(data.pending_by_table, pending);
@@ -2384,6 +2513,7 @@ function scheduleAppUpdateCheck() {
 
 // ---------- boot ----------
 (async function boot() {
+  updateOfflineBanner();
   const syncDot = document.getElementById("sync-dot");
   const syncLabel = document.getElementById("sync-label");
   if (syncLabel) syncLabel.textContent = "Starting local POS server...";
@@ -2426,12 +2556,18 @@ function scheduleAppUpdateCheck() {
   loadProvisioningStatus();
   scheduleAppUpdateCheck();
   window.addEventListener("online", async () => {
+    updateOfflineBanner();
     if (authToken && currentStaff) {
       try {
         await ensureDeviceRegistration();
       } catch (_) {}
+      // Connection just came back -- quietly bring whatever's on screen
+      // up to date instead of leaving stale, possibly-offline data showing
+      // until the person happens to click something themselves.
+      silentlyRefreshActivePanel();
     }
   });
+  window.addEventListener("offline", updateOfflineBanner);
   document.getElementById("login-password").addEventListener("keydown", (e) => {
     if (e.key === "Enter") doLogin();
   });

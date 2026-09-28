@@ -31,6 +31,12 @@ class CriticalBoundaryTests(unittest.TestCase):
             GLR_MODE="local",
             JWT_SECRET_KEY="test-secret",
             DEVICE_ID_FILE=Path("device-id.txt"),
+            # Needed for the local-mode login path (_authenticate_against_central)
+            # to build a request URL at all. The tests that log in this way mock
+            # requests.post itself, so the real value is never actually used --
+            # it just has to be a non-empty string so login doesn't 500 before
+            # ever reaching that mock.
+            CENTRAL_SYNC_URL="https://central.test",
         )
         db.init_app(self.app)
         self.app.register_blueprint(auth_bp)
@@ -372,13 +378,29 @@ class CriticalBoundaryTests(unittest.TestCase):
             self.assertIsNone(db.session.get(Sale, "pending-sale").invoice_number)
 
     def test_existing_tokens_revalidate_employee_state_and_logout(self):
+        from app.auth import _session_cache, _session_key
+
+        def _expire_cached_session(token):
+            # Simulate SESSION_REVALIDATE_SECONDS having elapsed, so the next
+            # request is due for a central re-check -- revalidation is
+            # deliberately NOT instant on every request (that would turn
+            # ordinary local use into constant central/Firestore traffic),
+            # so exercising it here means moving the clock forward rather
+            # than expecting the very next request to already trigger it.
+            with self.app.app_context():
+                entry = _session_cache()[_session_key(token)]
+                entry["checked_at"] -= 999
+
         client, headers = self._cashier_client()
         self.assertEqual(headers["Authorization"], "Bearer central-1")
+        token = headers["Authorization"].split(" ", 1)[1]
+        _expire_cached_session(token)
         with patch("app.auth.requests.get", return_value=Mock(status_code=401)):
             self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
 
         client, headers = self._cashier_client()
-
+        token = headers["Authorization"].split(" ", 1)[1]
+        _expire_cached_session(token)
         with patch("app.auth.requests.get", return_value=Mock(status_code=200)) as session_get:
             session_get.return_value.json.return_value = {
                 "id": 1, "name": "Cashier One", "email": "one@critical.test",
@@ -387,6 +409,8 @@ class CriticalBoundaryTests(unittest.TestCase):
             self.assertEqual(client.get("/api/products", headers=headers).status_code, 200)
 
         client, headers = self._cashier_client()
+        token = headers["Authorization"].split(" ", 1)[1]
+        _expire_cached_session(token)
         with patch("app.auth.requests.get", return_value=Mock(status_code=200)) as session_get:
             session_get.return_value.json.return_value = {
                 "id": 1, "name": "Cashier One", "email": "one@critical.test",
@@ -394,12 +418,23 @@ class CriticalBoundaryTests(unittest.TestCase):
             }
             self.assertEqual(client.get("/api/shop", headers=headers).status_code, 200)
 
+        # Logout takes effect immediately regardless of the revalidation
+        # interval -- it clears the local cache entry directly rather than
+        # waiting for a central re-check to notice anything.
         client, headers = self._cashier_client()
         with patch("app.routes.auth.requests.post", return_value=Mock(status_code=200)):
             logout = client.post("/api/auth/logout", headers=headers)
         self.assertEqual(logout.status_code, 200)
         with patch("app.auth.requests.get", return_value=Mock(status_code=401)):
             self.assertEqual(client.get("/api/products", headers=headers).status_code, 401)
+
+        # And within the revalidation window, no central call happens at all
+        # -- the whole point of the interval. A freshly logged-in session,
+        # with no expiry simulated, must not hit central just to view products.
+        client, headers = self._cashier_client()
+        with patch("app.auth.requests.get") as session_get:
+            self.assertEqual(client.get("/api/products", headers=headers).status_code, 200)
+        session_get.assert_not_called()
 
     def test_sync_pull_does_not_invalidate_active_tokens_on_noop_staff_updates(self):
         self.app.config["CENTRAL_SYNC_URL"] = "http://central.test"
