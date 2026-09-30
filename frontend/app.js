@@ -677,6 +677,7 @@ async function loadInventoryPanel() {
     productsLoadedAt = Date.now();
 
     const restockSelect = document.getElementById("r-product");
+    const previousRestockSelection = restockSelect.value;
     restockSelect.innerHTML = '<option value="">Select product</option>';
     products.forEach((product) => {
       const option = document.createElement("option");
@@ -684,6 +685,13 @@ async function loadInventoryPanel() {
       option.textContent = `${product.name} (${product.stock})`;
       restockSelect.appendChild(option);
     });
+    // Same reasoning as loadSalesPanel's product select: a rebuild must not
+    // silently drop a selection the person is actively using, even if
+    // canSilentlyRefreshPanel should already be skipping this call while
+    // one is selected.
+    if (previousRestockSelection && restockSelect.querySelector(`option[value="${previousRestockSelection}"]`)) {
+      restockSelect.value = previousRestockSelection;
+    }
 
     const canManageCatalog = currentStaff && FINANCE_ROLES.includes(currentStaff.role);
     const costHeader = document.getElementById("inventory-cost-header");
@@ -1116,6 +1124,13 @@ async function voidSale(saleId) {
 async function loadSalesPanel() {
   await loadProducts();
   const select = document.getElementById("s-product");
+  // Preserve whatever is currently selected across this rebuild. This
+  // matters regardless of what triggered the rebuild -- canSilentlyRefreshPanel
+  // is meant to skip this call entirely while a product is selected, but a
+  // dropdown that resets someone's in-progress pick the moment anything
+  // refreshes it is fragile by nature, so the rebuild itself must not lose
+  // a still-valid selection even if it does run.
+  const previousSelection = select.value;
   select.innerHTML = '<option value="">Select product</option>';
   // Out-of-stock products don't appear here at all -- there's nothing
   // to sell, so nothing to pick. The backend independently enforces
@@ -1130,6 +1145,22 @@ async function loadSalesPanel() {
     opt.dataset.costPrice = p.cost_price ?? "";
     select.appendChild(opt);
   });
+  if (previousSelection && select.querySelector(`option[value="${previousSelection}"]`)) {
+    // Restore the selection and its matching cost/stock display -- but
+    // deliberately NOT via onSaleProductChange(), which clears the price
+    // field on every product change. That's correct for a person actually
+    // switching products, but this is a rebuild restoring the same one, and
+    // the whole point is to not disturb a price they may have already typed.
+    select.value = previousSelection;
+    const opt = select.selectedOptions[0];
+    const costField = document.getElementById("s-cost-price");
+    if (costField) {
+      const cost = Number(opt.dataset.costPrice);
+      costField.value = Number.isFinite(cost) ? money(cost) : "Not available";
+    }
+    document.getElementById("s-stock-count").textContent = opt.dataset.stock;
+    document.getElementById("s-stock-card").style.display = "flex";
+  }
   renderSessionTable();
 }
 

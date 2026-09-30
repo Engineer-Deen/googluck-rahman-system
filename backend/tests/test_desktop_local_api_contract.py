@@ -156,6 +156,30 @@ class DesktopLocalApiContractTests(unittest.TestCase):
         self.assertIn("yesterday", body)
         self.assertIn("daysAgo", body)
 
+    def test_product_dropdowns_preserve_selection_across_a_rebuild(self):
+        """loadSalesPanel and loadInventoryPanel rebuild their product
+        dropdown's <option> list from scratch on every call -- including
+        calls that happen while the person has one selected and is filling
+        in the rest of the form. If the rebuild doesn't explicitly restore
+        the previous selection, any refresh (the routine background sync,
+        the status poll, a manual SYNC NOW) drops them back to "Select
+        product" out from under an in-progress sale or restock entry."""
+        script = FRONTEND_APP_JS.read_text(encoding="utf-8")
+
+        sales_body = script[script.index("async function loadSalesPanel"):script.index("function getSaleCartTotal")]
+        self.assertIn("previousSelection", sales_body)
+        self.assertIn('select.value = previousSelection', sales_body)
+        # Restoring must not go through onSaleProductChange(), which clears
+        # the price field on every product change -- correct when someone
+        # is actually switching products, wrong when merely restoring the
+        # same one after a rebuild (that would just move the bug from
+        # "selection resets" to "price resets" instead of fixing it).
+        self.assertNotIn("select.value = previousSelection;\n    onSaleProductChange()", sales_body)
+
+        inventory_body = script[script.index("async function loadInventoryPanel"):script.index("async function editProduct")]
+        self.assertIn("previousRestockSelection", inventory_body)
+        self.assertIn("restockSelect.value = previousRestockSelection", inventory_body)
+
     def test_tauri_surfaces_sidecar_spawn_errors(self):
         text = TAURI_LIB.read_text(encoding="utf-8")
         self.assertIn("fn glr_local_backend_status", text)
