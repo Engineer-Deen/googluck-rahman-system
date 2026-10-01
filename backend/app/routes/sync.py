@@ -766,7 +766,24 @@ def status():
     from flask import current_app
 
     pending = SyncOutboxItem.query.filter_by(status="pending").count() if current_app.config["GLR_MODE"] == "local" else 0
-    needs_review = SyncOutboxItem.query.filter_by(status="needs_review").count() if current_app.config["GLR_MODE"] == "local" else 0
+    needs_review_items_query = (
+        SyncOutboxItem.query.filter_by(status="needs_review").order_by(SyncOutboxItem.created_at.desc())
+        if current_app.config["GLR_MODE"] == "local" else None
+    )
+    needs_review = needs_review_items_query.count() if needs_review_items_query is not None else 0
+    # The count alone ("1 item needs review") doesn't tell the owner what
+    # actually happened or which sale it was -- e.g. two devices both
+    # selling the last unit of something while offline, where only one sale
+    # can be honored. Include the actual reason so this is a real notice,
+    # not just a number to be curious about.
+    needs_review_items = [
+        {
+            "table_name": item.table_name,
+            "record_id": item.record_id,
+            "reason": item.last_error,
+        }
+        for item in (needs_review_items_query.limit(20).all() if needs_review_items_query is not None else [])
+    ]
     device_id = get_current_device_id() if current_app.config["GLR_MODE"] == "local" else None
 
     states = {s.key: s.value for s in SyncState.query.all()} if current_app.config["GLR_MODE"] == "local" else {}
@@ -797,6 +814,7 @@ def status():
         pending_count=pending,
         pending_by_table=pending_by_table,
         needs_review_count=needs_review,
+        needs_review_items=needs_review_items,
         device_id=device_id,
         last_sync_at=states.get("last_sync_at"),
         last_sync_error=last_sync_error,

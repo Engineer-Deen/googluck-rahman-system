@@ -875,70 +875,120 @@ class FirestoreSyncService:
                 item["product_id"]: self._require_product_document(item["product_id"])
                 for item in items
             }
+            shop_id = self._device_value(device, "shop_id")
+            device_id = self._device_value(device, "id")
 
-            invoice = payload.get("invoice_number") or self._allocate_invoice(payload)
-            sale = {
-                "id": sale_id,
-                "shop_id": self._device_value(device, "shop_id"),
-                "device_id": self._device_value(device, "id"),
-                "staff_id": payload.get("staff_id"),
-                "customer_name": payload.get("customer_name"),
-                "payment_method": payload.get("payment_method", "cash"),
-                "total_amount": str(payload.get("total_amount", "0")),
-                "invoice_number": invoice,
-                "created_at": payload.get("created_at") or _utcnow(),
-                "updated_at": _utcnow(),
-                "server_received_at": _utcnow(),
-            }
-            batch = self.client.batch()
-            batch.set(sale_ref, sale, merge=True)
+            # Two devices can each independently sell the last unit of the
+            # same product while both offline -- their queued sales look
+            # fine locally (each device only knows its own count at the
+            # time), but only one can actually be honored once both reach
+            # central. Whichever push gets here and commits first wins;
+            # the other is rejected with a clear "already sold elsewhere"
+            # reason instead of silently taking stock negative. This has to
+            # be a transaction, not a plain read-then-write: two pushes for
+            # the same product can arrive at the same moment (separate
+            # requests, possibly separate server processes), and only a
+            # transaction gives Firestore's own serialization -- whichever
+            # commits second sees the first's write and is forced to
+            # re-evaluate, rather than both independently reading "1
+            # available" and both deciding they're fine to proceed.
+            requested_totals: dict[int, int] = {}
             for item in items:
-                item_id = item.get("id") or f"{sale_id}:{item['product_id']}"
-                product_data = product_data_by_id[item["product_id"]]
-                quantity = int(item["quantity"])
-                unit_price = Decimal(str(item.get("unit_price", product_data.get("unit_price", "0"))))
-                batch.set(
-                    self._collection("sale_items").document(item_id),
-                    {
-                        **item,
-                        "id": item_id,
-                        "sale_id": sale_id,
-                        "unit_price": str(unit_price),
-                        "subtotal": str((unit_price * quantity).quantize(Decimal("0.01"))),
-                        "unit_cost": str(item.get("unit_cost", product_data.get("cost_price", "0"))),
-                    },
-                    merge=True,
-                )
-            if payload.get("amount_paid") not in (None, 0, "0", "0.00"):
-                payment_id = payload.get("payment_id") or f"{sale_id}:initial-payment"
-                batch.set(self._collection("sale_payments").document(payment_id), {
-                    "id": payment_id,
-                    "sale_id": sale_id,
-                    "shop_id": self._device_value(device, "shop_id"),
-                    "amount": str(payload["amount_paid"]),
-                    "device_id": self._device_value(device, "id"),
+                requested_totals[item["product_id"]] = requested_totals.get(item["product_id"], 0) + int(item["quantity"])
+            product_ids = sorted(requested_totals)
+
+            invoice_holder = self._allocate_invoice(payload) if not payload.get("invoice_number") else None
+            transaction = self.client.transaction()
+
+            @transactional
+            def create(transaction):
+                sale_snapshot = _transaction_get(transaction, sale_ref)
+                if sale_snapshot and sale_snapshot.exists:
+                    return sale_snapshot.to_dict() or {}
+
+                available: dict[int, int] = {}
+                for start in range(0, len(product_ids), 30):  # Firestore `in` limit
+                    chunk = product_ids[start:start + 30]
+                    query = self._collection("stock_movements").where("product_id", "in", chunk)
+                    for snapshot in transaction.get(query):
+                        movement = snapshot.to_dict() or {}
+                        p_id = movement.get("product_id")
+                        if p_id is None or movement.get("shop_id") != shop_id:
+                            continue
+                        p_id = int(p_id)
+                        available[p_id] = available.get(p_id, 0) + int(movement.get("quantity_delta", 0) or 0)
+                for product_id, quantity in requested_totals.items():
+                    if quantity > available.get(product_id, 0):
+                        name = product_data_by_id[product_id].get("name", product_id)
+                        raise ValueError(
+                            f"This sale could not be completed: {name} was already sold in "
+                            f"another sale (only {available.get(product_id, 0)} left, {quantity} requested)."
+                        )
+
+                invoice = payload.get("invoice_number") or invoice_holder
+                sale = {
+                    "id": sale_id,
+                    "shop_id": shop_id,
+                    "device_id": device_id,
                     "staff_id": payload.get("staff_id"),
-                    "created_at": _utcnow(),
+                    "customer_name": payload.get("customer_name"),
+                    "payment_method": payload.get("payment_method", "cash"),
+                    "total_amount": str(payload.get("total_amount", "0")),
+                    "invoice_number": invoice,
+                    "created_at": payload.get("created_at") or _utcnow(),
                     "updated_at": _utcnow(),
-                }, merge=True)
+                    "server_received_at": _utcnow(),
+                }
+                transaction.set(sale_ref, sale, merge=True)
+                for item in items:
+                    item_id = item.get("id") or f"{sale_id}:{item['product_id']}"
+                    product_data = product_data_by_id[item["product_id"]]
+                    quantity = int(item["quantity"])
+                    unit_price = Decimal(str(item.get("unit_price", product_data.get("unit_price", "0"))))
+                    transaction.set(
+                        self._collection("sale_items").document(item_id),
+                        {
+                            **item,
+                            "id": item_id,
+                            "sale_id": sale_id,
+                            "unit_price": str(unit_price),
+                            "subtotal": str((unit_price * quantity).quantize(Decimal("0.01"))),
+                            "unit_cost": str(item.get("unit_cost", product_data.get("cost_price", "0"))),
+                        },
+                        merge=True,
+                    )
+                if payload.get("amount_paid") not in (None, 0, "0", "0.00"):
+                    payment_id = payload.get("payment_id") or f"{sale_id}:initial-payment"
+                    transaction.set(self._collection("sale_payments").document(payment_id), {
+                        "id": payment_id,
+                        "sale_id": sale_id,
+                        "shop_id": shop_id,
+                        "amount": str(payload["amount_paid"]),
+                        "device_id": device_id,
+                        "staff_id": payload.get("staff_id"),
+                        "created_at": _utcnow(),
+                        "updated_at": _utcnow(),
+                    }, merge=True)
+                for item in items:
+                    movement_id = item.get("stock_movement_id") or f"{sale_id}:{item['product_id']}:sale"
+                    transaction.set(self._collection("stock_movements").document(movement_id), {
+                        "id": movement_id,
+                        "product_id": item["product_id"],
+                        "shop_id": shop_id,
+                        "device_id": device_id,
+                        "quantity_delta": -int(item["quantity"]),
+                        "reason": "sale",
+                        "reference_id": sale_id,
+                        "created_at": _utcnow(),
+                        "updated_at": _utcnow(),
+                    }, merge=True)
+                return sale
+
+            sale = create(transaction)
             for item in items:
-                movement_id = item.get("stock_movement_id") or f"{sale_id}:{item['product_id']}:sale"
-                batch.set(self._collection("stock_movements").document(movement_id), {
-                    "id": movement_id,
-                    "product_id": item["product_id"],
-                    "shop_id": self._device_value(device, "shop_id"),
-                    "device_id": self._device_value(device, "id"),
-                    "quantity_delta": -int(item["quantity"]),
-                    "reason": "sale",
-                    "reference_id": sale_id,
-                    "created_at": _utcnow(),
-                    "updated_at": _utcnow(),
-                }, merge=True)
-            batch.commit()
-            for item in items:
-                self._mark_product_shop(item["product_id"], self._device_value(device, "shop_id"))
-            self._touch_sync_marker(self._device_value(device, "shop_id"))
-            return {"invoice_number": invoice}
+                self._mark_product_shop(item["product_id"], shop_id)
+            self._touch_sync_marker(shop_id)
+            return {"invoice_number": sale.get("invoice_number")}
 
         if table_name == "sale_payments":
             sale = self._collection("sales").document(str(payload["sale_id"])).get()

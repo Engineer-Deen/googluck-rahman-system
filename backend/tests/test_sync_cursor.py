@@ -6,7 +6,7 @@ from unittest.mock import patch
 from flask import Flask
 
 from app.extensions import db
-from app.models import Device, Product, Shop, Staff, StockMovement, SyncState
+from app.models import Device, Product, Shop, Staff, StockMovement, SyncOutboxItem, SyncState
 from app.routes.sync import sync_bp
 from app.sync.worker import LAST_PULL_KEY, pull_reference_data_once
 
@@ -311,6 +311,32 @@ class SyncCursorTests(unittest.TestCase):
                 if t.name == "glr-full-sync":
                     t.join(timeout=3)
         pull.assert_called()
+
+    def test_sync_status_reports_the_actual_reason_for_a_flagged_item(self):
+        """A bare "1 item needs review" tells the owner nothing actionable.
+        /api/sync/status must include the real reason (e.g. a sale rejected
+        because the stock was already sold on another device), not just a
+        count, so the frontend can show it instead of a mystery number."""
+        from app.auth import register_local_session
+
+        with self.app.app_context():
+            db.session.add(SyncOutboxItem(
+                id=1, table_name="sales", record_id="sale-seller-pc", status="needs_review",
+                payload_json="{}",
+                last_error="This sale could not be completed: A200 was already sold in another sale (only 0 left, 1 requested).",
+            ))
+            db.session.commit()
+            register_local_session("status-token", {"id": 1, "role": "owner", "shop_id": 1, "is_active": True})
+
+        response = self.app.test_client().get(
+            "/api/sync/status", headers={"Authorization": "Bearer status-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["needs_review_count"], 1)
+        self.assertEqual(len(data["needs_review_items"]), 1)
+        self.assertEqual(data["needs_review_items"][0]["record_id"], "sale-seller-pc")
+        self.assertIn("already sold in another sale", data["needs_review_items"][0]["reason"])
 
     def test_worker_prefers_next_cursor_over_legacy_server_time(self):
         response = _Response({

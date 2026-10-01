@@ -237,6 +237,9 @@ class FirestoreProviderFailureTests(unittest.TestCase):
             db.engine.dispose()
 
     def test_firestore_push_idempotent_under_retry(self):
+        self.client.collections["stock_movements"]["seed-10"] = {
+            "id": "seed-10", "product_id": 10, "shop_id": 1, "quantity_delta": 5,
+        }
         payload = {
             "id": "sale-retry",
             "shop_id": 1,
@@ -258,7 +261,9 @@ class FirestoreProviderFailureTests(unittest.TestCase):
         self.assertEqual(first.get_json()["results"][0]["invoice_number"], second.get_json()["results"][0]["invoice_number"])
         self.assertEqual(len(self.client.collections["sales"]), 1)
         self.assertEqual(len(self.client.collections["sale_items"]), 1)
-        self.assertEqual(len(self.client.collections["stock_movements"]), 1)
+        # 2, not 1: the stock seed this test adds, plus the sale's own single
+        # movement (the retry is idempotent, so it does not add a second).
+        self.assertEqual(len(self.client.collections["stock_movements"]), 2)
 
     def test_firestore_unavailable_on_pull_returns_503_without_false_success(self):
         class BoomService:

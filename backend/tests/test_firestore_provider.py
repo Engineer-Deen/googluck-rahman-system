@@ -176,6 +176,13 @@ class FakeTransaction:
         self._lock.release()
 
     def get(self, ref):
+        # A real Firestore transaction accepts either a document reference
+        # (single get()) or a query (stream() of matching documents) -- this
+        # fake previously only ever needed the document case, since nothing
+        # called transaction.get() with a query before push_item's stock
+        # check started doing so.
+        if hasattr(ref, "stream") and not hasattr(ref, "get"):
+            return list(ref.stream())
         return ref.get()
 
     def set(self, ref, data, merge=False):
@@ -256,6 +263,9 @@ class FirestoreAdapterTests(unittest.TestCase):
         self.assertEqual(service._allocate_product_id(), 2)
 
     def test_firestore_adapter_creates_sales_documents_and_initial_payment(self):
+        self.client.collections["stock_movements"]["seed-10"] = {
+            "id": "seed-10", "product_id": 10, "shop_id": 1, "quantity_delta": 5,
+        }
         payload = {
             "id": "sale-1",
             "shop_id": 1,
@@ -281,6 +291,9 @@ class FirestoreAdapterTests(unittest.TestCase):
         self.assertIn(1, self.client.collections["products"]["10"]["shop_ids"])
 
     def test_firestore_adapter_is_idempotent_for_duplicate_sale_push(self):
+        self.client.collections["stock_movements"]["seed-10"] = {
+            "id": "seed-10", "product_id": 10, "shop_id": 1, "quantity_delta": 5,
+        }
         payload = {
             "id": "sale-1",
             "shop_id": 1,
@@ -302,7 +315,52 @@ class FirestoreAdapterTests(unittest.TestCase):
         self.assertEqual(len(self.client.collections["sale_items"]), 1)
         self.assertEqual(len(self.client.collections["sales"]), 1)
 
+    def test_two_devices_selling_the_last_unit_offline_only_one_sale_wins(self):
+        """The exact real-world scenario: two PCs (owner and seller) both go
+        offline, each independently sells the last unit of the same product
+        (each device only knows its own locally-cached stock count at the
+        time, so both succeed locally), then both reconnect and push. Only
+        one sale can actually be honored -- the other must be rejected with
+        a clear reason, not silently accepted, which would take stock
+        negative and record two sales for one unit that only existed once."""
+        self.client.collections["stock_movements"]["seed-10"] = {
+            "id": "seed-10", "product_id": 10, "shop_id": 1, "quantity_delta": 1,
+        }
+        device_b = type("DeviceLike", (), {"id": "device-b", "shop_id": 1})()
+
+        payload_from_owner_pc = {
+            "id": "sale-owner-pc", "shop_id": 1, "device_id": "device-a", "staff_id": 1,
+            "customer_name": "Owner Sale", "created_at": "2026-01-01T01:00:00+00:00",
+            "items": [{"id": "item-owner-pc", "product_id": 10, "quantity": 1, "unit_price": "10.00"}],
+        }
+        payload_from_seller_pc = {
+            "id": "sale-seller-pc", "shop_id": 1, "device_id": "device-b", "staff_id": 2,
+            "customer_name": "Seller Sale", "created_at": "2026-01-01T01:00:05+00:00",
+            "items": [{"id": "item-seller-pc", "product_id": 10, "quantity": 1, "unit_price": "10.00"}],
+        }
+
+        # The owner's PC happens to reconnect and push first.
+        winning = self.service.push_item(self.device, "sales", payload_from_owner_pc)
+        self.assertIn("invoice_number", winning)
+
+        # The seller's PC reconnects moments later and pushes its own
+        # (equally locally-valid-at-the-time) sale for the same last unit.
+        with self.assertRaises(ValueError) as ctx:
+            self.service.push_item(device_b, "sales", payload_from_seller_pc)
+        self.assertIn("already sold in another sale", str(ctx.exception))
+
+        # The first sale stands, untouched. The second never got written at
+        # all -- not partially, not with a negative stock movement.
+        self.assertIn("sale-owner-pc", self.client.collections["sales"])
+        self.assertNotIn("sale-seller-pc", self.client.collections["sales"])
+        self.assertNotIn("item-seller-pc", self.client.collections["sale_items"])
+        movements = [m for m in self.client.collections["stock_movements"].values() if m.get("product_id") == 10]
+        self.assertEqual(sum(m["quantity_delta"] for m in movements), 0)  # 1 seeded - 1 sold, never -1
+
     def test_firestore_adapter_continues_invoice_sequence_after_migration(self):
+        self.client.collections["stock_movements"]["seed-10"] = {
+            "id": "seed-10", "product_id": 10, "shop_id": 1, "quantity_delta": 5,
+        }
         self.client.collections["sales"]["migrated-sale"] = {
             "id": "migrated-sale",
             "invoice_number": "INV-2026-1008",

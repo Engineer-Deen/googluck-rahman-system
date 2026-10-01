@@ -2217,6 +2217,7 @@ async function pollSyncStatus() {
     const pending = Number(data.pending_count || 0);
     const pendingSummary = formatPendingSummary(data.pending_by_table, pending);
     const needsReview = Number(data.needs_review_count || 0);
+    const needsReviewItems = Array.isArray(data.needs_review_items) ? data.needs_review_items : [];
     const lastPush = formatSyncTime(data.last_sync_at);
     const lastPull = formatSyncTime(data.last_pull_at);
     const pushError = data.last_sync_error || "";
@@ -2266,7 +2267,14 @@ async function pollSyncStatus() {
     if (needsReview > 0) {
       key = "review";
       label = "Needs attention";
-      detail = `${pluralize(needsReview, "change")} could not be synchronized and needs review`;
+      // The actual reason (e.g. "this sale was already sold on another
+      // device"), not just a bare count -- a count alone leaves the owner
+      // knowing something is wrong without knowing what, or whether it's
+      // safe to ignore. The full text (and every item, if there's more
+      // than one) is always in the hover tooltip via setSyncUi's title.
+      detail = needsReviewItems[0]?.reason
+        ? needsReviewItems[0].reason
+        : `${pluralize(needsReview, "change")} could not be synchronized and needs review`;
       uiState = "review";
     } else if (pending > 0 && pushProblem) {
       key = "retrying";
@@ -2300,13 +2308,19 @@ async function pollSyncStatus() {
       pushProblem ? `Upload error: ${pushError}` : "",
       pullProblem ? `Refresh error: ${pullError}` : "",
     ].filter(Boolean).join("\n");
+    // On hover, list every flagged item's reason, not just the one shown in
+    // the header line -- there's no separate details view for these, so the
+    // tooltip is the only place to see all of them if there's more than one.
+    const reviewDetail = needsReviewItems.length
+      ? needsReviewItems.map((item) => item.reason || `${item.table_name} ${item.record_id}`).join("\n")
+      : "";
 
     setSyncUi({
       state: uiState,
       label,
       detail,
       pending,
-      title: errorDetail || `${detail}. Click SYNC NOW to send queued changes immediately.`,
+      title: reviewDetail || errorDetail || `${detail}. Click SYNC NOW to send queued changes immediately.`,
       disabled: syncRequestInFlight,
     });
 
@@ -2329,7 +2343,16 @@ async function pollSyncStatus() {
       } else if ((prev.key === "pending" || prev.key === "error") && key === "synced") {
         syncToast("Synchronization complete. All queued changes reached the central server.", "success");
       } else if (key === "review" && prev.key !== "review") {
-        syncToast(`${needsReview} synchronization ${needsReview === 1 ? "item needs" : "items need"} owner review.`, "warning");
+        // Lead with the actual reason when there's exactly one flagged item
+        // (the common case -- e.g. two devices selling the last unit of the
+        // same product while both offline) rather than a bare count the
+        // owner has to go investigate separately.
+        syncToast(
+          needsReview === 1 && needsReviewItems[0]?.reason
+            ? needsReviewItems[0].reason
+            : `${needsReview} synchronization ${needsReview === 1 ? "item needs" : "items need"} owner review.`,
+          "warning"
+        );
       }
     }
     lastSyncSnapshot = { key, pending };
